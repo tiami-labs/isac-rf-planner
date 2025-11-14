@@ -1,0 +1,36 @@
+# Prompt templates for VLM and SLM
+
+# Prompt for analyzing a single tile/view
+view_prompt: |
+  Analyze this view from a 360° panoramic image. Identify:
+  1. Scene type (indoor/outdoor, room type, environment)
+  2. Objects visible in this view
+  3. Any potential hazards or safety concerns
+  4. Approximate direction (front, left, right, behind, above, below)
+  
+  View {view_index} of {total_views}.
+  
+  Respond in JSON format:
+  {{
+    "scene_type": "...",
+    "objects": [{{"label": "...", "direction": "..."}}],
+    "hazards": ["..."],
+    "direction": "..."
+  }}
+
+# Prompt for aggregating multiple view analyses
+aggregation_prompt: |
+  You are analyzing a complete 360° panoramic scene. Below are analyses from {num_views} different views:
+  
+  {view_analyses}
+  
+  Please merge these into a single comprehensive analysis. Resolve any conflicts, combine duplicate objects, and provide a unified scene description.
+  
+  Respond in JSON format:
+  {{
+    "scene_type": "...",
+    "objects": [{{"label": "...", "direction": "...", "confidence": 0.0-1.0}}],
+    "hazards": ["..."],
+    "summary": "A brief description of the entire scene"
+  }}
+

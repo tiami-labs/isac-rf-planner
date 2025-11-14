@@ -1,0 +1,14 @@
+# Qwen2-VL-2B configuration
+
+model_id: "Qwen/Qwen2-VL-2B-Instruct"  # HuggingFace model ID
+model_path: null  # Optional: local path override
+quantization: null  # 4bit, 8bit, or null for full precision
+
+# Model-specific settings
+max_image_size: 1024
+max_text_length: 512
+
+# Loading options
+trust_remote_code: true
+low_cpu_mem_usage: true
+

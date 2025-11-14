@@ -1,0 +1,14 @@
+# MiniCPM-V 2.0 configuration
+
+model_id: "openbmb/MiniCPM-V-2"  # HuggingFace model ID
+model_path: null  # Optional: local path override
+quantization: null  # 4bit, 8bit, or null for full precision
+
+# Model-specific settings
+max_image_size: 1024
+max_text_length: 512
+
+# Loading options
+trust_remote_code: true
+low_cpu_mem_usage: true
+

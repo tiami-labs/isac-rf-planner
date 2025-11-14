@@ -1,0 +1,24 @@
+# Global settings for 360° panorama analysis
+
+tiling:
+  num_views: 4  # Number of overlapping tiles to extract
+  overlap_deg: 30  # Overlap in degrees between adjacent tiles
+  max_pixels: 512  # Maximum pixels per tile (will downscale if needed)
+
+output:
+  format: json  # json, yaml
+  indent: 2
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Model configurations (paths specified in model-specific configs)
+vlm:
+  backend: transformers  # transformers, gguf, openvino, ollama
+  device: auto  # auto (detects GPU/CPU), cpu (force CPU), cuda (force GPU), mps (Apple Silicon)
+
+slm:
+  backend: transformers
+  device: auto  # auto (detects GPU/CPU), cpu (force CPU), cuda (force GPU), mps (Apple Silicon)
+
