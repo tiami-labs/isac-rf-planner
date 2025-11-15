@@ -1,0 +1,21 @@
+# RF simulation parameters
+
+freq_mhz: 3500.0  # 5G mid-band frequency
+tx_power_dbm: 30.0  # Transmitter power in dBm
+noise_floor_dbm: -100.0  # Receiver noise floor
+max_range_m: 500.0  # Maximum simulation range in meters
+step_m: 5.0  # Grid resolution in meters
+
+# OFDM parameters
+subcarrier_spacing_khz: 30.0  # Subcarrier spacing (15 kHz for LTE, 30/60/120 for 5G)
+num_resource_blocks: 100  # Number of resource blocks (12 subcarriers per RB)
+channel_bandwidth_mhz: 20.0  # Total channel bandwidth
+
+# MIMO parameters
+num_tx_antennas: 1  # Number of transmit antennas
+num_rx_antennas: 1  # Number of receive antennas
+mimo_mode: "SISO"  # SISO, SIMO, MISO, MIMO
+
+# Link adaptation
+enable_link_adaptation: true  # Auto-select modulation based on SINR
+fixed_modulation: null  # If set, use this modulation (e.g., "QPSK", "16-QAM", "64-QAM", "256-QAM")
