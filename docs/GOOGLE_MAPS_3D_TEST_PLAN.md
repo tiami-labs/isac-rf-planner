@@ -136,7 +136,7 @@ python scripts/test_google_maps_3d_heatmap.py --api-key YOUR_API_KEY --no-cache
 **Test Execution**:
 ```bash
 $ python3 scripts/test_google_maps_3d_heatmap.py \
-    --api-key AIzaSyDNwg51WCr0TZ9UwFrZkSOUMWiP1wZiKA4 \
+    --api-key YOUR_API_KEY \
     --output ./test_3d_heatmap.html \
     --points 20
 
