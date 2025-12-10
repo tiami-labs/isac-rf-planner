@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Heatmap Test - Google Maps 3D Tiles</title>
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Cesium.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <style>
+        html, body, #cesiumContainer {
+            width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden;
+        }
+        .info-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(42, 42, 42, 0.9);
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            z-index: 1000;
+            max-width: 300px;
+        }
+        .info-panel h3 {
+            margin: 0 0 10px 0;
+            color: #4CAF50;
+        }
+        .legend {
+            margin-top: 10px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div id="cesiumContainer"></div>
+    <div class="info-panel">
+        <h3>3D Heatmap Test</h3>
+        <div>Points: 50</div>
+        <div>Center: (37.774565, -122.420195)</div>
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #2196F3;"></div>
+                <span>Low Intensity (Blue)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #4CAF50;"></div>
+                <span>Medium (Lime)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #FF9800;"></div>
+                <span>High (Orange)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #F44336;"></div>
+                <span>Very High (Red)</span>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Initialize Cesium viewer
+        const viewer = new Cesium.Viewer('cesiumContainer', {
+            imageryProvider: false,
+            baseLayerPicker: false,
+            vrButton: false,
+            geocoder: false,
+            homeButton: true,
+            infoBox: true,
+            sceneModePicker: true,
+            selectionIndicator: true,
+            timeline: false,
+            navigationHelpButton: true,
+            animation: false,
+            requestRenderMode: true,
+        });
+        
+        // Hide globe (we're using 3D tiles)
+        viewer.scene.globe.show = false;
+        
+        // Configure Cesium to include API key in all tile requests
+        const apiKey = 'YOUR_API_KEY';
+        const baseUrl = 'https://tile.googleapis.com';
+        
+        // Custom request handler to add API key to all Google Maps tile requests
+        // This is needed because relative URIs in the tileset need the API key
+        // The tileset contains relative URIs like /v1/3dtiles/datasets/...?session=...
+        const originalLoad = Cesium.Resource._Implementations.loadWithXhr;
+        Cesium.Resource._Implementations.loadWithXhr = function(url, responseType, headers, deferred, overrideMimeType) {
+            // Handle relative URLs - resolve them to full URLs with base
+            let fullUrl = url;
+            if (url.startsWith('/')) {
+                // Relative URL - prepend base URL
+                fullUrl = baseUrl + url;
+            } else if (!url.startsWith('http')) {
+                // Relative URL without leading slash
+                fullUrl = baseUrl + '/' + url;
+            }
+            
+            // Add API key to query string for all Google Maps tile requests
+            // Preserve existing query parameters (like session tokens)
+            if (fullUrl.includes('tile.googleapis.com')) {
+                try {
+                    const urlObj = new URL(fullUrl);
+                    // Only add key if not already present (preserve session tokens)
+                    if (!urlObj.searchParams.has('key')) {
+                        urlObj.searchParams.set('key', apiKey);
+                        fullUrl = urlObj.toString();
+                    }
+                } catch (e) {
+                    // If URL parsing fails, try simple string manipulation
+                    // Only add key if not already present
+                    if (!fullUrl.includes('key=')) {
+                        const separator = fullUrl.includes('?') ? '&' : '?';
+                        fullUrl = fullUrl + separator + 'key=' + encodeURIComponent(apiKey);
+                    }
+                }
+            }
+            
+            // Debug logging (can be removed in production)
+            if (fullUrl.includes('tile.googleapis.com')) {
+                console.log('Loading tile:', fullUrl.substring(0, 120) + '...');
+            }
+            return originalLoad(fullUrl, responseType, headers, deferred, overrideMimeType);
+        };
+        
+        // Load Google Maps 3D Tiles
+        const tileset = viewer.scene.primitives.add(
+            new Cesium.Cesium3DTileset({
+                url: 'https://tile.googleapis.com/v1/3dtiles/root.json?key=YOUR_API_KEY',
+                showCreditsOnScreen: true,
+                maximumScreenSpaceError: 16  // Adjust for better performance
+            })
+        );
+        
+        tileset.readyPromise.then(function(loadedTileset) {
+            console.log('Google Maps 3D Tiles loaded successfully');
+            console.log('Tileset bounding sphere:', loadedTileset.boundingSphere);
+            console.log('Tileset ready for rendering');
+            
+            // Zoom to tileset after a short delay to ensure tiles are loading
+            setTimeout(function() {
+                viewer.zoomTo(loadedTileset);
+            }, 1000);
+        }).otherwise(function(error) {
+            console.error('Error loading 3D Tiles:', error);
+            console.error('Error details:', error.message, error.stack);
+            alert('Error loading 3D Tiles: ' + error.message + '\nCheck browser console for details.');
+        });
+        
+        // Monitor tile loading progress
+        tileset.tileLoadProgressEvent.addEventListener(function(numberOfPendingRequests, numberOfTilesProcessing) {
+            console.log('Tiles loading: pending=' + numberOfPendingRequests + ', processing=' + numberOfTilesProcessing);
+        });
+        
+        // Heatmap points data
+        const heatmapPoints = [{"lat": 37.77412802613088, "lon": -122.41778385820426, "intensity": 0.608544549630155}, {"lat": 37.78164149269364, "lon": -122.41576461894935, "intensity": 0.8967716911565405}, {"lat": 37.784888555037185, "lon": -122.42013181156386, "intensity": 0.7424030649298237}, {"lat": 37.782180679746254, "lon": -122.41431796065025, "intensity": 1.0}, {"lat": 37.780103194170295, "lon": -122.41530537913764, "intensity": 0.4310214645507037}, {"lat": 37.780883946533194, "lon": -122.42597149405091, "intensity": 0.7084787222264851}, {"lat": 37.77645630184263, "lon": -122.42378374698134, "intensity": 0.19745175396053297}, {"lat": 37.781666517012255, "lon": -122.42068572895882, "intensity": 0.8295997691937671}, {"lat": 37.77055299276128, "lon": -122.41266672278331, "intensity": 0.6341581397847603}, {"lat": 37.77771609532654, "lon": -122.41924917336203, "intensity": 0.09183485615531177}, {"lat": 37.76745128525839, "lon": -122.42588254126173, "intensity": 0.8113100624944403}, {"lat": 37.782111466026926, "lon": -122.4142494151152, "intensity": 0.7264770022123977}, {"lat": 37.77029057828464, "lon": -122.427433317991, "intensity": 0.9537471693088803}, {"lat": 37.78353228288699, "lon": -122.42690525095381, "intensity": 0.6180073573155027}, {"lat": 37.778453234172304, "lon": -122.41495864602638, "intensity": 0.7669216541577225}, {"lat": 37.76573267133142, "lon": -122.41791808945852, "intensity": 0.6029793684392963}, {"lat": 37.76772772493518, "lon": -122.41162323598382, "intensity": 0.7798621223799728}, {"lat": 37.774874505007006, "lon": -122.41999238241335, "intensity": 0.30452524651766844}, {"lat": 37.78484531491706, "lon": -122.42002162851107, "intensity": 0.2854769491815044}, {"lat": 37.77388394579784, "lon": -122.41967872359481, "intensity": 0.02805896195670919}, {"lat": 37.77503955243707, "lon": -122.4097229215823, "intensity": 0.04984756498115824}, {"lat": 37.774863937627856, "lon": -122.42686161454883, "intensity": 0.7566305784165114}, {"lat": 37.77452432663905, "lon": -122.42711962438383, "intensity": 0.8925600603407843}, {"lat": 37.773749152478096, "lon": -122.42780585484569, "intensity": 0.73180269941284}, {"lat": 37.77432804940948, "lon": -122.41455768582041, "intensity": 0.7114740498555021}, {"lat": 37.76662185865163, "lon": -122.42455278191609, "intensity": 0.23292565362462686}, {"lat": 37.77797263297146, "lon": -122.41472395987336, "intensity": 0.016464001981355655}, {"lat": 37.770429635015475, "lon": -122.42499439655427, "intensity": 0.8865654331904593}, {"lat": 37.77179581285284, "lon": -122.42527894773222, "intensity": 0.5259492370328823}, {"lat": 37.779921424987315, "lon": -122.4108463582919, "intensity": 0.01893755043696392}, {"lat": 37.77136538029225, "lon": -122.41939349219788, "intensity": 0.4034546719320204}, {"lat": 37.766039972568905, "lon": -122.4198897217733, "intensity": 0.6974107911609593}, {"lat": 37.76700175415135, "lon": -122.42419438060216, "intensity": 0.41931626006584616}, {"lat": 37.77192202320481, "lon": -122.42741036552252, "intensity": 0.25145003053264714}, {"lat": 37.76555275019682, "lon": -122.42902850839529, "intensity": 0.520873731321522}, {"lat": 37.78473911626317, "lon": -122.4170630998974, "intensity": 0.7446809366698464}, {"lat": 37.76650529999812, "lon": -122.40963867892685, "intensity": 0.339868869906853}, {"lat": 37.781421607197565, "lon": -122.42683805453164, "intensity": 0.5346050253133355}, {"lat": 37.77860049508574, "lon": -122.4208958710427, "intensity": 0.08171736525226378}, {"lat": 37.76539324688763, "lon": -122.4199854865071, "intensity": 0.46516483115093366}, {"lat": 37.766019158282575, "lon": -122.41707567087813, "intensity": 0.916055664261562}, {"lat": 37.784270021290475, "lon": -122.42510148896659, "intensity": 0.941032815177419}, {"lat": 37.773289196643574, "lon": -122.42623285611212, "intensity": 0.0}, {"lat": 37.773206532851056, "lon": -122.41770038352085, "intensity": 0.0672027334974636}, {"lat": 37.779990088920755, "lon": -122.41816137627566, "intensity": 0.5595724666469255}, {"lat": 37.76728806290166, "lon": -122.4094373011817, "intensity": 0.6125920292093813}, {"lat": 37.77810154803086, "lon": -122.41706509639835, "intensity": 0.41075575055950575}, {"lat": 37.771685455029, "lon": -122.42613611168127, "intensity": 0.3225212447870936}, {"lat": 37.76998239634709, "lon": -122.41890333221438, "intensity": 0.5578198140487235}, {"lat": 37.76751755060963, "lon": -122.42879213209967, "intensity": 0.7246091045242598}];
+        
+        // Color gradient function (matching 2D heatmap: blue -> lime -> orange -> red)
+        function getHeatmapColor(intensity) {
+            if (intensity < 0.4) {
+                // Blue to Lime
+                const t = intensity / 0.4;
+                return Cesium.Color.fromBytes(
+                    Math.floor(33 + (76 - 33) * t),   // R: 33->76
+                    Math.floor(150 + (175 - 150) * t), // G: 150->175
+                    Math.floor(243 + (80 - 243) * t)   // B: 243->80
+                );
+            } else if (intensity < 0.6) {
+                // Lime to Orange
+                const t = (intensity - 0.4) / 0.2;
+                return Cesium.Color.fromBytes(
+                    Math.floor(76 + (255 - 76) * t),   // R: 76->255
+                    Math.floor(175 + (152 - 175) * t), // G: 175->152
+                    Math.floor(80 + (0 - 80) * t)      // B: 80->0
+                );
+            } else if (intensity < 0.8) {
+                // Orange to Red
+                const t = (intensity - 0.6) / 0.2;
+                return Cesium.Color.fromBytes(
+                    255,  // R: 255
+                    Math.floor(152 - 67 * t),  // G: 152->85
+                    Math.floor(0 + 38 * t)     // B: 0->38
+                );
+            } else {
+                // Red
+                return Cesium.Color.RED;
+            }
+        }
+        
+        // Add heatmap points as 3D billboards
+        heatmapPoints.forEach(function(point) {
+            const color = getHeatmapColor(point.intensity);
+            const height = 10 + point.intensity * 50; // Height based on intensity (10-60m)
+            
+            viewer.entities.add({
+                position: Cesium.Cartesian3.fromDegrees(point.lon, point.lat, height),
+                billboard: {
+                    image: createHeatmapDot(color, point.intensity),
+                    scale: 0.5 + point.intensity * 1.5, // Scale 0.5-2.0
+                    heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
+                    verticalOrigin: Cesium.VerticalOrigin.BOTTOM
+                },
+                label: {
+                    text: point.intensity.toFixed(2),
+                    font: '10pt sans-serif',
+                    fillColor: Cesium.Color.WHITE,
+                    outlineColor: Cesium.Color.BLACK,
+                    outlineWidth: 2,
+                    style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                    verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                    pixelOffset: new Cesium.Cartesian2(0, -25),
+                    show: false  // Hide by default, show on click
+                },
+                description: `
+                    <table>
+                        <tr><td><b>Intensity:</b></td><td>${point.intensity.toFixed(3)}</td></tr>
+                        <tr><td><b>Lat:</b></td><td>${point.lat.toFixed(6)}</td></tr>
+                        <tr><td><b>Lon:</b></td><td>${point.lon.toFixed(6)}</td></tr>
+                    </table>
+                `
+            });
+        });
+        
+        // Create heatmap dot image
+        function createHeatmapDot(color, intensity) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            
+            // Draw gradient circle
+            const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            gradient.addColorStop(0, Cesium.Color.toCssColorString(color.withAlpha(0.9)));
+            gradient.addColorStop(0.5, Cesium.Color.toCssColorString(color.withAlpha(0.6)));
+            gradient.addColorStop(1, Cesium.Color.toCssColorString(color.withAlpha(0.0)));
+            
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(32, 32, 32, 0, Math.PI * 2);
+            ctx.fill();
+            
+            return canvas.toDataURL();
+        }
+        
+        // Set camera to center position
+        viewer.camera.setView({
+            destination: Cesium.Cartesian3.fromDegrees(-122.42019462560455, 37.7745651769939, 500),
+            orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-45),
+                roll: 0.0
+            }
+        });
+        
+        // Add attribution
+        viewer.cesiumWidget.creditContainer.style.display = "block";
+    </script>
+</body>
+</html>
