@@ -394,7 +394,7 @@ class GoogleMaps3DHeatmapGenerator:
         }});
         
         // Monitor tile loading progress
-        tileset.tileLoadProgressEvent.addEventListener(function(numberOfPendingRequests, numberOfTilesProcessing) {{
+        tileset.loadProgress.addEventListener(function(numberOfPendingRequests, numberOfTilesProcessing) {{
             console.log('Tiles loading: pending=' + numberOfPendingRequests + ', processing=' + numberOfTilesProcessing);
         }});
         
