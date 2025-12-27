@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Google Photorealistic 3D Tiles + 3D Heatmap</title>
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+  <style>
+    html, body, #cesiumContainer {
+      width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden;
+    }
+    .panel {
+      position: absolute;
+      background: rgba(42, 42, 42, 0.90);
+      color: white;
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      z-index: 1000;
+      max-width: 360px;
+    }
+    #infoPanel { top: 10px; left: 10px; }
+    #controlsPanel { top: 10px; right: 10px; }
+    #legendPanel { bottom: 10px; left: 10px; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:10px; margin: 6px 0; }
+    .row label { white-space: nowrap; }
+    input[type="range"] { width: 190px; }
+    select { width: 200px; }
+    .legend-item { display:flex; align-items:center; margin: 4px 0; }
+    .legend-color { width: 16px; height: 16px; border-radius: 50%; margin-right: 8px; border: 1px solid rgba(255,255,255,0.35); }
+    code { color: #b6e0ff; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+
+  <div id="infoPanel" class="panel">
+    <div style="font-weight:700; font-size:13px; margin-bottom:6px;">3D Tiles + 3D Heatmap</div>
+    <div>Center: (37.774900, -122.419400)</div>
+    <div>Heat points: 3</div>
+    <div id="status" style="margin-top:6px;">Loading…</div>
+    <div id="pick" style="margin-top:6px; opacity:0.9;"></div>
+  </div>
+
+  <div id="controlsPanel" class="panel">
+    <div style="font-weight:700; font-size:13px; margin-bottom:6px;">Controls</div>
+
+    <div class="row">
+      <label for="mode">Heatmap mode</label>
+      <select id="mode">
+        <option value="columns">3D columns (volumes)</option>
+        <option value="billboards">Billboards (old)</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="maxHeight">Max height</label>
+      <input id="maxHeight" type="range" min="10" max="200" value="80" step="1" />
+    </div>
+
+    <div class="row">
+      <label for="radius">Radius</label>
+      <input id="radius" type="range" min="2" max="60" value="12" step="1" />
+    </div>
+
+    <div class="row">
+      <label for="subDepth">Subsurface depth</label>
+      <input id="subDepth" type="range" min="0" max="150" value="30" step="1" />
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <label><input id="cutawayEnabled" type="checkbox" checked/> Cutaway plane</label>
+      <span id="cutawayValue"></span>
+    </div>
+    <div class="row">
+      <label for="cutawayHeight">Cut height (m)</label>
+      <input id="cutawayHeight" type="range" min="-80" max="200" value="50" step="1" />
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <button id="rerender" style="width:100%; padding:8px; border-radius:6px; border:0; cursor:pointer;">Rebuild heatmap</button>
+    </div>
+
+    <div style="opacity:0.85; margin-top:6px; line-height:1.3;">
+      Tip: enable the cutaway and drag it down (lower values) to expose subsurface volumes.
+    </div>
+  </div>
+
+  <div id="legendPanel" class="panel">
+    <div style="font-weight:700; font-size:13px; margin-bottom:6px;">Intensity → Color</div>
+    <div class="legend-item"><div class="legend-color" style="background:#2196F3;"></div>Low</div>
+    <div class="legend-item"><div class="legend-color" style="background:#4CAF50;"></div>Medium</div>
+    <div class="legend-item"><div class="legend-color" style="background:#FF9800;"></div>High</div>
+    <div class="legend-item"><div class="legend-color" style="background:#F44336;"></div>Very high</div>
+  </div>
+
+<script>
+(() => {
+  const statusEl = document.getElementById('status');
+  const pickEl = document.getElementById('pick');
+
+  const tilesetUrl = "https://tile.googleapis.com/v1/3dtiles/root.json?key=DUMMY";
+  const heatSources = [{"lat": 37.777449072991985, "lon": -122.41874717274841, "intensity": 0.07584937217394239}, {"lat": 37.78442369292109, "lon": -122.41625864470397, "intensity": 0.7384355866846093}, {"lat": 37.77577217139491, "lon": -122.42867377420248, "intensity": 0.9418345805048892}];
+
+  // UI
+  const modeEl = document.getElementById('mode');
+  const maxHeightEl = document.getElementById('maxHeight');
+  const radiusEl = document.getElementById('radius');
+  const subDepthEl = document.getElementById('subDepth');
+  const cutawayEnabledEl = document.getElementById('cutawayEnabled');
+  const cutawayHeightEl = document.getElementById('cutawayHeight');
+  const cutawayValueEl = document.getElementById('cutawayValue');
+  const rerenderBtn = document.getElementById('rerender');
+
+  modeEl.value = "columns";
+
+  // Viewer
+  const viewer = new Cesium.Viewer('cesiumContainer', {
+    imageryProvider: false,
+    baseLayerPicker: false,
+    vrButton: false,
+    geocoder: false,
+    homeButton: true,
+    infoBox: true,
+    sceneModePicker: true,
+    selectionIndicator: true,
+    timeline: false,
+    navigationHelpButton: true,
+    animation: false,
+    globe: false
+  });
+
+  Cesium.RequestScheduler.requestsByServer['tile.googleapis.com:443'] = 18;
+
+  let heatPrimitive = null;
+  let cutawayPlanes = null;
+  let tileset = null;
+
+  function clamp01(x) {
+    return Math.max(0.0, Math.min(1.0, x));
+  }
+
+  // Blue -> Green -> Orange -> Red (roughly matching your legend)
+  function getHeatmapColor(intensity) {
+    const i = clamp01(intensity);
+    if (i < 0.4) {
+      const t = i / 0.4;
+      return Cesium.Color.fromBytes(
+        Math.floor(33 + (76 - 33) * t),
+        Math.floor(150 + (175 - 150) * t),
+        Math.floor(243 + (80 - 243) * t)
+      );
+    } else if (i < 0.6) {
+      const t = (i - 0.4) / 0.2;
+      return Cesium.Color.fromBytes(
+        Math.floor(76 + (255 - 76) * t),
+        Math.floor(175 + (152 - 175) * t),
+        Math.floor(80 + (0 - 80) * t)
+      );
+    } else if (i < 0.8) {
+      const t = (i - 0.6) / 0.2;
+      return Cesium.Color.fromBytes(
+        255,
+        Math.floor(152 - 67 * t),
+        Math.floor(0 + 38 * t)
+      );
+    }
+    return Cesium.Color.RED;
+  }
+
+  function destroyHeatmap() {
+    if (heatPrimitive) {
+      viewer.scene.primitives.remove(heatPrimitive);
+      heatPrimitive = null;
+    }
+    // Billboard mode uses entities; clear them too.
+    viewer.entities.removeAll();
+  }
+
+  function createHeatmapDot(color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d');
+    ctx.beginPath();
+    ctx.arc(16, 16, 14, 0, 2 * Math.PI, false);
+    ctx.fillStyle = color.toCssColorString();
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = Cesium.Color.WHITE.toCssColorString();
+    ctx.stroke();
+    return canvas.toDataURL();
+  }
+
+  async function clampPointsToMesh(cartesians) {
+    // clampToHeightMostDetailed is the best option when available.
+    // If not available, fall back to unclamped.
+    try {
+      if (viewer.scene.clampToHeightSupported && viewer.scene.clampToHeightMostDetailed) {
+        const updated = await viewer.scene.clampToHeightMostDetailed(cartesians);
+        return updated;
+      }
+    } catch (e) {
+      console.warn('clampToHeightMostDetailed failed; continuing without clamping.', e);
+    }
+    return cartesians;
+  }
+
+  async function buildColumnsHeatmap() {
+    destroyHeatmap();
+
+    const maxHeight = parseFloat(maxHeightEl.value);
+    const radiusM = parseFloat(radiusEl.value);
+    const subDepth = parseFloat(subDepthEl.value);
+
+    statusEl.textContent = 'Building 3D heatmap volumes…';
+
+    const cartesians = heatSources.map(p => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 0));
+    const clamped = await clampPointsToMesh(cartesians);
+
+    const instances = [];
+    const alpha = 0.55;  // visual clarity
+
+    for (let i = 0; i < heatSources.length; i++) {
+      const src = heatSources[i];
+      const pos = clamped[i];
+      if (!Cesium.defined(pos)) continue;
+
+      const intensity = clamp01(src.intensity);
+      const above = Math.max(2.0, intensity * maxHeight);
+      const depth = Math.max(0.0, subDepth);
+      const length = above + depth;
+
+      const geom = new Cesium.CylinderGeometry({
+        length: length,
+        topRadius: radiusM,
+        bottomRadius: radiusM,
+        vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT
+      });
+
+      // Center the cylinder so it extends depth below the surface and above above-surface
+      // Local ENU origin at the clamped surface point:
+      const enu = Cesium.Transforms.eastNorthUpToFixedFrame(pos);
+      const offsetUp = (above - depth) / 2.0;
+      const modelMatrix = Cesium.Matrix4.multiplyByTranslation(
+        enu,
+        new Cesium.Cartesian3(0, 0, offsetUp),
+        new Cesium.Matrix4()
+      );
+
+      const color = getHeatmapColor(intensity).withAlpha(alpha);
+
+      instances.push(new Cesium.GeometryInstance({
+        geometry: geom,
+        modelMatrix: modelMatrix,
+        attributes: {
+          color: Cesium.ColorGeometryInstanceAttribute.fromColor(color)
+        }
+      }));
+    }
+
+    heatPrimitive = viewer.scene.primitives.add(new Cesium.Primitive({
+      geometryInstances: instances,
+      appearance: new Cesium.PerInstanceColorAppearance({
+        translucent: true,
+        closed: true
+      }),
+      asynchronous: true
+    }));
+
+    statusEl.textContent = `3D heatmap ready (columns: ${instances.length}).`;
+  }
+
+  async function buildBillboardsHeatmap() {
+    destroyHeatmap();
+
+    statusEl.textContent = 'Building billboards…';
+
+    const maxHeight = parseFloat(maxHeightEl.value);
+    const cartesians = heatSources.map(p => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 0));
+    const clamped = await clampPointsToMesh(cartesians);
+
+    for (let i = 0; i < heatSources.length; i++) {
+      const src = heatSources[i];
+      const pos = clamped[i];
+      if (!Cesium.defined(pos)) continue;
+
+      const intensity = clamp01(src.intensity);
+      const color = getHeatmapColor(intensity);
+      const extraHeight = 2 + intensity * maxHeight;
+
+      // Billboard wants cartographic degrees + height:
+      const carto = Cesium.Cartographic.fromCartesian(pos);
+      viewer.entities.add({
+        position: Cesium.Cartesian3.fromRadians(carto.longitude, carto.latitude, carto.height + extraHeight),
+        billboard: {
+          image: createHeatmapDot(color),
+          scale: 0.6 + intensity * 1.2,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM
+        },
+        description: `
+          <table>
+            <tr><td><b>Intensity:</b></td><td>${intensity.toFixed(3)}</td></tr>
+            <tr><td><b>Lat:</b></td><td>${Cesium.Math.toDegrees(carto.latitude).toFixed(6)}</td></tr>
+            <tr><td><b>Lon:</b></td><td>${Cesium.Math.toDegrees(carto.longitude).toFixed(6)}</td></tr>
+          </table>
+        `
+      });
+    }
+
+    statusEl.textContent = `Billboards ready (${heatSources.length}).`;
+  }
+
+  async function rebuildHeatmap() {
+    const mode = modeEl.value;
+    if (mode === 'billboards') {
+      await buildBillboardsHeatmap();
+    } else {
+      await buildColumnsHeatmap();
+    }
+    viewer.scene.requestRender();
+  }
+
+  function setCutaway(enabled, heightM) {
+    if (!tileset) return;
+
+    if (!cutawayPlanes) {
+      // Create once, then toggle.
+      // We'll place the plane in an ENU frame near the requested center.
+      // We clamp the center to the mesh when possible, otherwise the ellipsoid surface.
+      const centerCartesian = Cesium.Cartesian3.fromDegrees(-122.4194, 37.7749, 0);
+      cutawayPlanes = new Cesium.ClippingPlaneCollection({
+        planes: [ new Cesium.ClippingPlane(new Cesium.Cartesian3(0.0, 0.0, -1.0), 50.0) ],
+        enabled: true,
+        edgeWidth: 1.0,
+        edgeColor: Cesium.Color.WHITE,
+        modelMatrix: Cesium.Transforms.eastNorthUpToFixedFrame(centerCartesian)
+      });
+      tileset.clippingPlanes = cutawayPlanes;
+    }
+
+    cutawayPlanes.enabled = enabled;
+    // normal (0,0,-1) + distance = heightM clips everything with z > heightM in the local ENU frame
+    cutawayPlanes.get(0).distance = heightM;
+  }
+
+  function wireUI() {
+    function refreshCutawayLabel() {
+      const h = parseFloat(cutawayHeightEl.value);
+      cutawayValueEl.textContent = cutawayEnabledEl.checked ? `${h.toFixed(0)} m` : 'off';
+    }
+
+    rerenderBtn.addEventListener('click', () => rebuildHeatmap());
+    modeEl.addEventListener('change', () => rebuildHeatmap());
+    maxHeightEl.addEventListener('change', () => rebuildHeatmap());
+    radiusEl.addEventListener('change', () => rebuildHeatmap());
+    subDepthEl.addEventListener('change', () => rebuildHeatmap());
+
+    cutawayEnabledEl.addEventListener('change', () => {
+      refreshCutawayLabel();
+      setCutaway(cutawayEnabledEl.checked, parseFloat(cutawayHeightEl.value));
+      viewer.scene.requestRender();
+    });
+    cutawayHeightEl.addEventListener('input', () => {
+      refreshCutawayLabel();
+      setCutaway(cutawayEnabledEl.checked, parseFloat(cutawayHeightEl.value));
+      viewer.scene.requestRender();
+    });
+
+    refreshCutawayLabel();
+  }
+
+  function wirePicking() {
+    const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+    handler.setInputAction((movement) => {
+      pickEl.textContent = '';
+      try {
+        if (!viewer.scene.pickPositionSupported) return;
+        const cart = viewer.scene.pickPosition(movement.position);
+        if (!Cesium.defined(cart)) return;
+        const c = Cesium.Cartographic.fromCartesian(cart);
+        pickEl.innerHTML = `Pick: <code>${Cesium.Math.toDegrees(c.latitude).toFixed(6)}, ${Cesium.Math.toDegrees(c.longitude).toFixed(6)}, h=${c.height.toFixed(1)}m</code>`;
+      } catch (e) {
+        // ignore
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+  }
+
+  async function main() {
+    try {
+      wireUI();
+      wirePicking();
+
+      statusEl.textContent = 'Requesting tileset…';
+      tileset = await Cesium.Cesium3DTileset.fromUrl(tilesetUrl, { showCreditsOnScreen: true });
+      viewer.scene.primitives.add(tileset);
+
+      viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(-122.4194, 37.7749, 650),
+        orientation: {
+          heading: Cesium.Math.toRadians(0),
+          pitch: Cesium.Math.toRadians(-45),
+          roll: 0.0
+        }
+      });
+
+      // Cesium 1.111: use `loadProgress` (NOT tileLoadProgressEvent)
+      tileset.loadProgress.addEventListener(async (pending, processing) => {
+        if (pending === 0 && processing === 0) {
+          statusEl.textContent = 'Tiles loaded. Building heatmap…';
+          await rebuildHeatmap();
+          setCutaway(cutawayEnabledEl.checked, parseFloat(cutawayHeightEl.value));
+        }
+      });
+
+      statusEl.textContent = 'Loading tiles…';
+    } catch (error) {
+      console.error('Error loading 3D Tiles:', error);
+      statusEl.textContent = 'Error: ' + (error.message || error);
+      alert('Error loading 3D Tiles: ' + (error.message || error));
+    }
+  }
+
+  main();
+})();
+</script>
+</body>
+</html>
