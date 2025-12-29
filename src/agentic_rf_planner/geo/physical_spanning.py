@@ -1,6 +1,14 @@
-"""Map-based physical spanning estimation."""
+"""Map-based physical spanning estimation.
 
-from typing import Protocol
+This module defines the MapProvider protocol used by the RF planning pipeline.
+
+Critical design constraint:
+  - RF math (FSPL / NLOS excess / penetration loss / SINR) lives in rf/.
+  - The ONLY difference between 2D and 3D planning is ray propagation / geometry
+    intersection queries inside the MapProvider implementation.
+"""
+
+from typing import Any, Dict, List, Protocol
 
 from ..pipeline.schemas import LatLon, MaterialType
 
@@ -13,6 +21,22 @@ class MapProvider(Protocol):
 
     def count_buildings_between(self, start: LatLon, end: LatLon) -> int:
         """Count building obstacles between two points."""
+        ...
+
+    def prefetch_all_data(self, center: LatLon, radius_m: float) -> None:
+        """Optional bulk prefetch.
+
+        Implementations may use this to fetch/cache all data needed to answer
+        per-ray queries quickly (OSM prefetched polygons, mesh ray profiles, etc.).
+        """
+        ...
+
+    def get_buildings_along_ray(self, start: LatLon, end: LatLon) -> List[Dict[str, Any]]:
+        """Return building/structure obstacles intersecting the ray from start to end.
+
+        The RF pipeline uses this to accumulate material penetration losses along
+        the ray (in order is preferred, but not strictly required).
+        """
         ...
 
     def is_forest_between(self, start: LatLon, end: LatLon) -> bool:
@@ -33,6 +57,14 @@ class StubMapProvider:
     def count_buildings_between(self, start: LatLon, end: LatLon) -> int:
         """Stub: return 0 for now."""
         return 0
+
+    def prefetch_all_data(self, center: LatLon, radius_m: float) -> None:
+        """Stub: no-op."""
+        return None
+
+    def get_buildings_along_ray(self, start: LatLon, end: LatLon) -> List[Dict[str, Any]]:
+        """Stub: return empty obstacle list."""
+        return []
 
     def is_forest_between(self, start: LatLon, end: LatLon) -> bool:
         """Stub: return False for now."""
