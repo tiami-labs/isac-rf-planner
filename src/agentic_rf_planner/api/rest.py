@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -10,8 +11,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from ..pipeline.schemas import RFParams
+from ..pipeline.schemas import RFParams, LatLon
 from ..agents.rf_planning_agent import run_rf_planning_for_point
+
+from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
+from ..geo.google_mesh.provider import MissingMeshProfiles
 
 # Configure logging to show INFO and above, with detailed format
 logging.basicConfig(
@@ -66,6 +70,12 @@ class PlanRequest(BaseModel):
     enable_link_adaptation: bool = True
     fixed_modulation: Optional[str] = None
 
+    # Ray propagation mode selection
+    # If omitted, defaults to env RFP_DEFAULT_RAY_MODE (fallback: "2d").
+    ray_mode: Optional[str] = None  # "2d" or "3d"
+    tx_height_m: float = 0.0
+    rx_height_m: float = 1.5
+
 
 @app.post("/api/plan")
 async def api_plan(req: PlanRequest) -> Dict[str, Any]:
@@ -93,6 +103,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
     
     try:
         logger.info("Step 1: Creating RFParams...")
+        effective_ray_mode = (req.ray_mode or os.environ.get("RFP_DEFAULT_RAY_MODE") or "2d").strip()
         rf_params = RFParams(
             freq_mhz=req.freq_mhz,
             tx_power_dbm=req.tx_power_dbm,
@@ -107,6 +118,9 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             enable_link_adaptation=req.enable_link_adaptation,
             fixed_modulation=req.fixed_modulation,
             sectors=req.sectors,  # Pass sector configurations
+            ray_mode=effective_ray_mode,
+            tx_height_m=req.tx_height_m,
+            rx_height_m=req.rx_height_m,
         )
         logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
         if req.sectors:
@@ -116,6 +130,8 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         logger.info(f"  OFDM: SCS={rf_params.subcarrier_spacing_khz}kHz, RB={rf_params.num_resource_blocks}, BW={rf_params.channel_bandwidth_mhz}MHz")
         logger.info(f"  MIMO: {rf_params.mimo_mode} ({rf_params.num_tx_antennas}x{rf_params.num_rx_antennas})")
         logger.info(f"  Link adaptation: {'enabled' if rf_params.enable_link_adaptation else 'disabled'}")
+        logger.info(f"  Ray mode: {rf_params.ray_mode} (tx_h={rf_params.tx_height_m}m, rx_h={rf_params.rx_height_m}m)")
+        logger.info(f"  Ray mode: {effective_ray_mode} (tx_height_m={rf_params.tx_height_m}, rx_height_m={rf_params.rx_height_m})")
         
         logger.info("Step 2: Calling run_rf_planning_for_point...")
         # Run in executor to avoid blocking the event loop during long processing
@@ -135,6 +151,17 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         logger.info("Step 3: RF planning completed successfully")
         logger.info(f"  Result keys: {list(result.keys())}")
         return result
+    except MissingMeshProfiles as e:
+        # 3D mode requires persisted mesh ray profiles; UI will auto-generate.
+        logger.error(f"Missing 3D mesh profiles: {e}")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "missing_mesh_profiles",
+                "key": e.key,
+                "message": str(e),
+            },
+        )
     except ValueError as e:
         logger.error(f"ValueError in RF planning: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -147,6 +174,104 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
 def health() -> Dict[str, str]:
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/api/config")
+def api_config() -> Dict[str, Any]:
+    """Expose minimal runtime config needed by local frontend utilities.
+
+    Note: Google Photorealistic 3D Tiles requires the API key client-side.
+    This endpoint is intended for local development only.
+    """
+    key = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_MAPS_APIKEY")
+    default_ray_mode = (os.environ.get("RFP_DEFAULT_RAY_MODE") or "2d").strip().lower()
+    return {
+        "google_maps_api_key": key or "",
+        "google_maps_api_key_present": bool(key),
+        "mesh_profile_version": PROFILE_VERSION,
+        "default_ray_mode": default_ray_mode,
+    }
+
+
+@app.post("/api/mesh-profiles/put")
+async def mesh_profiles_put(profile_set: RayProfileSet, enrich_osm: bool = True) -> Dict[str, Any]:
+    """Persist a full set of mesh ray profiles for a TX/config.
+
+    The frontend is expected to compute mesh intersections (Google 3D mesh) and
+    enrich them with OSM semantics (tree/building/house) and material bucket.
+
+    Returns a deterministic cache key that can be referenced later.
+    """
+    if enrich_osm:
+        try:
+            from ..geo.google_mesh.osm_enrichment import enrich_profile_set_with_osm
+
+            profile_set = enrich_profile_set_with_osm(profile_set)
+        except Exception as e:
+            # Non-fatal; store whatever we received.
+            logging.getLogger(__name__).warning(f"OSM enrichment failed (storing raw profiles): {e}")
+
+    store = MeshProfileStore()
+    key = store.put(profile_set)
+    return {"status": "ok", "key": key, "stats": store.stats()}
+
+
+@app.get("/api/mesh-profiles/has")
+def mesh_profiles_has(
+    tx_lat: float,
+    tx_lon: float,
+    tx_height_m: float = 0.0,
+    rx_height_m: float = 1.5,
+    max_range_m: float = 500.0,
+    dr_m: float = 5.0,
+    dtheta_deg: float = 5.0,
+    version: str = PROFILE_VERSION,
+) -> Dict[str, Any]:
+    """Check whether profiles exist on disk for the given TX/config."""
+    store = MeshProfileStore()
+    exists, key = store.has(
+        tx=LatLon(lat=tx_lat, lon=tx_lon),
+        tx_height_m=tx_height_m,
+        rx_height_m=rx_height_m,
+        max_range_m=max_range_m,
+        dr_m=dr_m,
+        dtheta_deg=dtheta_deg,
+        version=version,
+    )
+    return {"status": "ok", "exists": exists, "key": key}
+
+
+@app.get("/api/mesh-profiles/get")
+def mesh_profiles_get(
+    tx_lat: float,
+    tx_lon: float,
+    tx_height_m: float = 0.0,
+    rx_height_m: float = 1.5,
+    max_range_m: float = 500.0,
+    dr_m: float = 5.0,
+    dtheta_deg: float = 5.0,
+    version: str = PROFILE_VERSION,
+) -> Dict[str, Any]:
+    """Load persisted profiles for a TX/config (useful for debugging)."""
+    from fastapi import HTTPException
+
+    store = MeshProfileStore()
+    tx = LatLon(lat=tx_lat, lon=tx_lon)
+    prof = store.get(
+        tx=tx,
+        tx_height_m=tx_height_m,
+        rx_height_m=rx_height_m,
+        max_range_m=max_range_m,
+        dr_m=dr_m,
+        dtheta_deg=dtheta_deg,
+        version=version,
+    )
+    if prof is None:
+        _, key_str = store.compute_key(tx, tx_height_m, rx_height_m, max_range_m, dr_m, dtheta_deg, version)
+        raise HTTPException(status_code=404, detail={"message": "not found", "key_str": key_str})
+
+    key, _ = store.compute_key(tx, tx_height_m, rx_height_m, max_range_m, dr_m, dtheta_deg, version)
+    return {"status": "ok", "key": key, "profile_set": prof.model_dump()}
 
 
 @app.post("/api/clear-cache")
@@ -166,10 +291,12 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
     
     # Parse request body (if provided)
     clear_osm = False
+    clear_mesh = False
     try:
         body = await req.json()
         if isinstance(body, dict):
             clear_osm = body.get("clear_osm", False)
+            clear_mesh = body.get("clear_mesh", False)
     except:
         # No body provided, use default (preserve OSM cache)
         pass
@@ -178,6 +305,7 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
         "status": "ok",
         "message": "Cache cleared",
         "osm_cache_cleared": False,
+        "mesh_cache_cleared": False,
     }
     
     # Only clear OSM cache if explicitly requested
@@ -198,6 +326,16 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
     else:
         logger.info("Cache clear requested - OSM cache preserved (use clear_osm=true to clear)")
         result["message"] = "In-memory cache cleared. OSM cache preserved (to avoid repeated API calls)."
+
+    if clear_mesh:
+        store = MeshProfileStore()
+        deleted_profiles = store.clear()
+        logger.info(f"Mesh profile cache clear requested - deleted {deleted_profiles} profile set(s)")
+        result.update({
+            "mesh_cache_cleared": True,
+            "mesh_profiles_deleted": deleted_profiles,
+            "mesh_cache_stats": store.stats(),
+        })
     
     return result
 
@@ -206,6 +344,14 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
 static_dir = Path(__file__).parent.parent / "ui" / "static"
 if static_dir.exists():
     from fastapi.responses import FileResponse
+
+    # Serve Cesium assets (repo root /Cesium) for the mesh-profiler utility.
+    # This keeps Google mesh sampling out of the core planner and avoids adding
+    # a server-side tiles dependency.
+    repo_root = Path(__file__).resolve().parents[3]
+    cesium_dir = repo_root / "Cesium"
+    if cesium_dir.exists():
+        app.mount("/Cesium", StaticFiles(directory=str(cesium_dir)), name="Cesium")
     
     @app.get("/")
     async def serve_index():
@@ -241,3 +387,28 @@ if static_dir.exists():
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
+    # Optional mesh profiler UI (Cesium + Google Photorealistic mesh sampling)
+    @app.get("/mesh-profiler")
+    async def serve_mesh_profiler():
+        file_path = static_dir / "mesh_profiler.html"
+        if file_path.exists():
+            return FileResponse(str(file_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/mesh_profiler.js")
+    async def serve_mesh_profiler_js():
+        file_path = static_dir / "mesh_profiler.js"
+        if file_path.exists():
+            return FileResponse(str(file_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+
+    @app.get("/mesh_profiler_core.js")
+    async def serve_mesh_profiler_core_js():
+        file_path = static_dir / "mesh_profiler_core.js"
+        if file_path.exists():
+            return FileResponse(str(file_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
