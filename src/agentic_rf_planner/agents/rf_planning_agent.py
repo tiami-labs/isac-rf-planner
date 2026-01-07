@@ -33,6 +33,9 @@ def run_rf_planning_for_point(
     map_provider: Optional[MapProvider] = None,
     max_snap_distance_m: float = 50.0,  # Increased default for better coverage
     num_views: int = 4,
+    ray_mode: str = "2d",  # "2d" (OSM polygons) or "3d" (Google mesh profiles)
+    tx_height_m: float = 0.0,
+    rx_height_m: float = 1.5,
 ) -> Dict[str, Any]:
     """
     Run complete RF planning pipeline for a point.
@@ -55,35 +58,83 @@ def run_rf_planning_for_point(
     logger.info(f"  max_snap_distance_m: {max_snap_distance_m}")
     logger.info("="*60)
 
-    # 1) Snap to street (required for TX placement) - EXACT SAME AS TEST SCRIPT
-    logger.info(f"STEP 1: Snapping to street (max distance: {max_snap_distance_m}m)...")
-    logger.info(f"  Calling snap_to_street({lat}, {lon}, max_distance_m={max_snap_distance_m})")
-    snapped = snap_to_street(lat, lon, max_distance_m=max_snap_distance_m)
-    logger.info(f"  snap_to_street returned: {snapped}")
-    if snapped is None:
-        logger.error(f"STEP 1 FAILED: No street found within {max_snap_distance_m}m of ({lat}, {lon})")
-        raise ValueError(
-            f"No street found within {max_snap_distance_m}m of ({lat}, {lon}). "
-            "Please pick another point closer to a road."
+    # 1) TX placement
+    # 2D mode: snap to street (keeps 2D behavior consistent with earlier implementation)
+    # 3D mode: DO NOT snap (profiles + Google mesh are computed for the clicked TX)
+    ray_mode_eff = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
+    if ray_mode_eff in ("3d", "mesh", "google_mesh", "google-mesh"):
+        logger.info("STEP 1: 3D mode - skipping street snapping; using clicked point as TX")
+        snapped = SnappedPoint(LatLon(lat=lat, lon=lon), 0.0)
+        logger.info(f"✓ STEP 1 SUCCESS: TX (no-snap): ({snapped.latlon.lat:.6f}, {snapped.latlon.lon:.6f})")
+    else:
+        logger.info(f"STEP 1: Snapping to street (max distance: {max_snap_distance_m}m)...")
+        logger.info(f"  Calling snap_to_street({lat}, {lon}, max_distance_m={max_snap_distance_m})")
+        snapped = snap_to_street(lat, lon, max_distance_m=max_snap_distance_m)
+        logger.info(f"  snap_to_street returned: {snapped}")
+        if snapped is None:
+            logger.error(f"STEP 1 FAILED: No street found within {max_snap_distance_m}m of ({lat}, {lon})")
+            raise ValueError(
+                f"No street found within {max_snap_distance_m}m of ({lat}, {lon}). "
+                "Please pick another point closer to a road."
+            )
+        if snapped.distance_m > max_snap_distance_m:
+            logger.error(f"STEP 1 FAILED: Nearest street is {snapped.distance_m:.1f}m away (max: {max_snap_distance_m}m)")
+            raise ValueError(
+                f"No street within {max_snap_distance_m}m; pick another point. "
+                f"Distance: {snapped.distance_m:.1f}m"
+            )
+        logger.info(
+            f"✓ STEP 1 SUCCESS: Snapped to street: ({snapped.latlon.lat:.6f}, {snapped.latlon.lon:.6f}), "
+            f"distance: {snapped.distance_m:.1f}m"
         )
-    if snapped.distance_m > max_snap_distance_m:
-        logger.error(f"STEP 1 FAILED: Nearest street is {snapped.distance_m:.1f}m away (max: {max_snap_distance_m}m)")
-        raise ValueError(
-            f"No street within {max_snap_distance_m}m; pick another point. "
-            f"Distance: {snapped.distance_m:.1f}m"
-        )
-    logger.info(f"✓ STEP 1 SUCCESS: Snapped to street: ({snapped.latlon.lat:.6f}, {snapped.latlon.lon:.6f}), distance: {snapped.distance_m:.1f}m")
+
 
     # 2) Initialize map provider (PRIMARY: geometry-based)
+    # Ray-mode selection is the ONLY place where 2D vs 3D diverges.
     logger.info("STEP 2: Initializing map provider...")
+
+    # Allow RFParams to carry these fields if caller uses the REST API.
+    ray_mode = getattr(rf_params, "ray_mode", ray_mode)
+    tx_height_m = float(getattr(rf_params, "tx_height_m", tx_height_m))
+    rx_height_m = float(getattr(rf_params, "rx_height_m", rx_height_m))
     if map_provider is None:
-        # Use OSM by default (real geometry data)
+        # Default providers:
+        #   - 2D: OSMMapProvider (polygons)
+        #   - 3D: GoogleMeshOSMMapProvider (persisted mesh ray profiles, OSM semantics)
         try:
-            logger.info("  Creating OSMMapProvider...")
-            map_provider = OSMMapProvider(cache_radius_m=1000.0)
-            logger.info("✓ Using OSM MapProvider for geometry-based world model")
+            if str(ray_mode).lower() in ("3d", "mesh", "google_mesh", "google-mesh"):
+                logger.info("  Creating GoogleMeshOSMMapProvider (3D)...")
+                from ..geo.google_mesh import GoogleMeshOSMMapProvider, MeshProfileStore, MissingMeshProfiles
+
+                osm = OSMMapProvider(cache_radius_m=1000.0)
+                store = MeshProfileStore()
+                map_provider = GoogleMeshOSMMapProvider(
+                    profile_store=store,
+                    osm_provider=osm,
+                    tx_height_m=tx_height_m,
+                    rx_height_m=rx_height_m,
+                    max_range_m=rf_params.max_range_m,
+                    dr_m=rf_params.step_m,
+                    dtheta_deg=5.0,  # must match coverage_grid's discretization
+                )
+
+                # Fail fast if mesh profiles are missing (avoid spending time before erroring).
+                try:
+                    map_provider.prefetch_all_data(snapped.latlon, rf_params.max_range_m + 50.0)
+                except MissingMeshProfiles as e:
+                    # Bubble up so the REST layer / UI can auto-generate profiles on demand.
+                    raise
+
+                logger.info("✓ Using Google-mesh MapProvider (3D ray propagation)")
+            else:
+                logger.info("  Creating OSMMapProvider...")
+                map_provider = OSMMapProvider(cache_radius_m=1000.0)
+                logger.info("✓ Using OSM MapProvider for geometry-based world model")
+        except ValueError:
+            # Preserve user-actionable errors (e.g., missing mesh profiles in 3D mode).
+            raise
         except Exception as e:
-            logger.warning(f"  Failed to initialize OSM MapProvider: {e}, falling back to stub")
+            logger.warning(f"  Failed to initialize map provider ({ray_mode}): {e}, falling back to stub")
             map_provider = StubMapProvider()
     else:
         logger.info("  Using provided map_provider")
@@ -243,6 +294,9 @@ def run_rf_planning_for_point(
         "original_point": {"lat": lat, "lon": lon},
         "snapped_tx": snapped.latlon.model_dump(),
         "snap_distance_m": snapped.distance_m,
+        "ray_mode": str(ray_mode),
+        "tx_height_m": tx_height_m,
+        "rx_height_m": rx_height_m,
         "clutter_type": clutter_type,
         "world_model_source": "geometry_only" if not vlm_used else "geometry_vlm_refined",
         "streetview_available": streetview_available,
@@ -255,6 +309,23 @@ def run_rf_planning_for_point(
             "rsrp": rsrp_2d.tolist(),
         },
     }
+
+    # Surface 3D mesh profile key (if applicable) so the frontend can diagnose/cache.
+    try:
+        key = getattr(map_provider, "key", None)
+        if key:
+            result["mesh_profile_key"] = key
+    except Exception:
+        pass
+
+    # If 3D mode is enabled, include the mesh-profile cache key for traceability.
+    try:
+        if hasattr(map_provider, "key"):
+            k = getattr(map_provider, "key")
+            if k:
+                result["mesh_profile_key"] = k
+    except Exception:
+        pass
     
     # Add panorama location if available
     if pano_location:
