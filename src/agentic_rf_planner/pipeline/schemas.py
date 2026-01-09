@@ -91,6 +91,15 @@ class RFParams(BaseModel):
     # Sector configuration (optional - if None, uses omnidirectional)
     sectors: Optional[List[Dict[str, Any]]] = None  # List of sector configs (will be converted to SectorConfig)
 
+    # Ray propagation configuration (2D vs 3D). RF math remains identical.
+    # "2d": polygon-based OSM intersections (existing)
+    # "3d": mesh-profile-based intersections (persisted Google 3D mesh + OSM semantics)
+    ray_mode: str = "2d"
+
+    # Heights above ground (meters), used only by 3D ray geometry.
+    tx_height_m: float = 0.0
+    rx_height_m: float = 1.5
+
 
 class WorldCell(BaseModel):
     """
