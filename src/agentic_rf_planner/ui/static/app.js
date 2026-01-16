@@ -115,12 +115,40 @@ function loadLastResults() {
 
 // Try to restore last results on page load
 window.addEventListener('DOMContentLoaded', () => {
+  // Initialize Ray Mode selector from server env (RFP_DEFAULT_RAY_MODE).
+  fetch("/api/config").then(r => r.ok ? r.json() : null).then(cfg => {
+    if (!cfg) return;
+    const mode = String(cfg.default_ray_mode || "").toLowerCase();
+    const sel = document.getElementById("ray-mode");
+    if (sel && (mode === "2d" || mode === "3d")) sel.value = mode;
+  }).catch(e => console.warn("[RF Planner] Failed to load /api/config for default ray mode:", e));
+
   if (!loadLastResults()) {
     setStatus("Click on the map to run RF planning.");
   }
 });
 
 // Extract RF planning logic into reusable function
+
+async function ensure3DMeshProfiles(lat, lng, txHeightM, rxHeightM, maxRangeM, drM, dthetaDeg) {
+  // Auto-generate and persist mesh contacts (first-time only).
+  // Requires GOOGLE_MAPS_API_KEY on the server environment.
+  setStatus("3D: generating Google-mesh ray profiles (first time only)…");
+  const mod = await import("/mesh_profiler_core.js");
+  await mod.buildAndUploadProfiles({
+    containerId: "cesiumProfilerHost",
+    lat: lat,
+    lon: lng,
+    txHeightM: txHeightM,
+    rxHeightM: rxHeightM,
+    maxRangeM: maxRangeM,
+    drM: drM,
+    dthetaDeg: dthetaDeg,
+    mode: "slice",
+    onProgress: (msg) => setStatus(msg),
+  });
+}
+
 async function runRFPlanning(lat, lng, source = "click") {
   console.log("=".repeat(60));
   console.log(`[RF Planner] RF PLANNING REQUEST (source: ${source})`);
@@ -191,7 +219,16 @@ async function runRFPlanning(lat, lng, source = "click") {
       console.log(`[RF Planner] No sectors found - will use omnidirectional (360°)`);
     }
     
-    // RF parameters (can be made configurable via UI later)
+    // Ray mode + heights (UI)
+    const rayModeEl = document.getElementById('ray-mode');
+    const txHeightEl = document.getElementById('tx-height-m');
+    const rxHeightEl = document.getElementById('rx-height-m');
+    const rayMode = rayModeEl ? String(rayModeEl.value || '2d') : '2d';
+    const txHeightM = txHeightEl ? parseFloat(txHeightEl.value || '0') : 0.0;
+    const rxHeightM = rxHeightEl ? parseFloat(rxHeightEl.value || '1.5') : 1.5;
+    const statusEl = document.getElementById('mesh-profile-status');
+
+    // RF parameters
     const rfParams = {
       lat: lat,
       lon: lng,
@@ -206,8 +243,34 @@ async function runRFPlanning(lat, lng, source = "click") {
       enable_link_adaptation: true,
       fixed_modulation: null,
       sectors: sectors.length > 0 ? sectors : null,  // null = omnidirectional
+      // Ray propagation: only geometry differs between 2D and 3D
+      ray_mode: rayMode,
+      tx_height_m: txHeightM,
+      rx_height_m: rxHeightM,
     };
     
+    // If 3D mode is selected, ensure a persisted mesh profile exists for this TX/config.
+    // This avoids a slow fallback and makes behavior explicit.
+    if (rayMode.toLowerCase() === '3d') {
+      const maxRangeM = 500.0;
+      const drM = 5.0;
+      const dthetaDeg = 5.0;
+      const hasUrl = `/api/mesh-profiles/has?tx_lat=${encodeURIComponent(lat)}&tx_lon=${encodeURIComponent(lng)}`
+        + `&tx_height_m=${encodeURIComponent(txHeightM)}&rx_height_m=${encodeURIComponent(rxHeightM)}`
+        + `&max_range_m=${encodeURIComponent(maxRangeM)}&dr_m=${encodeURIComponent(drM)}&dtheta_deg=${encodeURIComponent(dthetaDeg)}`;
+      try {
+        const hasResp = await fetch(hasUrl);
+        const hasJson = await hasResp.json();
+        if (!hasJson.exists) {
+          await ensure3DMeshProfiles(lat, lng, txHeightM, rxHeightM, maxRangeM, drM, dthetaDeg);
+        }
+      } catch (e) {
+        console.warn('[RF Planner] 3D profile generation failed:', e);
+        document.getElementById('status').textContent = `3D mode failed to generate mesh profiles: ${e}`;
+        return;
+      }
+    }
+
     console.log(`[RF Planner] Sending POST /api/plan...`);
     console.log(`[RF Planner] Request body:`, JSON.stringify(rfParams, null, 2));
     

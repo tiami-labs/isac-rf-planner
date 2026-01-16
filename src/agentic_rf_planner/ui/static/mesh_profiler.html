@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Mesh Profiler (Google Mesh → Ray Profiles)</title>
+  <link rel="stylesheet" href="/Cesium/Widgets/widgets.css" />
+  <style>
+    html, body, #cesiumContainer { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    #panel {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      width: 360px;
+      background: rgba(20,20,20,0.92);
+      color: #eee;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-size: 12px;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid #444;
+    }
+    #panel label { display: block; margin-top: 8px; color: #ccc; }
+    #panel input, #panel select, #panel button {
+      width: 100%; margin-top: 4px; padding: 6px;
+      background: #222; color: #eee; border: 1px solid #444; border-radius: 4px;
+      box-sizing: border-box;
+    }
+    #panel button { cursor: pointer; background: #0b5; border-color: #0a4; }
+    #panel button:disabled { cursor: not-allowed; opacity: 0.6; }
+    #status { margin-top: 10px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    #hint { margin-top: 10px; color: #bbb; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+
+  <div id="panel">
+    <div style="font-weight: 700; margin-bottom: 8px;">Mesh Profiler</div>
+    <div id="hint">Click the mesh to set TX. Then generate + upload ray profiles.
+
+This uses GOOGLE_MAPS_API_KEY from the server environment via /api/config.</div>
+
+    <label for="tx-height">TX height (m)</label>
+    <input id="tx-height" type="number" step="0.5" value="10.0" />
+
+    <label for="rx-height">RX height (m)</label>
+    <input id="rx-height" type="number" step="0.1" value="1.5" />
+
+    <label for="max-range">Max range (m)</label>
+    <input id="max-range" type="number" step="10" value="500" />
+
+    <label for="step-m">Step (m)</label>
+    <input id="step-m" type="number" step="1" value="5" />
+
+    <label for="dtheta">Bearing step (deg)</label>
+    <input id="dtheta" type="number" step="1" value="5" />
+
+    <label for="mode">Profiler mode</label>
+    <select id="mode">
+      <option value="slice" selected>Slice: mesh blocks when above TX plane</option>
+    </select>
+
+    <button id="generate" disabled>Generate + Upload Profiles</button>
+    <div id="status">Loading…</div>
+  </div>
+
+  <script>window.CESIUM_BASE_URL = "/Cesium/";</script>
+  <script type="module" src="/mesh_profiler.js"></script>
+</body>
+</html>

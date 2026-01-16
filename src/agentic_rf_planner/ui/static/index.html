@@ -13,6 +13,48 @@
   <div id="sidebar">
     <h2>RF Planner</h2>
     <div id="status">Click on the map to start.</div>
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
+      <h3 style="font-size: 14px; margin-bottom: 10px;">Ray Mode</h3>
+
+      <div style="margin-bottom: 10px;">
+        <label for="ray-mode" style="display: block; font-size: 11px; margin-bottom: 3px;">Propagation:</label>
+        <select
+          id="ray-mode"
+          style="width: 100%; padding: 6px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
+        >
+          <option value="2d">2D (OSM geometry)</option>
+          <option value="3d" selected>3D (Google mesh + OSM semantics)</option>
+        </select>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <div>
+          <label for="tx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">TX height (m)</label>
+          <input
+            type="number"
+            id="tx-height-m"
+            step="0.5"
+            value="10.0"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
+          />
+        </div>
+        <div>
+          <label for="rx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">RX height (m)</label>
+          <input
+            type="number"
+            id="rx-height-m"
+            step="0.1"
+            value="1.5"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
+          />
+        </div>
+      </div>
+
+      <div id="mesh-profile-status" style="margin-top: 10px; font-size: 11px; color: #bbb;">
+        3D requires a cached mesh ray-profile for this TX/height/range.
+      </div>
+    </div>
+
     
     <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
       <h3 style="font-size: 14px; margin-bottom: 10px;">Enter Coordinates</h3>
@@ -91,6 +133,7 @@
   </div>
   <div id="map-container" style="position: absolute; top: 0; right: 0; bottom: 0; left: 230px;">
     <div id="map"></div>
+  <div id="cesiumProfilerHost" style="position:fixed; left:-12000px; top:0; width:900px; height:700px; pointer-events:none; opacity:0; z-index:-1;"></div>
     
     <!-- RSRP Power Scale Legend -->
     <div id="rsrp-legend" style="display: none;">
