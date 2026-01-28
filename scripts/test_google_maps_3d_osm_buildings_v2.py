@@ -41,6 +41,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -125,6 +126,43 @@ def fetch_tileset_with_cache(api_key: str, cache_dir: str, use_cache: bool) -> D
     if use_cache:
         cache.cache_tileset(api_key, tileset_data)
     return tileset_data
+# -------------------------
+# Cesium static assets (self-host)
+# -------------------------
+
+def ensure_cesium_static_dir(target_dir: str, *, copy_from_node_modules: bool = True) -> None:
+    """Ensure Cesium static assets exist at target_dir.
+
+    The generated HTML expects:
+      <target_dir>/Cesium.js
+      <target_dir>/Assets/*
+      <target_dir>/Widgets/*
+      <target_dir>/Workers/*
+
+    If missing and copy_from_node_modules=True, we try to copy from:
+      ./node_modules/cesium/Build/Cesium
+    """
+    target = Path(target_dir)
+    if (target / "Cesium.js").exists():
+        return
+
+    if not copy_from_node_modules:
+        logger.warning(f"Cesium.js not found at {target}. Page will not load unless Cesium is served there.")
+        return
+
+    nm = Path("node_modules") / "cesium" / "Build" / "Cesium"
+    if not (nm / "Cesium.js").exists():
+        logger.warning(
+            "Cesium.js not found at the expected node_modules path. "
+            "Install Cesium with: npm i cesium@1.111, then copy Build/Cesium into your web root as ./Cesium"
+        )
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(nm, target, dirs_exist_ok=True)
+    logger.info(f"Copied Cesium static assets to: {target}")
+
 
 
 # -------------------------
@@ -637,7 +675,8 @@ let _heatBuilt = false;
 let _heatPrims = [];
 let _heatLonLat = [];
 let _txMarker = null;
-let _txSphere = null;
+let _txPlanePrim = null;
+let _txPlaneGeomInstance = null;
 let _txPlaneOutline = null;
 let _txLon = CENTER_LON;
 let _txLat = CENTER_LAT;
@@ -649,116 +688,108 @@ let _pendingTx = null;
 window.__buildBusy = false;
 window.__queuedTxLonLat = null;
 
-function buildPlaneWithBuildingAttenuation(txLon, txLat) {
-  // Radial wave that continues through OSM buildings but changes color after interaction
-  // Create full circle - rays continue through buildings
+
+function buildPlaneFullCircle(txLon, txLat) {
+  // Always a full circle. Never "stops" or cuts for Google mesh or OSM.
   const numRays = 128;
   const metersPerDegLat = 111320.0;
   const cosLat = Math.cos(Cesium.Math.toRadians(txLat));
   const metersPerDegLon = metersPerDegLat * Math.max(0.1, cosLat);
-  
+
   const wavePoints = [];
-  
-  // Check A: Log whether OSM buildings are actually used
-  if (!buildings || buildings.length === 0) {
-    console.log("[TX Plane] buildings.length == 0 → FULL CIRCLE");
-  } else {
-    console.log(`[TX Plane] Checking ${buildings.length} OSM buildings for ray intersections`);
-  }
-  
-  // Always create full circle
   for (let i = 0; i < numRays; i++) {
-    const angle = (i / numRays) * Math.PI * 2.0;
-    const east = Math.cos(angle) * MAX_RANGE_M;
-    const north = Math.sin(angle) * MAX_RANGE_M;
-    const rayLon = txLon + (east / metersPerDegLon);
-    const rayLat = txLat + (north / metersPerDegLat);
-    wavePoints.push(rayLon, rayLat);
+    const ang = (i / numRays) * Math.PI * 2.0;
+    const east = Math.cos(ang) * MAX_RANGE_M;
+    const north = Math.sin(ang) * MAX_RANGE_M;
+    wavePoints.push(
+      txLon + (east / metersPerDegLon),
+      txLat + (north / metersPerDegLat)
+    );
   }
-  
-  // Find buildings that rays pass through and create attenuated shadow areas
-  // These represent the signal area AFTER passing through buildings (attenuated)
-  const attenuatedAreas = [];
-  
-  if (buildings && buildings.length > 0) {
-    for (let j = 0; j < buildings.length; j++) {
-      const b = buildings[j];
-      if (!b.verts || b.verts.length < 3) continue;
-      
-      // Check if building is within range
-      const bLon = b.centroid[0];
-      const bLat = b.centroid[1];
-      const dist = haversineMeters(txLat, txLon, bLat, bLon);
-      
-      if (dist <= MAX_RANGE_M * 1.5) {
-        // For each building, create a shadow polygon from the building outward
-        // Find the "back" edge of the building (furthest from TX)
-        
-        // Find all vertices and their distances
-        const vertexDists = [];
-        for (let vIdx = 0; vIdx < b.verts.length; vIdx++) {
-          const v = b.verts[vIdx];
-          const vDist = haversineMeters(txLat, txLon, v[1], v[0]);
-          vertexDists.push({idx: vIdx, dist: vDist, v: v});
-        }
-        
-        // Sort by distance to find furthest vertices
-        vertexDists.sort((a, b) => b.dist - a.dist);
-        
-        // Take the furthest vertices (back of building)
-        const furthestVertices = vertexDists.slice(0, Math.min(3, vertexDists.length));
-        
-        if (furthestVertices.length > 0 && furthestVertices[0].dist < MAX_RANGE_M) {
-          // Create shadow polygon from building back edge to circle edge
-          const shadowPoints = [];
-          
-          // Add furthest vertices (back edge of building)
-          for (const fv of furthestVertices) {
-            shadowPoints.push(fv.v[0], fv.v[1]);
-          }
-          
-          // Extend outward from the furthest point to max range
-          const furthestV = furthestVertices[0].v;
-          const furthestLon = furthestV[0];
-          const furthestLat = furthestV[1];
-          const furthestDist = furthestVertices[0].dist;
-          
-          // Direction from TX to furthest point
-          const dirLon = (furthestLon - txLon);
-          const dirLat = (furthestLat - txLat);
-          const dirLen = Math.hypot(dirLon, dirLat);
-          
-          if (dirLen > 0) {
-            const dirLonNorm = dirLon / dirLen;
-            const dirLatNorm = dirLat / dirLen;
-            
-            // Create extension to max range with some width
-            const spreadAngle = 0.2; // radians
-            const centerAngle = Math.atan2(dirLatNorm, dirLonNorm);
-            
-            // Add points along the shadow edge
-            const numPoints = 5;
-            for (let p = 0; p <= numPoints; p++) {
-              const angle = centerAngle - spreadAngle + (2 * spreadAngle * p / numPoints);
-              const extDist = furthestDist + (p / numPoints) * (MAX_RANGE_M - furthestDist);
-              const extLon = txLon + Math.cos(angle) * extDist / metersPerDegLon;
-              const extLat = txLat + Math.sin(angle) * extDist / metersPerDegLat;
-              shadowPoints.push(extLon, extLat);
-            }
-            
-            attenuatedAreas.push(shadowPoints);
-          }
-        }
+
+  return {
+    hierarchy: new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(wavePoints)),
+    wavePoints: wavePoints
+  };
+}
+
+async function computeInteractionFlags(txLon, txLat, planeHeight) {
+  // Classification only affects COLOR; geometry stays full-circle.
+  // Colors requested:
+  //   - Google mesh hit => BLUE
+  //   - OSM footprint hit => PINK
+  //   - Both => WHITE
+  //   - Neither => YELLOW
+  const samples = 96;
+  const radii = [0.4, 0.75, 1.0];
+  const eps = 0.25; // meters
+
+  const metersPerDegLat = 111320.0;
+  const cosLat = Math.cos(Cesium.Math.toRadians(txLat));
+  const metersPerDegLon = metersPerDegLat * Math.max(0.1, cosLat);
+
+  const lonlats = [];
+  for (let rIdx = 0; rIdx < radii.length; rIdx++) {
+    const rr = radii[rIdx] * MAX_RANGE_M;
+    for (let i = 0; i < samples; i++) {
+      const ang = (i / samples) * Math.PI * 2.0;
+      const east = Math.cos(ang) * rr;
+      const north = Math.sin(ang) * rr;
+      lonlats.push([
+        txLon + (east / metersPerDegLon),
+        txLat + (north / metersPerDegLat)
+      ]);
+    }
+  }
+
+  // OSM collision: any sample inside any OSM building footprint
+  let hitOsm = false;
+  if (buildings && buildings.length) {
+    outer:
+    for (let p = 0; p < lonlats.length; p++) {
+      const qLon = lonlats[p][0], qLat = lonlats[p][1];
+      for (let b = 0; b < buildings.length; b++) {
+        const bb = buildings[b];
+        if (!bb.verts || bb.verts.length < 3) continue;
+        if (_pointInPoly(qLon, qLat, bb.verts)) { hitOsm = true; break outer; }
       }
     }
   }
-  
-  return {
-    hierarchy: new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(wavePoints)),
-    wavePoints: wavePoints,
-    attenuatedAreas: attenuatedAreas
-  };
+
+  // Google collision: any clamped mesh height above the plane
+  let hitGoogle = false;
+  try {
+    const probes = [];
+    for (let p = 0; p < lonlats.length; p++) {
+      const ll = lonlats[p];
+      probes.push(Cesium.Cartesian3.fromDegrees(ll[0], ll[1], 200.0));
+    }
+    const clampPromise = viewer.scene.clampToHeightMostDetailed(probes);
+    const clamped = await Promise.race([
+      clampPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 800))
+    ]);
+    if (clamped && clamped.length) {
+      for (let i = 0; i < clamped.length; i++) {
+        const c = clamped[i];
+        if (!c) continue;
+        const ch = Cesium.Cartographic.fromCartesian(c).height;
+        if (ch > (planeHeight + eps)) { hitGoogle = true; break; }
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  let baseColor = Cesium.Color.YELLOW;
+  if (hitGoogle && hitOsm) baseColor = Cesium.Color.WHITE;
+  else if (hitGoogle) baseColor = Cesium.Color.BLUE;
+  else if (hitOsm) baseColor = new Cesium.Color(1.0, 0.0, 1.0, 1.0); // pink/magenta
+
+  return { hitGoogle, hitOsm, baseColor };
 }
+
+
 
 async function setTxMarker(lon, lat) {
   const h = await clampHeightAt(lon, lat);
@@ -776,7 +807,8 @@ async function setTxMarker(lon, lat) {
         color: Cesium.Color.YELLOW,
         outlineColor: Cesium.Color.BLACK,
         outlineWidth: 2,
-        disableDepthTestDistance: Number.POSITIVE_INFINITY
+        // Always visible above the mesh
+        disableDepthTestDistance: 0.0
       },
       position: pos
     });
@@ -784,97 +816,77 @@ async function setTxMarker(lon, lat) {
     _txMarker.position = pos;
   }
 
-  // TX emission plane (flat circle at ground level, deformed/cut by buildings)
-  // The plane grows from TX point and gets fully stopped/deformed when contacting buildings
-  // This represents maximum attenuation - buildings completely block the RF signal
-  const planeHeight = h + 0.1; // Slightly above ground to avoid z-fighting
-  
-  // Build the plane with building attenuation (color change after passing through buildings)
-  const result = buildPlaneWithBuildingAttenuation(lon, lat);
+  // TX emission plane: full circle, never clipped/stopped.
+  const planeHeight = (isFinite(h) ? h : 0.0) + 0.15;
+
+  const result = buildPlaneFullCircle(lon, lat);
   const hierarchy = result.hierarchy;
   const wavePoints = result.wavePoints;
-  const attenuatedAreas = result.attenuatedAreas;
-  
-  // Initialize attenuated polygons array if needed
-  if (!window._attenuatedPolygons) {
-    window._attenuatedPolygons = [];
+
+  const flags = await computeInteractionFlags(lon, lat, planeHeight);
+  const baseColor = flags.baseColor;
+
+  // --- Base TX plane fill rendered as a Primitive ---
+  // Reason: Entities + depth test can make the plane appear to "stop" at the Google mesh.
+  // This primitive disables depth testing so it always renders through the mesh.
+  const alpha = 0.35;
+  const instanceColor = new Cesium.Color(baseColor.red, baseColor.green, baseColor.blue, alpha);
+
+  const geom = new Cesium.PolygonGeometry({
+    polygonHierarchy: hierarchy,
+    height: planeHeight,
+    vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT
+  });
+
+  _txPlaneGeomInstance = new Cesium.GeometryInstance({
+    geometry: geom,
+    attributes: {
+      color: Cesium.ColorGeometryInstanceAttribute.fromColor(instanceColor)
+    }
+  });
+
+  if (_txPlanePrim) {
+    viewer.scene.primitives.remove(_txPlanePrim);
+    _txPlanePrim = null;
   }
-  
-  // Remove old attenuated polygons
-  for (const poly of window._attenuatedPolygons) {
-    viewer.entities.remove(poly);
-  }
-  window._attenuatedPolygons = [];
-  
-  if (!_txSphere) {
-    // Create base plane (full circle - orange-yellow)
-    _txSphere = viewer.entities.add({
-      name: 'tx_plane',
-      polygon: {
-        hierarchy: hierarchy,
-        height: planeHeight,
-        material: new Cesium.Color(0.8, 0.6, 0.0, 0.75), // Base color - normal signal
-        outline: true,
-        outlineColor: new Cesium.Color(0.9, 0.7, 0.0, 0.90),
-        disableDepthTestDistance: Number.POSITIVE_INFINITY
-      }
-    });
-    
-    // Check B: Log the runtime value of disableDepthTestDistance
-    console.log(
-      "[TX Plane] disableDepthTestDistance =",
-      _txSphere.polygon.disableDepthTestDistance
-    );
-  } else {
-    // Update the plane when TX moves
-    _txSphere.polygon.hierarchy = hierarchy;
-    _txSphere.polygon.height = planeHeight;
-    
-    // Check B: Log the runtime value of disableDepthTestDistance
-    console.log(
-      "[TX Plane] disableDepthTestDistance =",
-      _txSphere.polygon.disableDepthTestDistance
-    );
-  }
-  
-  // Check C: Draw the same boundary as a polyline (no fill, no triangulation)
+
+  _txPlanePrim = viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: _txPlaneGeomInstance,
+    appearance: new Cesium.PerInstanceColorAppearance({
+      translucent: true,
+      closed: false
+    }),
+    asynchronous: false
+  }));
+
+  // Never get occluded by the Google mesh
+  _txPlanePrim.appearance.renderState = Cesium.RenderState.fromCache({
+    depthTest: { enabled: false },
+    depthMask: false,
+    blending: Cesium.BlendingState.ALPHA_BLEND
+  });
+
+  // Boundary outline (debug + always visible)
   if (_txPlaneOutline) {
     viewer.entities.remove(_txPlaneOutline);
     _txPlaneOutline = null;
   }
-  
+  const outlinePts = wavePoints.slice();
+  // close the loop
+  outlinePts.push(wavePoints[0], wavePoints[1]);
+
   _txPlaneOutline = viewer.entities.add({
     name: "tx_plane_outline",
     polyline: {
-      positions: Cesium.Cartesian3.fromDegreesArray(wavePoints),
-      width: 3,
+      positions: Cesium.Cartesian3.fromDegreesArray(outlinePts),
+      width: 2,
       material: Cesium.Color.CYAN,
       clampToGround: false,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY
+      disableDepthTestDistance: 0.0
     }
   });
-  
-  // Create overlay polygons for attenuated areas (darker color after passing through buildings)
-  if (attenuatedAreas && attenuatedAreas.length > 0) {
-    for (const areaPoints of attenuatedAreas) {
-      if (areaPoints.length >= 6) { // At least 3 points (lon,lat pairs)
-        const cartesianPoints = Cesium.Cartesian3.fromDegreesArray(areaPoints);
-        
-        const attenuatedPoly = viewer.entities.add({
-          name: 'attenuated_plane_area',
-          polygon: {
-            hierarchy: new Cesium.PolygonHierarchy(cartesianPoints),
-            height: planeHeight + 0.01, // Slightly above base plane to ensure visibility
-            material: new Cesium.Color(0.6, 0.2, 0.0, 0.75), // Darker red-orange for attenuation
-            outline: false,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY
-          }
-        });
-        window._attenuatedPolygons.push(attenuatedPoly);
-      }
-    }
-  }
 }
+
 
 
 // Build the heat overlay *once* at fixed world locations (the precomputed grid around CENTER).
@@ -1058,7 +1070,9 @@ async function initInteractiveMilestoneA() {
   // Entities get wiped by viewer.entities.removeAll() during rebuilds.
   // Force marker to be recreated on the next setTxMarker().
   _txMarker = null;
-  _txSphere = null;
+  if (_txPlanePrim) { viewer.scene.primitives.remove(_txPlanePrim); _txPlanePrim = null; }
+  _txPlaneGeomInstance = null;
+  if (_txPlaneOutline) { viewer.entities.remove(_txPlaneOutline); _txPlaneOutline = null; }
 
   // Bind UI listeners only once.
   if (!window.__rfInteractiveBound) {
@@ -1099,6 +1113,7 @@ def create_osm_rf_3d_html(
     tx_power_dbm: float,
     max_range_m: float,
     step_m: float,
+    cesium_base_url: str,
     show_google_tiles: bool = True,
 ) -> str:
     tileset_url = f"https://tile.googleapis.com/v1/3dtiles/root.json?key={api_key}"
@@ -1142,8 +1157,9 @@ def create_osm_rf_3d_html(
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
   <title>OSM-aware RF in 3D (Buildings + Forest)</title>
-  <script src=\"https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Cesium.js\"></script>
-  <link href=\"https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Widgets/widgets.css\" rel=\"stylesheet\" />
+  <script>window.CESIUM_BASE_URL = {json.dumps(cesium_base_url)};</script>
+  <script src="{cesium_base_url}Cesium.js"></script>
+  <link href="{cesium_base_url}Widgets/widgets.css" rel="stylesheet" />
   <style>
     html, body, #cesiumContainer {{ width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }}
     .panel {{
@@ -1446,26 +1462,64 @@ const GRID_STEP_M = {step_m};
 
 async function buildBuildingsAndForests() {{
       const alpha = parseFloat(document.getElementById('alpha').value);
-      const maxToClamp = 350; // keep interactive; clampToHeight is async and can be slow
-      const BASE_BIAS_M = -0.75; // sink volumes slightly to avoid 'on-roof' / floating artifacts
+      const BASE_BIAS_M = -0.75; // sink volumes slightly to avoid z-fighting
 
-      // While we build the overlays, clicks should queue the TX and be applied when we finish.
       window.__buildBusy = true;
+
+      async function clampCentroidHeights(features) {{
+        const out = new Array(features.length).fill(0.0);
+        if (!features || features.length === 0) return out;
+
+        const probes = [];
+        for (let i = 0; i < features.length; i++) {{
+          const f = features[i];
+          probes.push(Cesium.Cartesian3.fromDegrees(f.centroid[0], f.centroid[1], 200.0));
+        }}
+
+        const BATCH = 400;
+        for (let i = 0; i < probes.length; i += BATCH) {{
+          const slice = probes.slice(i, i + BATCH);
+          let clamped = null;
+          try {{
+            const clampPromise = viewer.scene.clampToHeightMostDetailed(slice);
+            clamped = await Promise.race([
+              clampPromise,
+              new Promise((resolve) => setTimeout(() => resolve(null), 800))
+            ]);
+          }} catch (e) {{
+            clamped = null;
+          }}
+          for (let j = 0; j < slice.length; j++) {{
+            const k = i + j;
+            const pos = (clamped && clamped[j]) ? clamped[j] : null;
+            if (!pos) continue;
+            const carto = Cesium.Cartographic.fromCartesian(pos);
+            out[k] = carto.height;
+          }}
+        }}
+        return out;
+      }}
+
+      // Clamp centroids once (batched) to avoid thousands of async clamps.
+      statusEl.textContent = 'Clamping feature centroids (batched)…';
+      const bHeights = await clampCentroidHeights(buildings);
+      const fHeights = await clampCentroidHeights(forests);
 
       // Buildings
       statusEl.textContent = 'Creating OSM buildings…';
-      const bCount = buildings.length;
-      for (let i = 0; i < bCount; i++) {{
+      for (let i = 0; i < buildings.length; i++) {{
         const b = buildings[i];
-        const lon = b.centroid[0];
-        const lat = b.centroid[1];
-        let baseH = (i < maxToClamp) ? await estimateBaseHeightForFeature(b, b.height_m) : 0.0;
-        if (baseH > 0.0) baseH = Math.max(0.0, baseH + BASE_BIAS_M);
-
         const degArray = [];
         for (const p of b.verts) {{
           degArray.push(p[0], p[1]);
         }}
+
+        let baseH = 0.0;
+        const roofH = bHeights[i];
+        if (roofH && isFinite(roofH) && b.height_m && isFinite(b.height_m)) {{
+          baseH = Math.max(0.0, roofH - b.height_m + BASE_BIAS_M);
+        }}
+
         const color = colorForRsrp(b.rf_dbm, alpha);
         const ent = viewer.entities.add({{
           name: 'building:' + b.id,
@@ -1483,19 +1537,19 @@ async function buildBuildingsAndForests() {{
 
       // Forests
       statusEl.textContent = 'Creating vegetation volumes…';
-      const fCount = forests.length;
-      for (let i = 0; i < fCount; i++) {{
+      for (let i = 0; i < forests.length; i++) {{
         const f = forests[i];
-        const lon = f.centroid[0];
-        const lat = f.centroid[1];
-        let baseH = (i < maxToClamp) ? await estimateBaseHeightForFeature(f, f.canopy_m) : 0.0;
-        if (baseH > 0.0) baseH = Math.max(0.0, baseH + BASE_BIAS_M);
-
         const degArray = [];
         for (const p of f.verts) {{
           degArray.push(p[0], p[1]);
         }}
-        // Render forest with same RF ramp but a green-ish tint by mixing with green
+
+        let baseH = 0.0;
+        const roofH = fHeights[i];
+        if (roofH && isFinite(roofH) && f.canopy_m && isFinite(f.canopy_m)) {{
+          baseH = Math.max(0.0, roofH - f.canopy_m + BASE_BIAS_M);
+        }}
+
         const rfColor = colorForRsrp(f.rf_dbm, alpha);
         const green = new Cesium.Color(0.1, 0.8, 0.2, alpha);
         const mix = Cesium.Color.lerp(green, rfColor, 0.65, new Cesium.Color());
@@ -1516,8 +1570,7 @@ async function buildBuildingsAndForests() {{
 
       window.__buildBusy = false;
 
-      // If the user clicked during build, apply that TX now; otherwise apply current TX so the
-      // freshly created entities match the active TX selection.
+      // Apply queued TX (if user clicked while loading), otherwise refresh current TX.
       const q = window.__queuedTxLonLat;
       if (q && q.length === 2) {{
         window.__queuedTxLonLat = null;
@@ -1600,7 +1653,9 @@ def main() -> int:
 
     parser.add_argument("--cache-dir", default="./cache/google_maps_3d", help="Cache directory for Google tileset root.json")
     parser.add_argument("--no-cache", action="store_true", help="Disable Google tileset caching")
-    parser.add_argument("--output", default="./osm_rf_3d.html", help="Output HTML")
+    parser.add_argument("--output", default="./public/osm_rf_3d.html", help="Output HTML (recommended under your web root)")
+    parser.add_argument("--cesium-dir", default=None, help="Directory to serve Cesium static assets from (default: <output_dir>/Cesium)")
+    parser.add_argument("--no-copy-cesium", action="store_true", help="Do not auto-copy Cesium from node_modules into --cesium-dir")
     parser.add_argument("--no-google", action="store_true", help="Start with Google tiles hidden (OSM overlay only)")
 
     args = parser.parse_args()
@@ -1717,6 +1772,21 @@ def main() -> int:
         )
 
 
+
+    # 5) Cesium self-host: ensure static assets are available and compute base URL relative to the HTML file
+    out_dir = os.path.dirname(args.output) or "."
+    cesium_dir = args.cesium_dir or os.path.join(out_dir, "Cesium")
+    ensure_cesium_static_dir(cesium_dir, copy_from_node_modules=(not args.no_copy_cesium))
+
+    # Make a browser-friendly relative URL (with trailing slash)
+    rel = os.path.relpath(cesium_dir, out_dir).replace(os.sep, "/")
+    if rel == ".":
+        rel = "Cesium"
+    if not (rel.startswith(".") or rel.startswith("/")):
+        rel = "./" + rel
+    if not rel.endswith("/"):
+        rel += "/"
+    cesium_base_url = rel
     out = create_osm_rf_3d_html(
         api_key=args.api_key,
         center_lat=args.lat,
@@ -1729,6 +1799,7 @@ def main() -> int:
         tx_power_dbm=args.tx_power_dbm,
         max_range_m=args.max_range_m,
         step_m=args.step_m,
+        cesium_base_url=cesium_base_url,
         show_google_tiles=not args.no_google,
     )
 
@@ -1736,7 +1807,7 @@ def main() -> int:
     logger.info("✓ HTML generated")
     logger.info(out)
     logger.info("Serve with: python3 -m http.server 8000")
-    logger.info(f"Open: http://localhost:8000/{Path(out).name}")
+    logger.info(f"Open: http://localhost:8000/{str(Path(out)).replace(os.sep, '/').lstrip('./')}")
     logger.info("=" * 60)
     return 0
 

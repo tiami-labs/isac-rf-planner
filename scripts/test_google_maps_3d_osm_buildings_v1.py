@@ -637,7 +637,9 @@ let _heatBuilt = false;
 let _heatPrims = [];
 let _heatLonLat = [];
 let _txMarker = null;
-let _txSphere = null;
+let _txSphere = null; // legacy: previously an Entity polygon fill
+let _txPlanePrim = null; // Primitive fill for TX plane (no depth test => never clipped by Google tiles)
+let _txPlaneGeomInstance = null;
 let _txPlaneOutline = null;
 let _txLon = CENTER_LON;
 let _txLat = CENTER_LAT;
@@ -794,6 +796,77 @@ async function setTxMarker(lon, lat) {
   const hierarchy = result.hierarchy;
   const wavePoints = result.wavePoints;
   const attenuatedAreas = result.attenuatedAreas;
+
+  // --- Interaction classification (PROVEN by explicit tests, not by rendering) ---
+  // Rules:
+  //   - Google mesh "collision" => BLUE
+  //   - OSM footprint "collision" => WHITE
+  //   - Both => RED
+  //   - Neither => YELLOW
+  async function _isInsideAnyOsmBuilding(qLon, qLat) {
+    if (!buildings || buildings.length === 0) return false;
+    for (let i = 0; i < buildings.length; i++) {
+      const b = buildings[i];
+      if (!b.verts || b.verts.length < 3) continue;
+      if (_pointInPoly(qLon, qLat, b.verts)) return true;
+    }
+    return false;
+  }
+
+  async function _computeInteractionFlags(txLon, txLat, planeHeight) {
+      // Sample along the coverage circle to detect Google and OSM interactions
+      const samples = 72;
+      const metersPerDegLat = 111320.0;
+      const cosLat = Math.cos(Cesium.Math.toRadians(txLat));
+      const metersPerDegLon = metersPerDegLat * Math.max(0.1, cosLat);
+
+      let hitGoogle = false;
+      let hitOsm = false;
+      const eps = 0.25; // meters
+
+      // Sample multiple points along the TX plane's boundary (circle)
+      for (let i = 0; i < samples; i++) {
+          const ang = (i / samples) * Math.PI * 2.0;
+          const east = Math.cos(ang) * MAX_RANGE_M;
+          const north = Math.sin(ang) * MAX_RANGE_M;
+          const qLon = txLon + (east / metersPerDegLon);
+          const qLat = txLat + (north / metersPerDegLat);
+
+          // Check if it intersects with OSM building footprint
+          if (!hitOsm) {
+              // eslint-disable-next-line no-await-in-loop
+              hitOsm = await _isInsideAnyOsmBuilding(qLon, qLat);
+          }
+
+          // Check if it intersects with the Google mesh (surface above the plane height)
+          if (!hitGoogle) {
+              // eslint-disable-next-line no-await-in-loop
+              const gh = await clampHeightAt(qLon, qLat);
+              if (gh > (planeHeight + eps)) hitGoogle = true;
+          }
+
+          if (hitGoogle && hitOsm) break;
+      }
+
+      // Determine the interaction color based on conditions
+      let baseColor = Cesium.Color.YELLOW; // Default: No interaction
+      if (hitGoogle && hitOsm) {
+          baseColor = Cesium.Color.RED; // Both Google and OSM interaction
+      } else if (hitGoogle) {
+          baseColor = Cesium.Color.BLUE; // Only Google interaction
+      } else if (hitOsm) {
+          baseColor = Cesium.Color.WHITE; // Only OSM interaction
+      }
+
+      return { hitGoogle, hitOsm, baseColor }; // Return flags and the computed color
+  }
+
+
+  const flags = await _computeInteractionFlags(lon, lat, planeHeight);
+  let baseColor = Cesium.Color.YELLOW;
+  if (flags.hitGoogle && flags.hitOsm) baseColor = Cesium.Color.RED;
+  else if (flags.hitGoogle) baseColor = Cesium.Color.BLUE;
+  else if (flags.hitOsm) baseColor = Cesium.Color.WHITE;
   
   // Initialize attenuated polygons array if needed
   if (!window._attenuatedPolygons) {
@@ -806,36 +879,45 @@ async function setTxMarker(lon, lat) {
   }
   window._attenuatedPolygons = [];
   
-  if (!_txSphere) {
-    // Create base plane (full circle - orange-yellow)
-    _txSphere = viewer.entities.add({
-      name: 'tx_plane',
-      polygon: {
-        hierarchy: hierarchy,
-        height: planeHeight,
-        material: new Cesium.Color(0.8, 0.6, 0.0, 0.75), // Base color - normal signal
-        outline: true,
-        outlineColor: new Cesium.Color(0.9, 0.7, 0.0, 0.90),
-        disableDepthTestDistance: Number.POSITIVE_INFINITY
-      }
-    });
-    
-    // Check B: Log the runtime value of disableDepthTestDistance
-    console.log(
-      "[TX Plane] disableDepthTestDistance =",
-      _txSphere.polygon.disableDepthTestDistance
-    );
-  } else {
-    // Update the plane when TX moves
-    _txSphere.polygon.hierarchy = hierarchy;
-    _txSphere.polygon.height = planeHeight;
-    
-    // Check B: Log the runtime value of disableDepthTestDistance
-    console.log(
-      "[TX Plane] disableDepthTestDistance =",
-      _txSphere.polygon.disableDepthTestDistance
-    );
+  // --- Base TX plane fill rendered as a Primitive (not an Entity polygon) ---
+  // Reason: Entity polygons can be visually clipped/occluded depending on translucency + depth.
+  // This primitive is rendered with depthTest disabled so it will never "stop" at the Google mesh.
+  const alpha = 0.35;
+  const instanceColor = new Cesium.Color(baseColor.red, baseColor.green, baseColor.blue, alpha);
+
+  const geom = new Cesium.PolygonGeometry({
+    polygonHierarchy: hierarchy,
+    height: planeHeight,
+    vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT
+  });
+
+  _txPlaneGeomInstance = new Cesium.GeometryInstance({
+    geometry: geom,
+    attributes: {
+      color: Cesium.ColorGeometryInstanceAttribute.fromColor(instanceColor)
+    }
+  });
+
+  if (_txPlanePrim) {
+    viewer.scene.primitives.remove(_txPlanePrim);
+    _txPlanePrim = null;
   }
+
+  _txPlanePrim = viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: _txPlaneGeomInstance,
+    appearance: new Cesium.PerInstanceColorAppearance({
+      translucent: true,
+      closed: false
+    }),
+    asynchronous: false
+  }));
+
+  // Ensure it never gets clipped by Google tiles (or anything else)
+  _txPlanePrim.appearance.renderState = Cesium.RenderState.fromCache({
+    depthTest: { enabled: false },
+    depthMask: false,
+    blending: Cesium.BlendingState.ALPHA_BLEND
+  });
   
   // Check C: Draw the same boundary as a polyline (no fill, no triangulation)
   if (_txPlaneOutline) {
