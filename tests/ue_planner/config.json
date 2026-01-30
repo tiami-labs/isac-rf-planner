@@ -1,0 +1,97 @@
+{
+  "telemetry_data_path": "./tiami_data",
+  "output_path": "./rfplanner_output",
+  "telemetry_file_pattern": "pbch_telemetry_*.json",
+  "raw_iq_file": "raw_iq_data.bin",
+  "cir_data_file": "cir_data.bin",
+  
+  "isac_enabled": true,
+  "motion_detection_threshold_us": 10.0,
+  "timing_accuracy_threshold_us": 5.0,
+  
+  "min_snr_db": 10.0,
+  "max_path_loss_db": 140.0,
+  "coverage_radius_m": 500.0,
+  
+  "antenna_gain_dbi": 3.0,
+  "cable_loss_db": 2.0,
+  "noise_figure_db": 7.0,
+  
+  "frequency_bands": {
+    "n78": {
+      "freq_mhz": 3500,
+      "bandwidth_mhz": 40
+    }
+  },
+  
+  "map_center_lat": 1.285095,
+  "map_center_lon": 103.840254,
+  "map_zoom": 12,
+  
+  "update_interval_ms": 1000,
+  "max_history_points": 1000,
+  
+  "log_level": "INFO",
+  "log_file": "rfplanner.log",
+  
+  "visualization": {
+    "figure_size": [12, 8],
+    "dpi": 300,
+    "style": "seaborn-v0_8",
+    "color_palette": "viridis",
+    "save_format": "png"
+  },
+  
+  "motion_analysis": {
+    "stationary_threshold_us": 5.0,
+    "slow_motion_threshold_us": 20.0,
+    "fast_motion_threshold_us": 50.0,
+    "confidence_threshold": 0.7
+  },
+  
+  "position_estimation": {
+    "timing_weight": 0.6,
+    "signal_strength_weight": 0.4,
+    "min_confidence": 0.5,
+    "max_position_error_m": 100.0
+  },
+  
+  "rf_planning": {
+    "environment": "urban",
+    "path_loss_model": "cost231",
+    "shadow_fading_std_db": 8.0,
+    "penetration_loss_db": 15.0,
+    "coverage_quality_thresholds": {
+      "excellent_snr_db": 20.0,
+      "good_snr_db": 15.0,
+      "fair_snr_db": 10.0,
+      "poor_snr_db": 5.0
+    }
+  },
+  
+  "clustering": {
+    "n_clusters": 5,
+    "random_state": 42,
+    "min_samples": 3,
+    "eps": 50.0
+  },
+  
+  "export": {
+    "include_raw_data": true,
+    "include_processed_data": true,
+    "include_statistics": true,
+    "include_visualizations": true,
+    "compression": false
+  },
+  
+  "real_time": {
+    "enable_alerts": true,
+    "alert_thresholds": {
+      "low_snr_db": 8.0,
+      "high_interference_db": -60.0,
+      "motion_detected": true,
+      "coverage_gap": true
+    },
+    "max_data_age_seconds": 300
+  }
+} 
