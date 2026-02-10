@@ -1,0 +1,20 @@
+{
+  "name": "rf-planning",
+  "version": "1.0.0",
+  "description": "RF planning system that uses vision-language models (VLMs) to detect materials in 360° panoramas and compute RF signal coverage heatmaps.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cesium": "1.111"
+  }
+}

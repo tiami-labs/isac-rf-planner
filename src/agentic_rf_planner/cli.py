@@ -51,6 +51,14 @@ def main() -> None:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--ray-mode",
+        choices=["2d", "3d"],
+        default=None,
+        help="Ray propagation mode: 2d (OSM polygons) or 3d (persisted Google mesh profiles)",
+    )
+    parser.add_argument("--tx-height-m", type=float, default=None, help="TX height above ground (meters)")
+    parser.add_argument("--rx-height-m", type=float, default=None, help="RX height above ground (meters)")
     args = parser.parse_args()
 
     # Load configuration
@@ -67,12 +75,18 @@ def main() -> None:
 
     # Load RF params
     rf_cfg = cfg.get("rf", {})
+    ray_mode = args.ray_mode or rf_cfg.get("ray_mode", "2d")
+    tx_height_m = args.tx_height_m if args.tx_height_m is not None else rf_cfg.get("tx_height_m", 0.0)
+    rx_height_m = args.rx_height_m if args.rx_height_m is not None else rf_cfg.get("rx_height_m", 1.5)
     rf_params = RFParams(
         freq_mhz=rf_cfg.get("freq_mhz", 3500.0),
         tx_power_dbm=rf_cfg.get("tx_power_dbm", 30.0),
         noise_floor_dbm=rf_cfg.get("noise_floor_dbm", -100.0),
         max_range_m=rf_cfg.get("max_range_m", 500.0),
         step_m=rf_cfg.get("step_m", 5.0),
+        ray_mode=ray_mode,
+        tx_height_m=float(tx_height_m),
+        rx_height_m=float(rx_height_m),
     )
 
     # Load VLM
