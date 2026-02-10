@@ -105,11 +105,19 @@ def load_cached_osm_data(center: LatLon, radius_m: float, data_type: str) -> Opt
         
         # Simple distance check (if requested center is within cached region)
         # For now, we require exact match (grid-based)
-        logger.info(f"✓ Cache HIT: Loaded {len(data['data'])} {data_type} from cache")
+        num_items = len(data['data'])
+        logger.info(f"✓ Cache HIT: Loaded {num_items} {data_type} from cache")
         logger.debug(f"  Cache file: {cache_path}")
         logger.debug(f"  Cached at: {data.get('cached_at', 'unknown')}")
         logger.debug(f"  Cached center: {data.get('center', {})}")
         logger.debug(f"  Cached radius: {data.get('radius_m', 'unknown')}m")
+        
+        if num_items == 0:
+            logger.warning(f"⚠ WARNING: Cache returned 0 {data_type} - this may indicate:")
+            logger.warning(f"  1. Previous query found no {data_type} at this location")
+            logger.warning(f"  2. Location has no OSM {data_type} data")
+            logger.warning(f"  3. Cache file contains empty result from previous fetch")
+        
         return data['data']
     
     except Exception as e:

@@ -55,10 +55,50 @@ def attenuation_grid_to_raster(
             # Average if multiple points
             rsrp_2d[lat_idx, lon_idx] = (rsrp_2d[lat_idx, lon_idx] + rsrp) / 2.0
 
-    # Fill NaN values with nearest neighbor
-    rsrp_2d = _fill_nans(rsrp_2d)
+    # Fill NaN values with nearest neighbor (inside the sampled region only).
+    rsrp_filled = _fill_nans(rsrp_2d.copy())
 
-    return lats_2d, lons_2d, rsrp_2d
+    # Enforce a circular mask so the heatmap is a radius around the TX,
+    # not the full bounding-box rectangle.
+    #
+    # IMPORTANT: The world grid is generated on a square bounding box around TX,
+    # so the farthest points are corners (~sqrt(2) * max_range). If we derive the
+    # radius from the farthest cell, the mask will NOT be circular.
+    # Use the configured RF max_range_m as the authoritative radius.
+    try:
+        tx_lat = float(grid.tx.lat)
+        tx_lon = float(grid.tx.lon)
+        earth_m = 6371000.0
+
+        lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
+        lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
+
+        # Equirectangular approximation (sufficient at city scale).
+        x = np.deg2rad(lon_arr - tx_lon) * np.cos(np.deg2rad((lat_arr + tx_lat) * 0.5))
+        y = np.deg2rad(lat_arr - tx_lat)
+        # Authoritative radius.
+        radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
+        if radius_m <= 0.0:
+            dist_m = earth_m * np.sqrt(x * x + y * y)
+            radius_m = float(np.nanmax(dist_m)) if dist_m.size else 0.0
+
+        # Compute distances for raster grid
+        x2 = np.deg2rad(lons_2d - tx_lon) * np.cos(
+            np.deg2rad((lats_2d + tx_lat) * 0.5)
+        )
+        y2 = np.deg2rad(lats_2d - tx_lat)
+        dist2_m = earth_m * np.sqrt(x2 * x2 + y2 * y2)
+
+        # Add a small margin (~1 pixel) to avoid clipping the boundary.
+        px_m = max(1.0, radius_m / max(1.0, min(width, height)))
+        mask = dist2_m <= (radius_m + 2.0 * px_m)
+        rsrp_filled[~mask] = np.nan
+    except Exception:
+        # If anything goes wrong, fall back to filled raster.
+        pass
+
+    return lats_2d, lons_2d, rsrp_filled
+
 
 
 def _fill_nans(arr: np.ndarray) -> np.ndarray:

@@ -56,9 +56,31 @@ class OSMMapProvider(MapProvider):
             center: Center point for prefetch
             radius_m: Radius to prefetch (should cover all cells)
         """
+        logger.info("="*60)
+        logger.info(f"OSM PREFETCH CALLED: center=({center.lat:.6f}, {center.lon:.6f}), radius={radius_m}m")
+        logger.info(f"  _prefetched: {self._prefetched}")
+        logger.info(f"  _cache_center: {self._cache_center}")
+        logger.info(f"  _prefetch_radius_m: {self._prefetch_radius_m}")
+        if self._cache_center:
+            dist = _distance_m(center, self._cache_center)
+            logger.info(f"  Distance from cache center: {dist:.1f}m")
+        logger.info("="*60)
+        
         if self._prefetched and self._cache_center and _distance_m(center, self._cache_center) < 100.0 and radius_m <= self._prefetch_radius_m:
-            logger.debug(f"Using existing prefetched data (radius={self._prefetch_radius_m}m)")
-            return
+            logger.info(f"Using existing prefetched data (radius={self._prefetch_radius_m}m)")
+            logger.info(f"  Existing cache: {len(self._cached_buildings)} buildings, {len(self._cached_landuse)} landuse")
+            if len(self._cached_buildings) == 0:
+                logger.warning(f"⚠ WARNING: Existing cache has 0 buildings! This is likely the problem!")
+                logger.warning(f"  The cache was likely populated with empty data from a previous query")
+                logger.warning(f"  Solution: Clear the OSM cache using POST /api/clear-cache with clear_osm=true")
+                logger.warning(f"  OR: The location truly has no OSM building data")
+                logger.warning(f"  Forcing re-fetch to verify...")
+                # Force re-fetch even if cache exists (to verify if location has data)
+                self._prefetched = False
+                self._cache_center = None
+            else:
+                # Cache has data, use it
+                return
         
         logger.info(f"Pre-fetching OSM data for radius {radius_m}m around ({center.lat}, {center.lon})...")
         
@@ -74,6 +96,11 @@ class OSMMapProvider(MapProvider):
             logger.info(f"✓ Cache HIT (both): Loaded from persistent cache: {len(cached_buildings)} buildings, {len(cached_landuse)} landuse areas")
             self._cached_buildings = cached_buildings
             self._cached_landuse = cached_landuse
+            if len(cached_buildings) == 0:
+                logger.warning(f"⚠ WARNING: Cache returned 0 buildings - this may indicate:")
+                logger.warning(f"  1. Previous fetch returned 0 buildings (location has no OSM data)")
+                logger.warning(f"  2. Cache file is corrupted or empty")
+                logger.warning(f"  Consider clearing cache and re-fetching")
         else:
             # Partial or full cache miss - fetch missing data
             if not cache_hit_buildings and not cache_hit_landuse:
@@ -87,7 +114,12 @@ class OSMMapProvider(MapProvider):
             if not cache_hit_buildings:
                 self._cached_buildings = self._fetch_buildings_from_osm(center, radius_m)
                 logger.info(f"  Pre-fetched {len(self._cached_buildings)} buildings")
-                # Save to persistent cache
+                # Save to persistent cache (even if empty - this is valid if location has no buildings)
+                # But warn if we got 0 buildings from a fresh fetch
+                if len(self._cached_buildings) == 0:
+                    logger.warning(f"⚠ WARNING: Fresh OSM API query returned 0 buildings")
+                    logger.warning(f"  This means the location ({center.lat:.6f}, {center.lon:.6f}) has no building data in OSM")
+                    logger.warning(f"  Check https://www.openstreetmap.org/ to verify building coverage at this location")
                 save_cached_osm_data(center, radius_m, 'buildings', self._cached_buildings)
             else:
                 self._cached_buildings = cached_buildings
@@ -174,10 +206,16 @@ class OSMMapProvider(MapProvider):
         out geom;
         """
         
+        logger.debug(f"OSM query bbox: {bbox}")
+        logger.debug(f"OSM query URL: {OVERPASS_URL}")
+        
         try:
+            logger.info(f"Fetching buildings from OSM Overpass API (bbox: {bbox})...")
             response = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
             response.raise_for_status()
             data = response.json()
+            
+            logger.debug(f"OSM API response: {len(data.get('elements', []))} elements")
             
             buildings = []
             for element in data.get("elements", []):
@@ -191,10 +229,21 @@ class OSMMapProvider(MapProvider):
                     building["material"] = _extract_building_material(building)
                     buildings.append(building)
             
+            logger.info(f"Successfully fetched {len(buildings)} buildings from OSM")
+            if len(buildings) == 0:
+                logger.warning(f"⚠ No buildings found in OSM for bbox {bbox}")
+                logger.warning(f"  This may be normal if the location has no building data in OSM")
+                logger.warning(f"  Check https://www.openstreetmap.org/ to verify building coverage")
+            
             return buildings
             
+        except requests.exceptions.RequestException as e:
+            logger.error(f"✗ Network error fetching buildings from OSM: {e}")
+            logger.error(f"  URL: {OVERPASS_URL}")
+            logger.error(f"  Query bbox: {bbox}")
+            return []
         except Exception as e:
-            logger.warning(f"Failed to fetch buildings from OSM: {e}")
+            logger.error(f"✗ Error fetching buildings from OSM: {e}", exc_info=True)
             return []
     
     def _fetch_landuse_from_osm(self, center: LatLon, radius_m: float) -> List[dict]:
