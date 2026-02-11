@@ -121,6 +121,32 @@ class GoogleMeshOSMMapProvider(MapProvider):
                 message="Missing persisted mesh ray profiles for this TX/config",
             )
 
+        # Backward-compatibility: older persisted profiles could be missing OSM semantics
+        # (kind/material/osm_id) due to a schema mismatch in osm_enrichment. If we have
+        # an OSM provider available, opportunistically enrich and re-persist once.
+        if self.osm is not None:
+            try:
+                needs = False
+                for bp in prof.profiles:
+                    for seg in bp.segments:
+                        k = (seg.kind or "unknown").lower()
+                        m = (seg.material or "unknown").lower()
+                        if seg.osm_id is None and (k == "unknown" or m == "unknown"):
+                            needs = True
+                            break
+                    if needs:
+                        break
+
+                if needs:
+                    from .osm_enrichment import enrich_profile_set_with_osm
+
+                    logger.info("Enriching legacy mesh profile set with OSM semantics...")
+                    prof = enrich_profile_set_with_osm(prof, osm=self.osm)
+                    self.store.put(prof)
+                    logger.info("✓ Updated persisted mesh profiles with OSM enrichment")
+            except Exception as e:
+                logger.warning(f"Failed to enrich legacy mesh profile set (non-fatal): {e}")
+
         self._load_profiles(center, prof)
 
     def _load_profiles(self, tx: LatLon, profile_set: RayProfileSet) -> None:
