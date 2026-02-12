@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Agentic RF Planner (3D)</title>
+  <link rel="stylesheet" href="/Cesium/Widgets/widgets.css" />
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    /* Match the 2D UI layout (sidebar is 230px wide in style.css). */
+    body { background: #000; overflow: hidden; }
+    #cesiumContainer { position:absolute; top:0; right:0; bottom:0; left:230px; }
+    /* Offscreen host used to generate mesh profiles without leaving the main UI */
+    #cesiumProfilerHost { position:absolute; left:-99999px; top:-99999px; width:800px; height:600px; }
+    #mesh-profile-status { margin-top: 8px; font-size: 11px; color: #bbb; white-space: pre-wrap; }
+    details summary { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>RF Planner (3D)</h2>
+    <div id="status">Loading 3D viewer…</div>
+
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
+      <h3 style="font-size: 14px; margin-bottom: 10px;">Ray Mode</h3>
+
+      <div style="margin-bottom: 10px;">
+        <label for="ray-mode" style="display: block; font-size: 11px; margin-bottom: 3px;">Propagation:</label>
+        <select id="ray-mode"
+          style="width: 100%; padding: 6px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;">
+          <option value="2d">2D (OSM geometry)</option>
+          <option value="3d" selected>3D (Google mesh + OSM semantics)</option>
+        </select>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <div>
+          <label for="tx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">TX height (m)</label>
+          <input type="number" id="tx-height-m" step="0.5" value="10.0"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">RX height (m)</label>
+          <input type="number" id="rx-height-m" step="0.5" value="1.5"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+      </div>
+
+      <div id="mesh-profile-status"></div>
+    </div>
+
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
+      <h3 style="font-size: 14px; margin-bottom: 10px;">Enter Coordinates</h3>
+      <form id="coord-form">
+        <div style="margin-bottom: 10px;">
+          <label style="display: block; font-size: 12px; margin-bottom: 4px;">Latitude:</label>
+          <!-- step="any" avoids browser "nearest valid value" errors when clicking mesh (6+ decimals). -->
+          <input type="number" id="lat-input" step="any" value="37.7749"
+            style="width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #444; background: #222; color: #eee;" />
+        </div>
+        <div style="margin-bottom: 10px;">
+          <label style="display: block; font-size: 12px; margin-bottom: 4px;">Longitude:</label>
+          <input type="number" id="lon-input" step="any" value="-122.4194"
+            style="width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #444; background: #222; color: #eee;" />
+        </div>
+
+        <button type="submit"
+          style="width: 100%; padding: 8px; background: #0066cc; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; font-weight: bold;">
+          Plan RF
+        </button>
+      </form>
+
+      <details style="margin-top: 10px;">
+        <summary style="font-size: 12px; color: #ccc;">Advanced RF params</summary>
+        <div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Freq (MHz)</label>
+            <input id="freq-mhz" type="number" step="0.1" value="3500"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">TX power (dBm)</label>
+            <input id="tx-power-dbm" type="number" step="0.1" value="43"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Noise figure (dB)</label>
+            <input id="noise-figure-db" type="number" step="0.1" value="7.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">SCS (kHz)</label>
+            <input id="scs-khz" type="number" step="1" value="15"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">RB</label>
+            <input id="num-rb" type="number" step="1" value="100"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">BW (MHz)</label>
+            <input id="bw-mhz" type="number" step="0.1" value="20"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">MIMO mode</label>
+            <select id="mimo-mode" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;">
+              <option value="SISO" selected>SISO</option>
+              <option value="SIMO">SIMO</option>
+              <option value="MISO">MISO</option>
+              <option value="MIMO">MIMO</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Link adaptation</label>
+            <select id="link-adapt" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;">
+              <option value="1" selected>Enabled</option>
+              <option value="0">Disabled</option>
+            </select>
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
+      <h3 style="font-size: 14px; margin-bottom: 10px;">3D Mesh Profile Params</h3>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <div>
+          <label style="display:block; font-size:10px; color:#ccc;">Radius (m)</label>
+          <input type="number" id="max-range" step="10" value="500"
+            style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+        </div>
+        <div>
+          <label style="display:block; font-size:10px; color:#ccc;">dr (m)</label>
+          <input type="number" id="dr-m" step="1" value="5"
+            style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+        </div>
+        <div>
+          <label style="display:block; font-size:10px; color:#ccc;">dθ (deg)</label>
+          <input type="number" id="dtheta" step="1" value="5"
+            style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+        </div>
+      </div>
+      <div style="margin-top: 8px; font-size: 10px; color: #aaa;">
+        Used to generate persisted Google-mesh ray profiles (only when ray_mode=3d and missing).
+      </div>
+    </div>
+
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
+      <h3 style="font-size: 14px; margin-bottom: 10px;">Sector Configuration</h3>
+      <div id="sectors-container" style="display: flex; flex-direction: column; gap: 10px;"></div>
+      <button id="add-sector-btn" type="button"
+        style="margin-top: 8px; padding: 6px; background: #006600; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 11px;">
+        + Add Sector
+      </button>
+      <div style="margin-top: 8px; font-size: 10px; color: #aaa;">Default: Omnidirectional (360°)</div>
+    </div>
+
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
+      <div style="margin-bottom: 10px;">
+        <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" id="show-sectors-toggle" checked style="cursor:pointer;" />
+          <span>Show Sector Overlays</span>
+        </label>
+      </div>
+      <button id="clear-map-btn"
+        style="width: 100%; padding: 8px; background: #cc0000; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; font-weight: bold;">
+        Clear Map
+      </button>
+
+      <div style="margin-top: 10px; font-size: 11px;">
+        <a href="/2d" style="color:#7ab7ff; text-decoration:none;">Switch to 2D UI</a>
+        &nbsp;|&nbsp;
+        <a href="/mesh-profiler" target="_blank" style="color:#7ab7ff; text-decoration:none;">Mesh profiler</a>
+      </div>
+    </div>
+  </div>
+
+  <div id="cesiumContainer"></div>
+  <div id="cesiumProfilerHost"></div>
+
+  <script type="module" src="/planner_3d.js"></script>
+</body>
+</html>
