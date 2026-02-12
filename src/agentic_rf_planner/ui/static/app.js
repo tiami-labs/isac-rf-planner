@@ -115,10 +115,10 @@ function loadLastResults() {
 
 // Try to restore last results on page load
 window.addEventListener('DOMContentLoaded', () => {
-  // Initialize Ray Mode selector from server env (RFP_DEFAULT_RAY_MODE).
+  // Initialize Ray Mode selector (defaults to "2d" from server config).
   fetch("/api/config").then(r => r.ok ? r.json() : null).then(cfg => {
     if (!cfg) return;
-    const mode = String(cfg.default_ray_mode || "").toLowerCase();
+    const mode = String(cfg.default_ray_mode || "2d").toLowerCase();
     const sel = document.getElementById("ray-mode");
     if (sel && (mode === "2d" || mode === "3d")) sel.value = mode;
   }).catch(e => console.warn("[RF Planner] Failed to load /api/config for default ray mode:", e));
