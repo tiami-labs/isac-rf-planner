@@ -71,7 +71,7 @@ class PlanRequest(BaseModel):
     fixed_modulation: Optional[str] = None
 
     # Ray propagation mode selection
-    # If omitted, defaults to env RFP_DEFAULT_RAY_MODE (fallback: "2d").
+    # If omitted, defaults to "2d". UI controls this via the ray-mode selector.
     ray_mode: Optional[str] = None  # "2d" or "3d"
     tx_height_m: float = 0.0
     rx_height_m: float = 1.5
@@ -103,7 +103,9 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
     
     try:
         logger.info("Step 1: Creating RFParams...")
-        effective_ray_mode = (req.ray_mode or os.environ.get("RFP_DEFAULT_RAY_MODE") or "2d").strip()
+        # Use UI-provided ray_mode if present, otherwise default to 2d (ignore env var)
+        # The UI toggle should control this, not an environment variable
+        effective_ray_mode = (req.ray_mode or "2d").strip().lower()
         rf_params = RFParams(
             freq_mhz=req.freq_mhz,
             tx_power_dbm=req.tx_power_dbm,
@@ -184,7 +186,8 @@ def api_config() -> Dict[str, Any]:
     This endpoint is intended for local development only.
     """
     key = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_MAPS_APIKEY")
-    default_ray_mode = (os.environ.get("RFP_DEFAULT_RAY_MODE") or "2d").strip().lower()
+    # Default ray mode is always "2d" - UI controls the actual mode via ray-mode selector
+    default_ray_mode = "2d"
     return {
         "google_maps_api_key": key or "",
         "google_maps_api_key_present": bool(key),
@@ -355,10 +358,38 @@ if static_dir.exists():
     
     @app.get("/")
     async def serve_index():
-        """Serve index.html."""
+        """Serve the default UI.
+
+        Defaults to 2D Leaflet UI. 3D Cesium UI is available at /3d.
+        """
+        # Always default to 2D - users can navigate to /3d if they want 3D mode
+        default_ray_mode = "2d"
+        if default_ray_mode == "3d":
+            idx3 = static_dir / "index_3d.html"
+            if idx3.exists():
+                return FileResponse(str(idx3))
+
         index_path = static_dir / "index.html"
         if index_path.exists():
             return FileResponse(str(index_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/2d")
+    async def serve_index_2d():
+        """Serve the 2D Leaflet UI explicitly."""
+        index_path = static_dir / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/3d")
+    async def serve_index_3d():
+        """Serve the 3D Cesium UI explicitly."""
+        idx3 = static_dir / "index_3d.html"
+        if idx3.exists():
+            return FileResponse(str(idx3))
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
     
@@ -374,6 +405,14 @@ if static_dir.exists():
     @app.get("/app.js")
     async def serve_app_js():
         file_path = static_dir / "app.js"
+        if file_path.exists():
+            return FileResponse(str(file_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/planner_3d.js")
+    async def serve_planner_3d_js():
+        file_path = static_dir / "planner_3d.js"
         if file_path.exists():
             return FileResponse(str(file_path))
         from fastapi import HTTPException
