@@ -122,10 +122,16 @@ def run_rf_planning_for_point(
                 try:
                     map_provider.prefetch_all_data(snapped.latlon, rf_params.max_range_m + 50.0)
                 except MissingMeshProfiles as e:
-                    # Bubble up so the REST layer / UI can auto-generate profiles on demand.
-                    raise
+                    # 3D mode requires mesh profiles - fall back to 2D OSM mode instead of stub
+                    logger.warning(f"  3D mesh profiles missing (key={e.key}), falling back to 2D OSM mode")
+                    logger.info("  Using OSM MapProvider (2D) as fallback...")
+                    map_provider = osm  # Use the OSM provider we already created
+                    # Update ray_mode to 2d for consistency
+                    rf_params.ray_mode = "2d"
+                    logger.info("✓ Using OSM MapProvider for geometry-based world model (2D fallback)")
 
-                logger.info("✓ Using Google-mesh MapProvider (3D ray propagation)")
+                if map_provider is not None and not isinstance(map_provider, OSMMapProvider):
+                    logger.info("✓ Using Google-mesh MapProvider (3D ray propagation)")
             else:
                 logger.info("  Creating OSMMapProvider...")
                 map_provider = OSMMapProvider(cache_radius_m=1000.0)
@@ -134,8 +140,34 @@ def run_rf_planning_for_point(
             # Preserve user-actionable errors (e.g., missing mesh profiles in 3D mode).
             raise
         except Exception as e:
-            logger.warning(f"  Failed to initialize map provider ({ray_mode}): {e}, falling back to stub")
-            map_provider = StubMapProvider()
+            # Check if this is a MissingMeshProfiles exception (3D mode without profiles)
+            # Import here to avoid circular dependency (only needed if 3D mode was attempted)
+            try:
+                from ..geo.google_mesh.provider import MissingMeshProfiles
+                is_missing_profiles = isinstance(e, MissingMeshProfiles)
+            except (ImportError, AttributeError):
+                is_missing_profiles = False
+            
+            if is_missing_profiles:
+                logger.warning(f"  3D mesh profiles missing (key={e.key}), falling back to 2D OSM mode")
+                logger.info("  Using OSM MapProvider (2D) as fallback...")
+                try:
+                    map_provider = OSMMapProvider(cache_radius_m=1000.0)
+                    rf_params.ray_mode = "2d"  # Update ray_mode to 2d
+                    logger.info("✓ Using OSM MapProvider (2D fallback from missing 3D profiles)")
+                except Exception as e2:
+                    logger.error(f"  Failed to create OSM provider: {e2}, using stub")
+                    map_provider = StubMapProvider()
+            else:
+                logger.warning(f"  Failed to initialize map provider ({ray_mode}): {e}, falling back to 2D OSM mode")
+                # Fall back to OSM provider instead of stub
+                try:
+                    map_provider = OSMMapProvider(cache_radius_m=1000.0)
+                    rf_params.ray_mode = "2d"  # Update ray_mode to 2d
+                    logger.info("✓ Using OSM MapProvider (2D fallback)")
+                except Exception as e2:
+                    logger.error(f"  Failed to create OSM provider: {e2}, using stub")
+                    map_provider = StubMapProvider()
     else:
         logger.info("  Using provided map_provider")
     
