@@ -40,14 +40,46 @@ def build_world_model(
     import logging
     logger = logging.getLogger(__name__)
     
+    # DIAGNOSTIC: Log map_provider status
+    logger.info("="*60)
+    logger.info(f"BUILD_WORLD_MODEL CALLED")
+    logger.info(f"  TX: ({tx.lat:.6f}, {tx.lon:.6f})")
+    logger.info(f"  map_provider: {map_provider}")
+    logger.info(f"  map_provider type: {type(map_provider)}")
+    if map_provider is not None:
+        logger.info(f"  map_provider has prefetch_all_data: {hasattr(map_provider, 'prefetch_all_data')}")
+    logger.info("="*60)
+    
     # Pre-fetch all OSM data BEFORE processing cells (critical for performance)
     if map_provider is not None:
         # Check if map_provider has prefetch capability
         if hasattr(map_provider, 'prefetch_all_data'):
             prefetch_radius = rf_params.max_range_m + 50.0  # Add buffer
             logger.info(f"Pre-fetching OSM data for {prefetch_radius}m radius...")
-            map_provider.prefetch_all_data(tx, prefetch_radius)
-            logger.info("✓ OSM data pre-fetched, processing cells with cached data")
+            try:
+                map_provider.prefetch_all_data(tx, prefetch_radius)
+                # Verify that data was actually fetched
+                if hasattr(map_provider, '_cached_buildings'):
+                    num_buildings = len(map_provider._cached_buildings)
+                    num_landuse = len(getattr(map_provider, '_cached_landuse', []))
+                    logger.info(f"✓ OSM data pre-fetched: {num_buildings} buildings, {num_landuse} landuse areas")
+                    if num_buildings == 0:
+                        logger.warning(f"⚠ WARNING: No buildings found in OSM data for radius {prefetch_radius}m around ({tx.lat}, {tx.lon})")
+                        logger.warning("  This may indicate:")
+                        logger.warning("  1. Location has no OSM building data")
+                        logger.warning("  2. OSM API query failed silently")
+                        logger.warning("  3. Cache returned empty results incorrectly")
+                    else:
+                        logger.info("✓ OSM data pre-fetched, processing cells with cached data")
+                else:
+                    logger.warning("⚠ WARNING: prefetch_all_data completed but _cached_buildings not found")
+            except Exception as e:
+                logger.error(f"✗ ERROR: Failed to prefetch OSM data: {e}", exc_info=True)
+                logger.warning("  Continuing with empty OSM data - all cells will be LOS/UNKNOWN")
+        else:
+            logger.warning(f"⚠ WARNING: map_provider does not have prefetch_all_data method (type: {type(map_provider)})")
+    else:
+        logger.warning("⚠ WARNING: map_provider is None - no OSM data will be used")
 
     # Build coverage grid with adaptive ray termination
     # Pass map_provider so rays can stop when signal is too weak or metal blocks
