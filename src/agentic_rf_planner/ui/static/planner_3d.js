@@ -2,7 +2,7 @@
 //
 // Goals:
 // - Mirror the 2D UI controls (ray mode + heights + sector configs + RF params).
-// - Heatmap must be a circular radius (backend masks raster outside sampled radius).
+// - Heatmap rendering supports scatter (2D-style) and raster (legacy disc).
 // - In 3D mode, if mesh profiles are missing, auto-generate+upload them in-browser.
 
 import * as Cesium from "/Cesium/index.js";
@@ -125,6 +125,50 @@ function colorForValue(v, vmin, vmax) {
     r = 1; g = 0.5 * (1 - u); b = 0;
   }
   return new Cesium.Color(r, g, b, 0.70);
+}
+
+
+
+function renderGridPointHeatmap(grid) {
+  // Render the SAME scattered cells as the 2D Leaflet UI, but in Cesium.
+  // This preserves ray termination + road corridors because missing cells remain missing.
+  clearOverlay();
+  if (!grid || !grid.cell_lat || !grid.cell_lon || !grid.rsrp_dbm) return;
+
+  const n = Math.min(grid.cell_lat.length, grid.cell_lon.length, grid.rsrp_dbm.length);
+  if (n <= 0) return;
+
+  // Compute finite min/max
+  let vmin = Infinity;
+  let vmax = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const v = grid.rsrp_dbm[i];
+    if (!Number.isFinite(v)) continue;
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+  }
+  if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
+
+  const px = Math.max(1, Math.round(getNumber("heatmap-point-size-px", 6)));
+  const hM = getNumber("heatmap-point-height-m", 2.0);
+
+  // Use PointPrimitiveCollection for performance (~7k points typical)
+  points = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection());
+
+  for (let i = 0; i < n; i++) {
+    const lat = grid.cell_lat[i];
+    const lon = grid.cell_lon[i];
+    const v = grid.rsrp_dbm[i];
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(v)) continue;
+
+    points.add({
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, hM),
+      color: colorForValue(v, vmin, vmax),
+      pixelSize: px,
+      // Ensure overlay remains visible on top of 3D tiles.
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    });
+  }
 }
 
 function renderHeatmap(heatmap, txLat, txLon, radiusM) {
@@ -678,21 +722,41 @@ async function runPlan() {
     return;
   }
 
-  // Update TX marker to snapped point (backend always snaps today).
+  // Update TX marker to snapped point when provided (2D snaps; 3D mesh mode may not).
   if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
     updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
   } else {
     updateTxMarker(lat, lon);
   }
 
-  // Heatmap (circular disc)
-  if (out.heatmap) {
-    const tx = out.snapped_tx || out.original_point || currentTxLocation;
-    const simRadiusM = (out.grid && out.grid.rf_params && out.grid.rf_params.max_range_m)
-      ? Number(out.grid.rf_params.max_range_m)
-      : getNumber("max-range", 500.0);
-    if (tx && Number.isFinite(tx.lat) && Number.isFinite(tx.lon)) {
-      renderHeatmap(out.heatmap, tx.lat, tx.lon, simRadiusM);
+
+  // Heatmap rendering
+  // Default: scatter (same as 2D planner) so the coverage outline deforms based on ray termination.
+  const renderMode = getString("heatmap-render-mode", "scatter").toLowerCase();
+
+  if (renderMode === "raster") {
+    // Legacy: rasterize to a textured disc (fills gaps; can look overly circular)
+    if (out.heatmap) {
+      const tx = out.snapped_tx || out.original_point || currentTxLocation;
+      const simRadiusM = (out.grid && out.grid.rf_params && out.grid.rf_params.max_range_m)
+        ? Number(out.grid.rf_params.max_range_m)
+        : getNumber("max-range", 500.0);
+      if (tx && Number.isFinite(tx.lat) && Number.isFinite(tx.lon)) {
+        renderHeatmap(out.heatmap, tx.lat, tx.lon, simRadiusM);
+      }
+    }
+  } else {
+    // Recommended: render scattered cells from the backend attenuation grid.
+    // This preserves non-uniform reach (streets vs buildings) because we do not fill missing cells.
+    if (out.grid) {
+      renderGridPointHeatmap(out.grid);
+    } else if (out.heatmap) {
+      // Fallback: raster if grid is missing.
+      const tx = out.snapped_tx || out.original_point || currentTxLocation;
+      const simRadiusM = getNumber("max-range", 500.0);
+      if (tx && Number.isFinite(tx.lat) && Number.isFinite(tx.lon)) {
+        renderHeatmap(out.heatmap, tx.lat, tx.lon, simRadiusM);
+      }
     }
   }
 
