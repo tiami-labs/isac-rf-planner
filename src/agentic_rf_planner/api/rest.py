@@ -389,7 +389,7 @@ if static_dir.exists():
         """Serve the 3D Cesium UI explicitly."""
         idx3 = static_dir / "index_3d.html"
         if idx3.exists():
-            return FileResponse(str(idx3))
+            return FileResponse(str(idx3), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
     
@@ -414,7 +414,7 @@ if static_dir.exists():
     async def serve_planner_3d_js():
         file_path = static_dir / "planner_3d.js"
         if file_path.exists():
-            return FileResponse(str(file_path))
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
     
