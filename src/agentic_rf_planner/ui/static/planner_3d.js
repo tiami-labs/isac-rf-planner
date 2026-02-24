@@ -2,7 +2,7 @@
 //
 // Goals:
 // - Mirror the 2D UI controls (ray mode + heights + sector configs + RF params).
-// - Heatmap rendering supports scatter (2D-style) and raster (legacy disc).
+// - Render coverage in 3D from the same per-cell grid that the 2D UI uses (no forced circle).
 // - In 3D mode, if mesh profiles are missing, auto-generate+upload them in-browser.
 
 import * as Cesium from "/Cesium/index.js";
@@ -10,8 +10,8 @@ import { buildAndUploadProfiles } from "/mesh_profiler_core.js";
 
 let viewer = null;
 let txEntity = null;
-let points = null; // (legacy) Cesium.PointPrimitiveCollection
-let heatmapEntity = null; // Cesium entity (circular ellipse w/ texture)
+let points = null; // Cesium.PointPrimitiveCollection
+let heatmapEntity = null; // (legacy) Cesium entity (ellipse w/ texture)
 let sectorEntities = []; // visualization overlays
 let currentTxLocation = null; // {lat, lon}
 let sectorCounter = 0;
@@ -127,133 +127,51 @@ function colorForValue(v, vmin, vmax) {
   return new Cesium.Color(r, g, b, 0.70);
 }
 
-
-
-function renderGridPointHeatmap(grid) {
-  // Render the SAME scattered cells as the 2D Leaflet UI, but in Cesium.
-  // This preserves ray termination + road corridors because missing cells remain missing.
+// Render RF coverage using the same per-cell grid that the 2D UI uses.
+// This intentionally preserves "missing" cells (no forced circular mask, no interpolation),
+// which is what makes the footprint deform and follow streets / blockers.
+function renderGridCoverage(grid) {
   clearOverlay();
-  if (!grid || !grid.cell_lat || !grid.cell_lon || !grid.rsrp_dbm) return;
+  if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
+  const lats = grid.cell_lat;
+  const lons = grid.cell_lon;
+  const rsrp = grid.rsrp_dbm;
+  if (lats.length === 0 || lons.length !== lats.length || rsrp.length !== lats.length) return;
 
-  const n = Math.min(grid.cell_lat.length, grid.cell_lon.length, grid.rsrp_dbm.length);
-  if (n <= 0) return;
-
-  // Compute finite min/max
   let vmin = Infinity;
   let vmax = -Infinity;
-  for (let i = 0; i < n; i++) {
-    const v = grid.rsrp_dbm[i];
+  for (let i = 0; i < rsrp.length; i++) {
+    const v = rsrp[i];
     if (!Number.isFinite(v)) continue;
     if (v < vmin) vmin = v;
     if (v > vmax) vmax = v;
   }
   if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
 
-  const px = Math.max(1, Math.round(getNumber("heatmap-point-size-px", 6)));
-  const hM = getNumber("heatmap-point-height-m", 2.0);
-
-  // Use PointPrimitiveCollection for performance (~7k points typical)
+  // Point primitives are much faster than entities at this scale.
   points = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection());
+  const disableDepth = Number.POSITIVE_INFINITY;
 
-  for (let i = 0; i < n; i++) {
-    const lat = grid.cell_lat[i];
-    const lon = grid.cell_lon[i];
-    const v = grid.rsrp_dbm[i];
+  // Rough visual match to Leaflet circles: many small semi-transparent points.
+  // Pixel size is camera-dependent; scaleByDistance keeps them readable while zooming.
+  const basePx = Math.max(3, Math.min(12, Math.round(getNumber("heatmap-point-px", 7))));
+  const scaleByDistance = new Cesium.NearFarScalar(500.0, 1.2, 8000.0, 0.4);
+
+  for (let i = 0; i < lats.length; i++) {
+    const lat = lats[i];
+    const lon = lons[i];
+    const v = rsrp[i];
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(v)) continue;
 
     points.add({
-      position: Cesium.Cartesian3.fromDegrees(lon, lat, hM),
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, 0.0),
       color: colorForValue(v, vmin, vmax),
-      pixelSize: px,
-      // Ensure overlay remains visible on top of 3D tiles.
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      pixelSize: basePx,
+      scaleByDistance,
+      heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      disableDepthTestDistance: disableDepth,
     });
   }
-}
-
-function renderHeatmap(heatmap, txLat, txLon, radiusM) {
-  clearOverlay();
-  if (!heatmap || !heatmap.lats || !heatmap.lons || !heatmap.rsrp) return;
-
-  // Compute value range (finite only)
-  let vmin = Infinity;
-  let vmax = -Infinity;
-  for (let i = 0; i < heatmap.rsrp.length; i++) {
-    const row = heatmap.rsrp[i];
-    for (let j = 0; j < row.length; j++) {
-      const v = row[j];
-      if (!Number.isFinite(v)) continue;
-      if (v < vmin) vmin = v;
-      if (v > vmax) vmax = v;
-    }
-  }
-  if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
-
-  const rows = heatmap.rsrp.length;
-  const cols = heatmap.rsrp[0] ? heatmap.rsrp[0].length : 0;
-  if (rows <= 0 || cols <= 0) return;
-
-  // Build an RGBA canvas for the ellipse material.
-  // NaN cells are fully transparent; everything else is alpha-blended.
-  const canvas = document.createElement("canvas");
-  canvas.width = cols;
-  canvas.height = rows;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  const img = ctx.createImageData(cols, rows);
-
-  // Use the lat/lon bounding box to compute a true-radius mask in meters.
-  // This guarantees the rendered heatmap is a circle (not a square) even when
-  // the backend grid is a bounding-box.
-  const minLat = heatmap.lats[0][0];
-  const maxLat = heatmap.lats[rows - 1][0];
-  const minLon = heatmap.lons[0][0];
-  const maxLon = heatmap.lons[0][cols - 1];
-
-  const metersPerDegLat = 111320.0;
-  const metersPerDegLon = 111320.0 * Math.cos((txLat * Math.PI) / 180.0);
-  const mPerPxX = ((maxLon - minLon) * metersPerDegLon) / Math.max(1, (cols - 1));
-  const mPerPxY = ((maxLat - minLat) * metersPerDegLat) / Math.max(1, (rows - 1));
-  const cx = ((txLon - minLon) / Math.max(1e-12, (maxLon - minLon))) * (cols - 1);
-  const cy = ((txLat - minLat) / Math.max(1e-12, (maxLat - minLat))) * (rows - 1);
-  const r2 = Math.max(1.0, radiusM) * Math.max(1.0, radiusM);
-
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      const v = heatmap.rsrp[y][x];
-      const idx = (y * cols + x) * 4;
-      if (!Number.isFinite(v)) {
-        img.data[idx + 3] = 0;
-        continue;
-      }
-
-      // Circular radius mask (meters).
-      const dxm = (x - cx) * mPerPxX;
-      const dym = (y - cy) * mPerPxY;
-      if ((dxm * dxm + dym * dym) > r2) {
-        img.data[idx + 3] = 0;
-        continue;
-      }
-
-      const c = colorForValue(v, vmin, vmax);
-      img.data[idx + 0] = Math.round(255 * c.red);
-      img.data[idx + 1] = Math.round(255 * c.green);
-      img.data[idx + 2] = Math.round(255 * c.blue);
-      img.data[idx + 3] = Math.round(255 * c.alpha);
-    }
-  }
-  ctx.putImageData(img, 0, 0);
-
-  // Render as a true circular ellipse on the ground, textured with our heatmap.
-  heatmapEntity = viewer.entities.add({
-    position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
-    ellipse: {
-      semiMajorAxis: radiusM,
-      semiMinorAxis: radiusM,
-      material: new Cesium.ImageMaterialProperty({ image: canvas, transparent: true }),
-      heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-      outline: false,
-    },
-  });
 }
 
 function addSectorUI() {
@@ -722,42 +640,18 @@ async function runPlan() {
     return;
   }
 
-  // Update TX marker to snapped point when provided (2D snaps; 3D mesh mode may not).
+  // Update TX marker to snapped point (backend always snaps today).
   if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
     updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
   } else {
     updateTxMarker(lat, lon);
   }
 
-
-  // Heatmap rendering
-  // Default: scatter (same as 2D planner) so the coverage outline deforms based on ray termination.
-  const renderMode = getString("heatmap-render-mode", "scatter").toLowerCase();
-
-  if (renderMode === "raster") {
-    // Legacy: rasterize to a textured disc (fills gaps; can look overly circular)
-    if (out.heatmap) {
-      const tx = out.snapped_tx || out.original_point || currentTxLocation;
-      const simRadiusM = (out.grid && out.grid.rf_params && out.grid.rf_params.max_range_m)
-        ? Number(out.grid.rf_params.max_range_m)
-        : getNumber("max-range", 500.0);
-      if (tx && Number.isFinite(tx.lat) && Number.isFinite(tx.lon)) {
-        renderHeatmap(out.heatmap, tx.lat, tx.lon, simRadiusM);
-      }
-    }
-  } else {
-    // Recommended: render scattered cells from the backend attenuation grid.
-    // This preserves non-uniform reach (streets vs buildings) because we do not fill missing cells.
-    if (out.grid) {
-      renderGridPointHeatmap(out.grid);
-    } else if (out.heatmap) {
-      // Fallback: raster if grid is missing.
-      const tx = out.snapped_tx || out.original_point || currentTxLocation;
-      const simRadiusM = getNumber("max-range", 500.0);
-      if (tx && Number.isFinite(tx.lat) && Number.isFinite(tx.lon)) {
-        renderHeatmap(out.heatmap, tx.lat, tx.lon, simRadiusM);
-      }
-    }
+  // Coverage rendering (3D): draw the same per-cell grid as 2D.
+  // This preserves missing cells (no forced circle, no interpolation), which is what
+  // creates the deformed footprint and road / canyon effects.
+  if (out.grid) {
+    renderGridCoverage(out.grid);
   }
 
   // Sector overlays: approximate radius from profile params (matches circular heatmap intent).
