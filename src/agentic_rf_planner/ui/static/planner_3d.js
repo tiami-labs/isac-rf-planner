@@ -12,7 +12,7 @@ let viewer = null;
 let txEntity = null;
 let points = null; // Cesium.PointPrimitiveCollection
 let heatmapEntity = null; // (legacy) Cesium entity (ellipse w/ texture)
-let bubblePrimitive = null; // 3D propagation shell
+let surfacePrimitive = null; // Cesium.Primitive (draped "fabric" surface)
 let sectorEntities = []; // visualization overlays
 let currentTxLocation = null; // {lat, lon}
 let sectorCounter = 0;
@@ -92,9 +92,9 @@ function clearOverlay() {
     viewer.scene.primitives.remove(points);
     points = null;
   }
-  if (bubblePrimitive) {
-    try { viewer.scene.primitives.remove(bubblePrimitive); } catch {}
-    bubblePrimitive = null;
+  if (surfacePrimitive) {
+    try { viewer.scene.primitives.remove(surfacePrimitive); } catch {}
+    surfacePrimitive = null;
   }
   for (const e of sectorEntities) {
     try { viewer.entities.remove(e); } catch {}
@@ -179,348 +179,193 @@ function renderGridCoverage(grid) {
   }
 }
 
-// --- 3D propagation visualization (deformed sphere / "bubble") ---
-//
-// When ray_mode === "3d" we keep the RF semantics/pipeline identical (same /api/plan output),
-// but change the visualization from a 2D ground projection to a 3D shell.
-//
-// Deformation source is deterministic:
-// - Per-azimuth extent is taken from the returned grid itself (adaptive ray termination).
-// - Optionally clipped by persisted mesh profile obstructions (same data used by 3D MapProvider).
-
-function enuDirToEcef(originEcef, bearingRad, elevRad, outDirEcef) {
-  // Bearing is degrees clockwise from North (matches mesh_profiler_core.js).
-  const cosEl = Math.cos(elevRad);
-  const localEnu = new Cesium.Cartesian3(
-    Math.sin(bearingRad) * cosEl, // East
-    Math.cos(bearingRad) * cosEl, // North
-    Math.sin(elevRad)             // Up
-  );
-  const enuToFixed = Cesium.Transforms.eastNorthUpToFixedFrame(originEcef);
-  Cesium.Matrix4.multiplyByPointAsVector(enuToFixed, localEnu, outDirEcef);
-  Cesium.Cartesian3.normalize(outDirEcef, outDirEcef);
-  return outDirEcef;
+function normalizeAngleDeg(a) {
+  let x = a % 360.0;
+  if (x < 0) x += 360.0;
+  return x;
 }
 
-function extractPickPosition(hit) {
-  if (!hit) return null;
-  if (hit instanceof Cesium.Cartesian3) return hit;
-  if (hit.position instanceof Cesium.Cartesian3) return hit.position;
-  return null;
-}
-
-async function pickFirstIntersection(scene, ray) {
-  // Prefer synchronous picking against currently-loaded tiles for responsiveness.
-  if (typeof scene.pickFromRay === "function") {
-    try {
-      return scene.pickFromRay(ray);
-    } catch {
-      // fall through
-    }
-  }
-  // Fallback: MostDetailed (can be slow, but better than nothing if pickFromRay is unavailable).
-  if (typeof scene.pickFromRayMostDetailed === "function") {
-    try {
-      return await scene.pickFromRayMostDetailed(ray);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function rayEllipsoidDistanceMeters(ray, ellipsoid) {
-  // Returns nearest positive intersection distance (meters) with ellipsoid, or null.
-  if (!Cesium.IntersectionTests || typeof Cesium.IntersectionTests.rayEllipsoid !== "function") return null;
-  const interval = Cesium.IntersectionTests.rayEllipsoid(ray, ellipsoid);
-  if (!interval) return null;
-  const t = interval.start >= 0.0 ? interval.start : interval.stop;
-  if (!Number.isFinite(t) || t < 0.0) return null;
-  return t;
-}
-
-function wrap360(deg) {
-  let d = deg % 360.0;
-  if (d < 0) d += 360.0;
-  return d;
-}
-
-function haversineM(lat1, lon1, lat2, lon2) {
+// Reconstruct ENU distance + bearing using the same small-distance approximation
+// as coverage_grid._project_from_tx (flat earth for <= ~1km).
+function enuRangeBearing(txLatDeg, txLonDeg, latDeg, lonDeg) {
   const R = 6371000.0;
-  const toRad = Cesium.Math.toRadians;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2
-    + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+  const txLat = Cesium.Math.toRadians(txLatDeg);
+  const dLat = Cesium.Math.toRadians(latDeg - txLatDeg);
+  const dLon = Cesium.Math.toRadians(lonDeg - txLonDeg);
+  const north = dLat * R;
+  const east = dLon * R * Math.cos(txLat);
+  const range = Math.sqrt(north * north + east * east);
+  const bearing = normalizeAngleDeg(Cesium.Math.toDegrees(Math.atan2(east, north)));
+  return { range_m: range, bearing_deg: bearing };
 }
 
-function bearingDeg(lat1, lon1, lat2, lon2) {
-  // 0° = North, 90° = East
-  const toRad = Cesium.Math.toRadians;
-  const toDeg = Cesium.Math.toDegrees;
-  const φ1 = toRad(lat1);
-  const φ2 = toRad(lat2);
-  const λ1 = toRad(lon1);
-  const λ2 = toRad(lon2);
-  const y = Math.sin(λ2 - λ1) * Math.cos(φ2);
-  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1);
-  return wrap360(toDeg(Math.atan2(y, x)));
-}
-
-function quantizeBearing(deg, stepDeg) {
-  const s = Math.max(0.5, Number(stepDeg) || 5.0);
-  return wrap360(Math.round(wrap360(deg) / s) * s);
-}
-
-function inferBearingStepDegFromGrid(txLat, txLon, grid) {
-  // Try to infer the azimuth step from returned grid bearings.
-  try {
-    const lats = grid?.cell_lat;
-    const lons = grid?.cell_lon;
-    if (!Array.isArray(lats) || !Array.isArray(lons) || lats.length < 20) return 5.0;
-    const bs = [];
-    for (let i = 0; i < lats.length; i += Math.max(1, Math.floor(lats.length / 200))) {
-      bs.push(Math.round(bearingDeg(txLat, txLon, lats[i], lons[i])));
+async function clampToMeshHeights(cartesians, heightOffsetM = 0.5) {
+  const clamped = await viewer.scene.clampToHeightMostDetailed(cartesians);
+  const out = new Array(clamped.length);
+  for (let i = 0; i < clamped.length; i++) {
+    const c = clamped[i];
+    if (!c) {
+      out[i] = null;
+      continue;
     }
-    bs.sort((a, b) => a - b);
-    let minDiff = Infinity;
-    for (let i = 1; i < bs.length; i++) {
-      const d = bs[i] - bs[i - 1];
-      if (d > 0.5 && d < minDiff) minDiff = d;
-    }
-    if (Number.isFinite(minDiff) && minDiff >= 1.0 && minDiff <= 30.0) return minDiff;
-  } catch {
-    // ignore
-  }
-  return 5.0;
-}
-
-function buildPropagationRadiusByBearing(txLat, txLon, grid, stepDeg) {
-  const lats = grid?.cell_lat;
-  const lons = grid?.cell_lon;
-  if (!Array.isArray(lats) || !Array.isArray(lons) || lats.length === 0) return new Map();
-  const rByBin = new Map();
-  for (let i = 0; i < lats.length; i++) {
-    const lat = lats[i];
-    const lon = lons[i];
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-    const b = quantizeBearing(bearingDeg(txLat, txLon, lat, lon), stepDeg);
-    const r = haversineM(txLat, txLon, lat, lon);
-    const prev = rByBin.get(b);
-    if (!Number.isFinite(prev) || r > prev) rByBin.set(b, r);
-  }
-  return rByBin;
-}
-
-async function fetchMeshProfileSetOrNull(txLat, txLon) {
-  const txHeightM = getNumber("tx-height-m", 10.0);
-  const rxHeightM = getNumber("rx-height-m", 1.5);
-  const maxRangeM = getNumber("max-range", 500.0);
-  const drM = getNumber("dr-m", 5.0);
-  const dthetaDeg = getNumber("dtheta", 5.0);
-
-  const url = `/api/mesh-profiles/get?tx_lat=${encodeURIComponent(txLat)}&tx_lon=${encodeURIComponent(txLon)}`
-    + `&tx_height_m=${encodeURIComponent(txHeightM)}&rx_height_m=${encodeURIComponent(rxHeightM)}`
-    + `&max_range_m=${encodeURIComponent(maxRangeM)}&dr_m=${encodeURIComponent(drM)}&dtheta_deg=${encodeURIComponent(dthetaDeg)}`;
-
-  try {
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const j = await r.json();
-    return j?.profile_set || null;
-  } catch {
-    return null;
-  }
-}
-
-function buildFirstBlockRadiusByBearing(profileSet) {
-  const out = new Map();
-  if (!profileSet || !Array.isArray(profileSet.profiles)) return out;
-  for (const p of profileSet.profiles) {
-    const b = wrap360(Number(p.bearing_deg) || 0.0);
-    const segs = Array.isArray(p.segments) ? p.segments : [];
-    let r0 = Infinity;
-    for (const s of segs) {
-      const v = Number(s?.r0_m);
-      if (Number.isFinite(v) && v > 0 && v < r0) r0 = v;
-    }
-    if (Number.isFinite(r0) && r0 < Infinity) out.set(b, r0);
+    const carto = Cesium.Cartographic.fromCartesian(c);
+    carto.height = (carto.height || 0.0) + heightOffsetM;
+    out[i] = Cesium.Cartesian3.fromRadians(carto.longitude, carto.latitude, carto.height);
   }
   return out;
 }
 
-async function computeTxOriginEcef(txLat, txLon, txHeightM) {
-  // Anchor the origin to the rendered mesh when possible to keep height semantics consistent.
-  const probeAlt = Math.max(10.0, txHeightM + 50.0);
-  const probe = Cesium.Cartesian3.fromDegrees(txLon, txLat, probeAlt);
-  try {
-    const clamped = await viewer.scene.clampToHeightMostDetailed([probe]);
-    if (clamped && clamped[0]) {
-      const carto = Cesium.Cartographic.fromCartesian(clamped[0]);
-      const meshH = Number.isFinite(carto.height) ? carto.height : 0.0;
-      return Cesium.Cartesian3.fromDegrees(txLon, txLat, meshH + txHeightM);
-    }
-  } catch {
-    // ignore and fall back
-  }
-  return Cesium.Cartesian3.fromDegrees(txLon, txLat, txHeightM);
-}
-
-async function renderDeformedPropagationBubble({ txLat, txLon, txHeightM, grid }) {
+// "Fabric" surface rendering for 3D mode:
+// - Uses the same per-cell grid data (no forced circle, preserves missing cells).
+// - Builds a polar mesh (rings x bearings) and drapes it onto the Google mesh using clampToHeightMostDetailed.
+async function renderDrapedSurfaceCoverage(grid) {
+  // Render coverage as a single textured ellipse/plane so it stays visually smooth and
+  // does not produce roof/ground bridging triangles.
+  // Semantics: the texture is sampled from the SAME (ring,theta) slots as coverage_grid.
+  // - No forced circle: outside maxRingByTheta[theta] is fully transparent.
+  // - Missing slots inside the boundary remain transparent (no interpolation).
   clearOverlay();
+  if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
+  if (!grid.tx || !Number.isFinite(grid.tx.lat) || !Number.isFinite(grid.tx.lon)) return;
 
-  setStatus("3D: building propagation bubble…");
+  const lats = grid.cell_lat;
+  const lons = grid.cell_lon;
+  const rsrp = grid.rsrp_dbm;
+  if (lats.length === 0 || lons.length !== lats.length || rsrp.length !== lats.length) return;
 
-  const origin = await computeTxOriginEcef(txLat, txLon, txHeightM);
-  const scene = viewer.scene;
-  const ellipsoid = scene.globe && scene.globe.ellipsoid ? scene.globe.ellipsoid : Cesium.Ellipsoid.WGS84;
-  const upDir = new Cesium.Cartesian3();
-  try {
-    ellipsoid.geodeticSurfaceNormal(origin, upDir);
-    Cesium.Cartesian3.normalize(upDir, upDir);
-  } catch {
-    upDir.x = 0; upDir.y = 0; upDir.z = 1;
+  const txLat = grid.tx.lat;
+  const txLon = grid.tx.lon;
+
+  const drM = Number(grid.rf_params?.step_m) || 5.0;
+  const dthetaDeg = 5.0;
+  const nTheta = Math.max(1, Math.round(360.0 / dthetaDeg));
+
+  // Visual radius comes from RF params max_range_m.
+  const radiusM = Number(grid.rf_params?.max_range_m) || 500.0;
+  const maxRingGlobal = Math.max(1, Math.ceil(radiusM / drM));
+
+  let vmin = Infinity;
+  let vmax = -Infinity;
+  for (let i = 0; i < rsrp.length; i++) {
+    const v = rsrp[i];
+    if (!Number.isFinite(v)) continue;
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+  }
+  if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
+
+  // Bin per-cell values into (theta, ring) slots. Keep strongest value per slot.
+  const valuesByTheta = Array.from({ length: nTheta }, () => new Array(maxRingGlobal + 1).fill(null));
+  const maxRingByTheta = new Array(nTheta).fill(0);
+
+  for (let i = 0; i < lats.length; i++) {
+    const lat = lats[i];
+    const lon = lons[i];
+    const v = rsrp[i];
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(v)) continue;
+
+    const rb = enuRangeBearing(txLat, txLon, lat, lon);
+    const ring = Math.max(1, Math.round(rb.range_m / drM));
+    if (ring > maxRingGlobal) continue;
+
+    const ti = ((Math.round(normalizeAngleDeg(rb.bearing_deg) / dthetaDeg) % nTheta) + nTheta) % nTheta;
+
+    const prev = valuesByTheta[ti][ring];
+    if (prev == null || v > prev) valuesByTheta[ti][ring] = v;
+    if (ring > maxRingByTheta[ti]) maxRingByTheta[ti] = ring;
   }
 
-  // Bubble radius must be consistent with the returned grid (adaptive ray termination).
-  const azStep = inferBearingStepDegFromGrid(txLat, txLon, grid);
-  const elStep = Math.max(10.0, azStep);
+  // Build a texture by sampling the (theta,ring) slots.
+  const texSize = 512;
+  const canvas = document.createElement("canvas");
+  canvas.width = texSize;
+  canvas.height = texSize;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const img = ctx.createImageData(texSize, texSize);
 
-  const nAz = Math.max(8, Math.round(360.0 / azStep));
-  const nEl = Math.max(6, Math.round(180.0 / elStep));
-  const cols = nAz + 1; // seam closure
-  const rows = nEl + 1;
-  const nVerts = cols * rows;
+  // Map pixels to ENU meters where +x = east, +y = north.
+  // The ellipse material's UV mapping is handled by Cesium; we generate the texture
+  // in a symmetric square around the TX.
+  const half = radiusM;
+  for (let py = 0; py < texSize; py++) {
+    // north meters (py=0 at top)
+    const y = -half + ((py + 0.5) * (2.0 * half) / texSize);
+    for (let px = 0; px < texSize; px++) {
+      const x = -half + ((px + 0.5) * (2.0 * half) / texSize);
+      const r = Math.sqrt(x * x + y * y);
+      const idx = (py * texSize + px) * 4;
 
-  const maxRangeM = Number(grid?.rf_params?.max_range_m) || getNumber("max-range", 500.0);
-
-  const propR = buildPropagationRadiusByBearing(txLat, txLon, grid, azStep);
-
-  // Optional deterministic obstacle clipping from persisted mesh profiles.
-  let firstBlockR = null;
-  try {
-    const prof = await fetchMeshProfileSetOrNull(txLat, txLon);
-    firstBlockR = buildFirstBlockRadiusByBearing(prof);
-  } catch {
-    firstBlockR = null;
-  }
-
-  const positions = new Float64Array(nVerts * 3);
-  const valid = new Uint8Array(nVerts);
-  const scratchDir = new Cesium.Cartesian3();
-  const scratchPos = new Cesium.Cartesian3();
-
-  const eps = 0.5;
-  let v = 0;
-  for (let iEl = 0; iEl <= nEl; iEl++) {
-    const elevDeg = -90.0 + (180.0 * iEl) / nEl;
-    const elevRad = Cesium.Math.toRadians(elevDeg);
-
-    for (let iAz = 0; iAz <= nAz; iAz++) {
-      const bearingDeg0 = (360.0 * iAz) / nAz;
-      const bearingDegQ = quantizeBearing(bearingDeg0, azStep);
-      const bearingRad = Cesium.Math.toRadians(bearingDeg0);
-
-      const baseR = propR.get(bearingDegQ);
-      if (!Number.isFinite(baseR) || baseR <= 1.0) {
-        const base = v * 3;
-        positions[base] = origin.x;
-        positions[base + 1] = origin.y;
-        positions[base + 2] = origin.z;
-        valid[v] = 0;
-        v++;
+      if (r > radiusM) {
+        img.data[idx + 3] = 0;
         continue;
       }
 
-      enuDirToEcef(origin, bearingRad, elevRad, scratchDir);
+      const bearing = normalizeAngleDeg(Cesium.Math.toDegrees(Math.atan2(x, y)));
+      const ti = ((Math.round(bearing / dthetaDeg) % nTheta) + nTheta) % nTheta;
+      const ring = Math.max(1, Math.round(r / drM));
 
-      let dist = Math.min(baseR, maxRangeM);
-
-      // If profiles exist, use the first obstruction on this bearing as an additional clip.
-      if (firstBlockR && firstBlockR.size) {
-        const rBlock = firstBlockR.get(bearingDegQ);
-        if (Number.isFinite(rBlock)) dist = Math.min(dist, rBlock);
+      // Deformed boundary: transparent outside last valid ring for this bearing.
+      if (ring > (maxRingByTheta[ti] || 0) || ring > maxRingGlobal) {
+        img.data[idx + 3] = 0;
+        continue;
       }
 
-      // Ground clip: local ground plane at TX mesh height.
-      const dotUp = Cesium.Cartesian3.dot(scratchDir, upDir);
-      if (dotUp < -1e-3) {
-        const t = txHeightM / (-dotUp);
-        if (Number.isFinite(t) && t > 0) dist = Math.min(dist, t);
+      const v = valuesByTheta[ti][ring];
+      if (!Number.isFinite(v)) {
+        img.data[idx + 3] = 0;
+        continue;
       }
 
-      dist = Math.max(1.0, dist - eps);
-
-      Cesium.Cartesian3.multiplyByScalar(scratchDir, dist, scratchPos);
-      Cesium.Cartesian3.add(origin, scratchPos, scratchPos);
-
-      const base = v * 3;
-      positions[base] = scratchPos.x;
-      positions[base + 1] = scratchPos.y;
-      positions[base + 2] = scratchPos.z;
-      valid[v] = 1;
-      v++;
-    }
-
-    if (iEl % 2 === 0) {
-      setStatus(`3D: building bubble… ${Math.round((100 * iEl) / nEl)}%`);
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, 0));
+      const c = colorForValue(v, vmin, vmax);
+      img.data[idx + 0] = Math.round(255 * c.red);
+      img.data[idx + 1] = Math.round(255 * c.green);
+      img.data[idx + 2] = Math.round(255 * c.blue);
+      img.data[idx + 3] = Math.round(255 * c.alpha);
     }
   }
+  ctx.putImageData(img, 0, 0);
 
-  // Build indices, skipping triangles that touch invalid vertices (e.g. outside sector coverage).
-  const idx = [];
-  for (let iEl = 0; iEl < nEl; iEl++) {
-    for (let iAz = 0; iAz < nAz; iAz++) {
-      const i0 = iEl * cols + iAz;
-      const i1 = i0 + 1;
-      const i2 = i0 + cols;
-      const i3 = i2 + 1;
-      if (!(valid[i0] && valid[i1] && valid[i2] && valid[i3])) continue;
-      idx.push(i0, i2, i1);
-      idx.push(i1, i2, i3);
-    }
-  }
-  if (idx.length < 3) {
-    setStatus("3D: bubble skipped (no coverage cells for current sector configuration).");
-    return;
-  }
-  const useUint32 = nVerts > 65535;
-  const indices = useUint32 ? new Uint32Array(idx) : new Uint16Array(idx);
+  // Render as a single ellipse primitive. Disable depth testing so buildings don't clip it.
+  const center = Cesium.Cartesian3.fromDegrees(txLon, txLat, 0.0);
+  const ellipseGeom = new Cesium.EllipseGeometry({
+    center,
+    semiMajorAxis: radiusM,
+    semiMinorAxis: radiusM,
+    height: 0.0,
+    vertexFormat: Cesium.MaterialAppearance.VERTEX_FORMAT,
+  });
 
-  const geom = new Cesium.Geometry({
-    attributes: {
-      position: new Cesium.GeometryAttribute({
-        componentDatatype: Cesium.ComponentDatatype.DOUBLE,
-        componentsPerAttribute: 3,
-        values: positions,
-      }),
+  const instance = new Cesium.GeometryInstance({ geometry: ellipseGeom });
+
+  const material = new Cesium.Material({
+    fabric: {
+      type: "Image",
+      uniforms: {
+        image: canvas,
+        transparent: true,
+      },
     },
-    indices,
-    primitiveType: Cesium.PrimitiveType.TRIANGLES,
-    boundingSphere: new Cesium.BoundingSphere(origin, maxRangeM),
   });
 
-  const instance = new Cesium.GeometryInstance({ geometry: geom });
-  const mat = Cesium.Material.fromType("Color", {
-    color: new Cesium.Color(0.2, 0.8, 1.0, 0.22),
-  });
-  bubblePrimitive = new Cesium.Primitive({
-    geometryInstances: instance,
-    appearance: new Cesium.MaterialAppearance({
-      material: mat,
-      translucent: true,
-      closed: false,
-      faceForward: true,
-    }),
-    asynchronous: false,
-  });
-
-  viewer.scene.primitives.add(bubblePrimitive);
-  setStatus("Plan complete.");
+  surfacePrimitive = viewer.scene.primitives.add(
+    new Cesium.Primitive({
+      geometryInstances: instance,
+      appearance: new Cesium.MaterialAppearance({
+        material,
+        translucent: true,
+        closed: false,
+        faceForward: true,
+        renderState: Cesium.RenderState.fromCache({
+          depthTest: { enabled: false },
+          depthMask: false,
+          blending: Cesium.BlendingState.ALPHA_BLEND,
+        }),
+      }),
+      asynchronous: true,
+      releaseGeometryInstances: true,
+      allowPicking: false,
+    })
+  );
 }
 
 function addSectorUI() {
@@ -996,24 +841,17 @@ async function runPlan() {
     updateTxMarker(lat, lon);
   }
 
-  // Coverage rendering (3D): draw the same per-cell grid as 2D.
-  // This preserves missing cells (no forced circle, no interpolation), which is what
-  // creates the deformed footprint and road / canyon effects.
+  // Coverage rendering:
+  // - 2D mode: point grid (legacy)
+  // - 3D mode: draped "fabric" surface over the Google mesh, using the same per-cell grid
+  //   (no forced circle, no interpolation), preserving missing cells.
   if (out.grid) {
     if (rayMode === "3d") {
-      const tx0 = (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon))
-        ? out.snapped_tx
-        : { lat, lon };
       try {
-        await renderDeformedPropagationBubble({
-          txLat: tx0.lat,
-          txLon: tx0.lon,
-          txHeightM,
-          grid: out.grid,
-        });
+        await renderDrapedSurfaceCoverage(out.grid);
       } catch (e) {
-        // Fall back to the 2D ground projection if bubble construction fails.
-        console.warn("Failed to build 3D propagation bubble:", e);
+        // Fallback to point grid if draping fails (e.g., mesh clamp unavailable).
+        console.warn("Surface drape failed, falling back to point grid:", e);
         renderGridCoverage(out.grid);
       }
     } else {
@@ -1065,17 +903,6 @@ async function init() {
   } catch (e) {
     setStatus(`Failed to load Google mesh tileset.\n\n${e}`);
     return;
-  }
-
-  // Optional: add OSM buildings tiles for semantic + geometry interaction.
-  // (Google photorealistic tiles include buildings too, but OSM buildings are useful for
-  // consistent picking/clipping across providers.)
-  try {
-    const osm = await Cesium.createOsmBuildingsAsync();
-    viewer.scene.primitives.add(osm);
-    if (osm.readyPromise) await osm.readyPromise;
-  } catch {
-    // Non-fatal.
   }
 
   // Start zoomed-in to the default coordinate (matches 2D UX).
