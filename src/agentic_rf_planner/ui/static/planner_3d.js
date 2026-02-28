@@ -219,11 +219,6 @@ async function clampToMeshHeights(cartesians, heightOffsetM = 0.5) {
 // - Uses the same per-cell grid data (no forced circle, preserves missing cells).
 // - Builds a polar mesh (rings x bearings) and drapes it onto the Google mesh using clampToHeightMostDetailed.
 async function renderDrapedSurfaceCoverage(grid) {
-  // Render coverage as a single textured ellipse/plane so it stays visually smooth and
-  // does not produce roof/ground bridging triangles.
-  // Semantics: the texture is sampled from the SAME (ring,theta) slots as coverage_grid.
-  // - No forced circle: outside maxRingByTheta[theta] is fully transparent.
-  // - Missing slots inside the boundary remain transparent (no interpolation).
   clearOverlay();
   if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
   if (!grid.tx || !Number.isFinite(grid.tx.lat) || !Number.isFinite(grid.tx.lon)) return;
@@ -233,16 +228,11 @@ async function renderDrapedSurfaceCoverage(grid) {
   const rsrp = grid.rsrp_dbm;
   if (lats.length === 0 || lons.length !== lats.length || rsrp.length !== lats.length) return;
 
-  const txLat = grid.tx.lat;
-  const txLon = grid.tx.lon;
-
+  // Range step comes from RF params (coverage_grid uses rf_params.step_m as dr).
   const drM = Number(grid.rf_params?.step_m) || 5.0;
+  // coverage_grid currently uses fixed dtheta=5 degrees.
   const dthetaDeg = 5.0;
   const nTheta = Math.max(1, Math.round(360.0 / dthetaDeg));
-
-  // Visual radius comes from RF params max_range_m.
-  const radiusM = Number(grid.rf_params?.max_range_m) || 500.0;
-  const maxRingGlobal = Math.max(1, Math.ceil(radiusM / drM));
 
   let vmin = Infinity;
   let vmax = -Infinity;
@@ -254,9 +244,25 @@ async function renderDrapedSurfaceCoverage(grid) {
   }
   if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
 
-  // Bin per-cell values into (theta, ring) slots. Keep strongest value per slot.
-  const valuesByTheta = Array.from({ length: nTheta }, () => new Array(maxRingGlobal + 1).fill(null));
-  const maxRingByTheta = new Array(nTheta).fill(0);
+  const txLat = grid.tx.lat;
+  const txLon = grid.tx.lon;
+
+  // Ensure tiles are streamed near TX (clamping can return null if nothing is loaded).
+  try {
+    const txCam = Cesium.Cartesian3.fromDegrees(txLon, txLat, 1500.0);
+    const camDist = Cesium.Cartesian3.distance(viewer.camera.positionWC, txCam);
+    if (camDist > 8000.0) {
+      viewer.camera.flyTo({ destination: txCam, duration: 0.0 });
+      viewer.scene.requestRender();
+    }
+  } catch {
+    // ignore
+  }
+
+  // 1) Bin points into (ring, theta) slots.
+  const slotToVertex = new Map(); // key: `${ring}_${ti}` -> vertex index
+  const vertices = []; // {lat,lon,v}
+  let maxRing = 0;
 
   for (let i = 0; i < lats.length; i++) {
     const lat = lats[i];
@@ -266,100 +272,118 @@ async function renderDrapedSurfaceCoverage(grid) {
 
     const rb = enuRangeBearing(txLat, txLon, lat, lon);
     const ring = Math.max(1, Math.round(rb.range_m / drM));
-    if (ring > maxRingGlobal) continue;
-
     const ti = ((Math.round(normalizeAngleDeg(rb.bearing_deg) / dthetaDeg) % nTheta) + nTheta) % nTheta;
+    const key = `${ring}_${ti}`;
 
-    const prev = valuesByTheta[ti][ring];
-    if (prev == null || v > prev) valuesByTheta[ti][ring] = v;
-    if (ring > maxRingByTheta[ti]) maxRingByTheta[ti] = ring;
+    // Keep the strongest sample for the slot (helps when snapping produces duplicates).
+    const existing = slotToVertex.get(key);
+    if (existing != null) {
+      if (v > vertices[existing].v) vertices[existing] = { lat, lon, v };
+      continue;
+    }
+
+    const idx = vertices.length;
+    vertices.push({ lat, lon, v });
+    slotToVertex.set(key, idx);
+    if (ring > maxRing) maxRing = ring;
   }
 
-  // Build a texture by sampling the (theta,ring) slots.
-  const texSize = 512;
-  const canvas = document.createElement("canvas");
-  canvas.width = texSize;
-  canvas.height = texSize;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  const img = ctx.createImageData(texSize, texSize);
+  if (vertices.length < 3) return;
 
-  // Map pixels to ENU meters where +x = east, +y = north.
-  // The ellipse material's UV mapping is handled by Cesium; we generate the texture
-  // in a symmetric square around the TX.
-  const half = radiusM;
-  for (let py = 0; py < texSize; py++) {
-    // north meters (py=0 at top)
-    const y = -half + ((py + 0.5) * (2.0 * half) / texSize);
-    for (let px = 0; px < texSize; px++) {
-      const x = -half + ((px + 0.5) * (2.0 * half) / texSize);
-      const r = Math.sqrt(x * x + y * y);
-      const idx = (py * texSize + px) * 4;
+  // Add a center vertex at TX to avoid a hole; color it with vmax.
+  const centerIndex = vertices.length;
+  vertices.push({ lat: txLat, lon: txLon, v: vmax });
 
-      if (r > radiusM) {
-        img.data[idx + 3] = 0;
-        continue;
-      }
+  // 2) Build triangle indices (preserve missing cells by skipping incomplete quads).
+  const indices = [];
 
-      const bearing = normalizeAngleDeg(Cesium.Math.toDegrees(Math.atan2(x, y)));
-      const ti = ((Math.round(bearing / dthetaDeg) % nTheta) + nTheta) % nTheta;
-      const ring = Math.max(1, Math.round(r / drM));
+  // Center fan: connect center -> ring 1
+  for (let ti = 0; ti < nTheta; ti++) {
+    const ti2 = (ti + 1) % nTheta;
+    const a = slotToVertex.get(`1_${ti}`);
+    const b = slotToVertex.get(`1_${ti2}`);
+    if (a == null || b == null) continue;
+    indices.push(centerIndex, a, b);
+  }
 
-      // Deformed boundary: transparent outside last valid ring for this bearing.
-      if (ring > (maxRingByTheta[ti] || 0) || ring > maxRingGlobal) {
-        img.data[idx + 3] = 0;
-        continue;
-      }
-
-      const v = valuesByTheta[ti][ring];
-      if (!Number.isFinite(v)) {
-        img.data[idx + 3] = 0;
-        continue;
-      }
-
-      const c = colorForValue(v, vmin, vmax);
-      img.data[idx + 0] = Math.round(255 * c.red);
-      img.data[idx + 1] = Math.round(255 * c.green);
-      img.data[idx + 2] = Math.round(255 * c.blue);
-      img.data[idx + 3] = Math.round(255 * c.alpha);
+  // Ring quads
+  for (let ring = 1; ring < maxRing; ring++) {
+    for (let ti = 0; ti < nTheta; ti++) {
+      const ti2 = (ti + 1) % nTheta;
+      const v00 = slotToVertex.get(`${ring}_${ti}`);
+      const v01 = slotToVertex.get(`${ring}_${ti2}`);
+      const v10 = slotToVertex.get(`${ring + 1}_${ti}`);
+      const v11 = slotToVertex.get(`${ring + 1}_${ti2}`);
+      if (v00 == null || v01 == null || v10 == null || v11 == null) continue;
+      // Two triangles (counter-clockwise as viewed from above)
+      indices.push(v00, v10, v11);
+      indices.push(v00, v11, v01);
     }
   }
-  ctx.putImageData(img, 0, 0);
 
-  // Render as a single ellipse primitive. Disable depth testing so buildings don't clip it.
-  const center = Cesium.Cartesian3.fromDegrees(txLon, txLat, 0.0);
-  const ellipseGeom = new Cesium.EllipseGeometry({
-    center,
-    semiMajorAxis: radiusM,
-    semiMinorAxis: radiusM,
-    height: 0.0,
-    vertexFormat: Cesium.MaterialAppearance.VERTEX_FORMAT,
-  });
+  if (indices.length < 3) return;
 
-  const instance = new Cesium.GeometryInstance({ geometry: ellipseGeom });
+  // 3) Sample mesh height at each vertex and build a Cesium Geometry.
+  // Probe height: put samples well above the surface (same approach as mesh profiler).
+  const probeH = 2000.0;
+  const probeCartesians = vertices.map((p) => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, probeH));
 
-  const material = new Cesium.Material({
-    fabric: {
-      type: "Image",
-      uniforms: {
-        image: canvas,
-        transparent: true,
-      },
+  // Clamp in batches to keep memory / request pressure reasonable.
+  const clamped = new Array(vertices.length);
+  const batchSize = 256;
+  for (let i = 0; i < probeCartesians.length; i += batchSize) {
+    const batch = probeCartesians.slice(i, i + batchSize);
+    // Small vertical offset reduces z-fighting.
+    const out = await clampToMeshHeights(batch, 0.75);
+    for (let j = 0; j < out.length; j++) clamped[i + j] = out[j];
+  }
+
+  // Positions + colors (per-vertex).
+  const pos = new Float64Array(vertices.length * 3);
+  const col = new Uint8Array(vertices.length * 4);
+
+  for (let i = 0; i < vertices.length; i++) {
+    const p = vertices[i];
+    const c = clamped[i] || Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 0.0);
+    pos[i * 3 + 0] = c.x;
+    pos[i * 3 + 1] = c.y;
+    pos[i * 3 + 2] = c.z;
+
+    const cc = colorForValue(p.v, vmin, vmax);
+    col[i * 4 + 0] = Math.round(255 * cc.red);
+    col[i * 4 + 1] = Math.round(255 * cc.green);
+    col[i * 4 + 2] = Math.round(255 * cc.blue);
+    col[i * 4 + 3] = Math.round(255 * cc.alpha);
+  }
+
+  const geom = new Cesium.Geometry({
+    attributes: {
+      position: new Cesium.GeometryAttribute({
+        componentDatatype: Cesium.ComponentDatatype.DOUBLE,
+        componentsPerAttribute: 3,
+        values: pos,
+      }),
+      color: new Cesium.GeometryAttribute({
+        componentDatatype: Cesium.ComponentDatatype.UNSIGNED_BYTE,
+        componentsPerAttribute: 4,
+        normalize: true,
+        values: col,
+      }),
     },
+    indices: indices.length > 65535 ? new Uint32Array(indices) : new Uint16Array(indices),
+    primitiveType: Cesium.PrimitiveType.TRIANGLES,
+    boundingSphere: Cesium.BoundingSphere.fromVertices(pos),
   });
+
+  const instance = new Cesium.GeometryInstance({ geometry: geom });
 
   surfacePrimitive = viewer.scene.primitives.add(
     new Cesium.Primitive({
       geometryInstances: instance,
-      appearance: new Cesium.MaterialAppearance({
-        material,
+      appearance: new Cesium.PerInstanceColorAppearance({
+        flat: true,
         translucent: true,
         closed: false,
-        faceForward: true,
-        renderState: Cesium.RenderState.fromCache({
-          depthTest: { enabled: false },
-          depthMask: false,
-          blending: Cesium.BlendingState.ALPHA_BLEND,
-        }),
       }),
       asynchronous: true,
       releaseGeometryInstances: true,
