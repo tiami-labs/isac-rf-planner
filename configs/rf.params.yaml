@@ -19,3 +19,20 @@ mimo_mode: "SISO"  # SISO, SIMO, MISO, MIMO
 # Link adaptation
 enable_link_adaptation: true  # Auto-select modulation based on SINR
 fixed_modulation: null  # If set, use this modulation (e.g., "QPSK", "16-QAM", "64-QAM", "256-QAM")
+
+# Building attenuation: per-material absolute values (dB) - primary
+# Optional: overall or per-material scale/subtract when absolute not set
+# Raw baseline (3.5 GHz): concrete 12, brick 10, wood 7, glass 9, metal 25, unknown 12 dB
+building_attenuation:
+  # Per-material absolute values (dB) - use directly
+  materials:
+    concrete: 9.0
+    brick: 7.5
+    wood: 5.25
+    glass: 6.75
+    metal: 18.75
+    unknown: 9.0
+  # Optional: overall scale and subtract (fallback when material not in materials)
+  overall:
+    scale: 0.75
+    reduction_db: 2.0
