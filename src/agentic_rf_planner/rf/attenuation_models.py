@@ -4,7 +4,7 @@ import logging
 import math
 from typing import Dict
 
-from ..pipeline.schemas import WorldModel, AttenuationGrid, MaterialType
+from ..pipeline.schemas import WorldModel, AttenuationGrid, MaterialType, RFParams
 from .material_models import DEFAULT_MATERIAL_DB
 from .modulation_schemes import select_modulation, get_modulation_by_name, ModulationOrder
 from .ofdm_params import OFDMParams, MIMOConfig
@@ -20,7 +20,7 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
       RSRP = tx_power_dbm - PL_base(d) - L_material + G_RX
       where:
         - PL_base(d) = FSPL(d) if LOS, else FSPL(d) + L_NLOS(d) if NLOS
-        - L_NLOS(d) = 20.0 + 0.1 × max(0, d - 50.0) dB
+        - L_NLOS(d) = 12.0 + 0.02 × max(0, d - 50.0) dB
         - L_material = cumulative material penetration loss along ray
         - G_RX = 0 dB (MIMO doesn't increase RSRP)
       
@@ -89,11 +89,11 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         nlos_excess_loss_db = 0.0
         if not is_los:
             # Base NLOS excess loss: typically 15-25 dB depending on environment
-            # For now, use a simple model: +20 dB base, with slight distance dependency
-            nlos_excess_loss_db = 20.0  # Base NLOS excess loss
-            # Optional: add distance-dependent component (e.g., +0.1 dB/m after 50m)
+            # Use a simple model with mild distance dependency.
+            nlos_excess_loss_db = 12.0  # Base NLOS excess loss
+            # Optional: add distance-dependent component (e.g., +0.02 dB/m after 50m)
             if d > 50.0:
-                nlos_excess_loss_db += 0.1 * (d - 50.0)  # Additional loss for longer NLOS paths
+                nlos_excess_loss_db += 0.02 * (d - 50.0)  # Additional loss for longer NLOS paths
         
         base_path_loss_db = fspl_db + nlos_excess_loss_db
         
@@ -104,7 +104,9 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
             material_loss_db = cell.cumulative_material_loss_db
         else:
             # Fallback: compute generic material loss (shouldn't happen if coverage_grid was called correctly)
-            material_loss_db = _compute_extra_loss(cell.dominant_material, cell.obstacles_count)
+            material_loss_db = _compute_extra_loss(
+                cell.dominant_material, cell.obstacles_count, world.rf_params
+            )
         
         # Check if path is blocked by metal
         if hasattr(cell, 'metal_blocked') and cell.metal_blocked:
@@ -199,21 +201,43 @@ def _free_space_path_loss_db(distance_m: float, freq_mhz: float) -> float:
     return 32.45 + 20.0 * math.log10(max(d_km, 1e-3)) + 20.0 * math.log10(freq_mhz)
 
 
-def _compute_extra_loss(material: MaterialType, obstacles_count: int) -> float:
+# Map MaterialType (fallback path) to config material keys
+_MATERIAL_TYPE_TO_CONFIG_KEY = {
+    MaterialType.BUILDING: "concrete",
+    MaterialType.HOUSE: "wood",
+    MaterialType.LARGE_STRUCTURE: "concrete",
+    MaterialType.TREES: "wood",
+    MaterialType.UNKNOWN: "unknown",
+}
+
+
+def _compute_extra_loss(
+    material: MaterialType, obstacles_count: int, rf_params: RFParams
+) -> float:
     """
     Compute extra attenuation based on material and obstacle count.
-    
-    Formula: base_loss + (obstacles_count * per_obstacle_loss)
-    - Base loss: applies even with 0 obstacles (material type itself causes loss)
-    - Per-obstacle loss: additional loss for each building/obstacle the ray passes through
+
+    Config-driven via rf_params.building_attenuation (overall + per-material).
+    Formula: max(0, (base_loss + obstacles_count * per_obstacle_loss) * scale - reduction_db)
     """
+    atten_cfg = getattr(rf_params, "building_attenuation", None)
+    mat_key = _MATERIAL_TYPE_TO_CONFIG_KEY.get(material, "unknown")
+    if atten_cfg:
+        from .material_penetration import _resolve_attenuation_params
+
+        scale, reduction_db = _resolve_attenuation_params(mat_key, atten_cfg)
+    else:
+        scale = 0.75
+        reduction_db = 2.0
+
     props = DEFAULT_MATERIAL_DB.get(material)
     if props is None:
         return 0.0
-    
+
     base_loss = props.base_loss_db
     obstacle_loss = obstacles_count * props.per_obstacle_loss_db
-    
-    return base_loss + obstacle_loss
+    raw = base_loss + obstacle_loss
+
+    return max(0.0, raw * scale - reduction_db)
 
 
