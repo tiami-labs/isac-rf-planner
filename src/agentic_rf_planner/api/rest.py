@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from ..config import load_rf_config
 from ..pipeline.schemas import RFParams, LatLon
 from ..agents.rf_planning_agent import run_rf_planning_for_point
 
@@ -76,6 +77,13 @@ class PlanRequest(BaseModel):
     tx_height_m: float = 0.0
     rx_height_m: float = 1.5
 
+    # Coverage / grid resolution (optional overrides; defaults match RFParams)
+    # In 3D mode these must match the mesh-profile cache key that the UI
+    # generates (max_range_m, step_m, dtheta_deg).
+    max_range_m: Optional[float] = None
+    step_m: Optional[float] = None
+    dtheta_deg: Optional[float] = None
+
 
 @app.post("/api/plan")
 async def api_plan(req: PlanRequest) -> Dict[str, Any]:
@@ -106,11 +114,19 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         # Use UI-provided ray_mode if present, otherwise default to 2d (ignore env var)
         # The UI toggle should control this, not an environment variable
         effective_ray_mode = (req.ray_mode or "2d").strip().lower()
+        # Load RF config for building attenuation etc. (config-driven, no code changes needed)
+        try:
+            rf_cfg = load_rf_config("configs/rf.params.yaml")
+        except Exception:
+            rf_cfg = {}
         rf_params = RFParams(
             freq_mhz=req.freq_mhz,
             tx_power_dbm=req.tx_power_dbm,
             noise_floor_dbm=req.noise_floor_dbm,
             noise_figure_db=req.noise_figure_db,
+            max_range_m=(req.max_range_m if req.max_range_m is not None else RFParams.model_fields["max_range_m"].default),
+            step_m=(req.step_m if req.step_m is not None else RFParams.model_fields["step_m"].default),
+            dtheta_deg=(req.dtheta_deg if req.dtheta_deg is not None else RFParams.model_fields.get("dtheta_deg").default if "dtheta_deg" in RFParams.model_fields else 5.0),
             subcarrier_spacing_khz=req.subcarrier_spacing_khz,
             num_resource_blocks=req.num_resource_blocks,
             channel_bandwidth_mhz=req.channel_bandwidth_mhz,
@@ -123,6 +139,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             ray_mode=effective_ray_mode,
             tx_height_m=req.tx_height_m,
             rx_height_m=req.rx_height_m,
+            building_attenuation=rf_cfg.get("building_attenuation"),
         )
         logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
         if req.sectors:
