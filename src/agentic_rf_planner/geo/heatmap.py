@@ -1,7 +1,15 @@
-"""Heatmap generation from attenuation grid."""
+"""Heatmap generation from attenuation grid.
 
+Performance notes:
+- The attenuation grid can have tens of thousands of scattered points.
+- For 3D OSM-only visualization, we prefer returning a pre-colored PNG texture (base64)
+  rather than large JSON arrays.
+"""
+
+import base64
+import io
 import logging
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any
 
 import numpy as np
 
@@ -16,135 +24,396 @@ def attenuation_grid_to_raster(
     height: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Convert scattered RSRP points to a simple raster.
+    Convert scattered RSRP points to a raster (lats_2d, lons_2d, rsrp_2d).
 
-    Returns:
-      lats_2d, lons_2d, rsrp_2d  (all [H, W])
-    MVP: do a simple scatter + nearest neighbor; no need for kriging.
+    This is used by non-3D-OSM renderers and for debugging. It is intentionally simple,
+    but the point-to-pixel assignment is vectorized for speed.
     """
     if not grid.cell_lat or not grid.cell_lon or not grid.rsrp_dbm:
         raise ValueError("Empty attenuation grid")
 
-    # Compute bounding box
-    min_lat = min(grid.cell_lat)
-    max_lat = max(grid.cell_lat)
-    min_lon = min(grid.cell_lon)
-    max_lon = max(grid.cell_lon)
+    lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
+    lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
+    val_arr = np.asarray(grid.rsrp_dbm, dtype=np.float32)
 
-    # Create uniform grid
-    lat_vals = np.linspace(min_lat, max_lat, height)
-    lon_vals = np.linspace(min_lon, max_lon, width)
+    # Bounding box
+    min_lat = float(np.min(lat_arr))
+    max_lat = float(np.max(lat_arr))
+    min_lon = float(np.min(lon_arr))
+    max_lon = float(np.max(lon_arr))
+
+    # Uniform grid in lat/lon
+    lat_vals = np.linspace(min_lat, max_lat, height, dtype=np.float64)
+    lon_vals = np.linspace(min_lon, max_lon, width, dtype=np.float64)
     lats_2d, lons_2d = np.meshgrid(lat_vals, lon_vals, indexing="ij")
 
-    # Simple nearest neighbor assignment
+    # Vectorized assignment onto nearest bins (via linear index mapping).
+    # Since lat_vals/lon_vals are linspace, we can compute indices by scaling.
+    # NOTE: lat decreases in array index? Here lat_vals is increasing; we map directly.
+    lat_span = max_lat - min_lat
+    lon_span = max_lon - min_lon
+    if lat_span <= 0 or lon_span <= 0:
+        raise ValueError("Degenerate bounds for heatmap rasterization")
+
+    lat_f = (lat_arr - min_lat) / lat_span
+    lon_f = (lon_arr - min_lon) / lon_span
+    i = np.clip(np.rint(lat_f * (height - 1)).astype(np.int32), 0, height - 1)
+    j = np.clip(np.rint(lon_f * (width - 1)).astype(np.int32), 0, width - 1)
+
+    sums = np.zeros((height, width), dtype=np.float64)
+    cnts = np.zeros((height, width), dtype=np.int32)
+    np.add.at(sums, (i, j), val_arr.astype(np.float64))
+    np.add.at(cnts, (i, j), 1)
+
     rsrp_2d = np.full((height, width), np.nan, dtype=np.float32)
+    m = cnts > 0
+    rsrp_2d[m] = (sums[m] / cnts[m]).astype(np.float32)
 
-    for i in range(len(grid.cell_lat)):
-        lat = grid.cell_lat[i]
-        lon = grid.cell_lon[i]
-        rsrp = grid.rsrp_dbm[i]
+    rsrp_filled = _fill_nans_nearest(rsrp_2d)
 
-        # Find nearest grid point
-        lat_idx = np.argmin(np.abs(lat_vals - lat))
-        lon_idx = np.argmin(np.abs(lon_vals - lon))
+    # Circular mask based on RF max range (authoritative).
+    _apply_circular_mask_in_latlon(grid, lats_2d, lons_2d, rsrp_filled)
 
-        # Assign value (or average if multiple points map to same cell)
-        if np.isnan(rsrp_2d[lat_idx, lon_idx]):
-            rsrp_2d[lat_idx, lon_idx] = rsrp
+    return lats_2d, lons_2d, rsrp_filled
+
+
+def attenuation_grid_to_png_ellipse(
+    grid: AttenuationGrid,
+    size: int = 768,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    alpha: float = 0.70,
+) -> Dict[str, Any]:
+    """
+    Create a pre-colored PNG (base64 data URL) suitable for Cesium ellipse draping.
+
+    Mapping:
+      - The ellipse is centered at TX with semiMajor/semiMinor = max_range_m.
+      - Texture coordinates map linearly to local East/North meters in [-R, R].
+
+    Returns dict:
+      {
+        "png_b64": "data:image/png;base64,...",
+        "width": size,
+        "height": size,
+        "radius_m": max_range_m,
+        "vmin": vmin_used,
+        "vmax": vmax_used,
+      }
+    """
+    if not grid.cell_lat or not grid.cell_lon or not grid.rsrp_dbm:
+        raise ValueError("Empty attenuation grid")
+
+    radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
+    if radius_m <= 0.0:
+        raise ValueError("rf_params.max_range_m must be > 0 for ellipse PNG")
+
+    tx_lat = float(grid.tx.lat)
+    tx_lon = float(grid.tx.lon)
+
+    lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
+    lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
+    val_arr = np.asarray(grid.rsrp_dbm, dtype=np.float32)
+
+    # Local EN (meters) via equirectangular approximation.
+    earth_m = 6371000.0
+    lat0 = np.deg2rad(tx_lat)
+    dx = np.deg2rad(lon_arr - tx_lon) * np.cos(lat0) * earth_m  # east
+    dy = np.deg2rad(lat_arr - tx_lat) * earth_m                 # north
+
+    # Map to pixel coords in [0, size-1]
+    u = (dx + radius_m) / (2.0 * radius_m)
+    v = (dy + radius_m) / (2.0 * radius_m)
+
+    jj = np.rint(u * (size - 1)).astype(np.int32)
+    ii = np.rint((1.0 - v) * (size - 1)).astype(np.int32)
+
+    inb = (
+        (jj >= 0) & (jj < size) &
+        (ii >= 0) & (ii < size) &
+        (dx * dx + dy * dy <= (radius_m * radius_m))
+    )
+
+    sums = np.zeros((size, size), dtype=np.float64)
+    cnts = np.zeros((size, size), dtype=np.int32)
+    np.add.at(sums, (ii[inb], jj[inb]), val_arr[inb].astype(np.float64))
+    np.add.at(cnts, (ii[inb], jj[inb]), 1)
+
+    rsrp = np.full((size, size), np.nan, dtype=np.float32)
+    m = cnts > 0
+    rsrp[m] = (sums[m] / cnts[m]).astype(np.float32)
+
+    # Build a "support" mask so we only fill small holes between nearby rays,
+    # and we do NOT smear values into large unsampled regions (e.g. beyond ray termination).
+    yy, xx = np.mgrid[0:size, 0:size]
+    x_m = (xx / (size - 1) - 0.5) * (2.0 * radius_m)          # east
+    y_m = ((size - 1 - yy) / (size - 1) - 0.5) * (2.0 * radius_m)  # north
+    r_pix = np.sqrt(x_m * x_m + y_m * y_m)
+    circle_mask = r_pix <= radius_m
+
+    # Estimate per-bearing reach based on which samples exist.
+    # IMPORTANT: rendering must not look like discrete "wedges" when dtheta is coarse.
+    # So we bin bearings at <= 1° and interpolate r_max across missing bins.
+    try:
+        bin_deg = float(getattr(grid.rf_params, "dtheta_deg", 1.0) or 1.0)
+    except Exception:
+        bin_deg = 1.0
+    bin_deg = max(0.25, min(1.0, bin_deg))
+    n_bins = int(max(360, round(360.0 / bin_deg)))
+
+    theta_s = (np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0
+    r_s = np.sqrt(dx * dx + dy * dy)
+
+    bi_s = np.floor(theta_s / (360.0 / n_bins)).astype(np.int32)
+    bi_s = np.clip(bi_s, 0, n_bins - 1)
+
+    rmax = np.zeros((n_bins,), dtype=np.float32)
+    np.maximum.at(rmax, bi_s, r_s.astype(np.float32))
+
+    # Interpolate rmax across missing bins (circular) so the support mask is continuous.
+    valid = rmax > 0.0
+    if np.any(valid) and not np.all(valid):
+        idx = np.arange(n_bins, dtype=np.float64)
+        valid_idx = idx[valid]
+        valid_r = rmax[valid].astype(np.float64)
+        if valid_idx.size == 1:
+            rmax[:] = float(valid_r[0])
         else:
-            # Average if multiple points
-            rsrp_2d[lat_idx, lon_idx] = (rsrp_2d[lat_idx, lon_idx] + rsrp) / 2.0
+            # Rotate so the first valid bin is at 0, making interpolation well-defined.
+            first = int(valid_idx[0])
+            rmax_rot = np.roll(rmax, -first)
+            valid_rot = np.roll(valid, -first)
+            idx2 = np.arange(n_bins, dtype=np.float64)
+            v_idx = idx2[valid_rot]
+            v_r = rmax_rot[valid_rot].astype(np.float64)
+            v_idx_ext = np.concatenate([v_idx, v_idx + n_bins])
+            v_r_ext = np.concatenate([v_r, v_r])
+            rmax_rot_f = np.interp(idx2, v_idx_ext, v_r_ext)
+            rmax = np.roll(rmax_rot_f.astype(np.float32), first)
 
-    # Fill NaN values with nearest neighbor (inside the sampled region only).
-    rsrp_filled = _fill_nans(rsrp_2d.copy())
+    # Gentle max-smoothing to avoid pinholes from numeric jitter.
+    for k in (1, 2, 3):
+        rmax = np.maximum(rmax, np.roll(rmax, k))
+        rmax = np.maximum(rmax, np.roll(rmax, -k))
 
-    # Enforce a circular mask so the heatmap is a radius around the TX,
-    # not the full bounding-box rectangle.
-    #
-    # IMPORTANT: The world grid is generated on a square bounding box around TX,
-    # so the farthest points are corners (~sqrt(2) * max_range). If we derive the
-    # radius from the farthest cell, the mask will NOT be circular.
-    # Use the configured RF max_range_m as the authoritative radius.
+    # Per-pixel bearing bins
+    theta_pix = (np.degrees(np.arctan2(x_m, y_m)) + 360.0) % 360.0
+    bi_pix = np.floor(theta_pix / (360.0 / n_bins)).astype(np.int32)
+    bi_pix = np.clip(bi_pix, 0, n_bins - 1)
+
+    # Allow fill only where the ray reached (plus one step for softness).
+    try:
+        dr_m = float(getattr(grid.rf_params, "step_m", 5.0) or 5.0)
+    except Exception:
+        dr_m = 5.0
+
+    support_mask = circle_mask & (rmax[bi_pix] > 0.0) & (r_pix <= (rmax[bi_pix] + dr_m))
+
+    # Fill holes within support only (do not fill beyond reach).
+    rsrp = _fill_nans_nearest(rsrp, fill_mask=support_mask)
+
+    # Anything outside the circle stays transparent.
+    rsrp[~circle_mask] = np.nan
+
+    finite = np.isfinite(rsrp)
+    if not np.any(finite):
+        vmin_used = float(vmin) if vmin is not None else -150.0
+        vmax_used = float(vmax) if vmax is not None else 50.0
+    else:
+        vmin_used = float(np.nanmin(rsrp)) if vmin is None else float(vmin)
+        vmax_used = float(np.nanmax(rsrp)) if vmax is None else float(vmax)
+        if not np.isfinite(vmin_used) or not np.isfinite(vmax_used) or vmax_used <= vmin_used:
+            vmin_used, vmax_used = -150.0, 50.0
+
+    rgba = _colorize_rsrp(rsrp, vmin_used, vmax_used, alpha=alpha)
+
+    # Encode PNG
+    try:
+        from PIL import Image
+        img = Image.fromarray(rgba, mode="RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        data_url = f"data:image/png;base64,{b64}"
+    except Exception as e:
+        logger.exception("Failed to encode heatmap PNG: %s", e)
+        raise
+
+    return {
+        "png_b64": data_url,
+        "width": int(size),
+        "height": int(size),
+        "radius_m": radius_m,
+        "vmin": vmin_used,
+        "vmax": vmax_used,
+    }
+
+
+def _colorize_rsrp(rsrp: np.ndarray, vmin: float, vmax: float, alpha: float = 0.70) -> np.ndarray:
+    """Vectorized port of planner_3d.js colorForValue()."""
+    h, w = rsrp.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    finite = np.isfinite(rsrp)
+    if not np.any(finite):
+        return rgba
+
+    t = (rsrp.astype(np.float64) - vmin) / (vmax - vmin)
+    t = np.clip(t, 0.0, 1.0)
+
+    r = np.zeros_like(t)
+    g = np.zeros_like(t)
+    b = np.zeros_like(t)
+
+    # Piecewise gradient
+    m0 = t < 0.2
+    u0 = np.zeros_like(t)
+    u0[m0] = t[m0] / 0.2
+    g[m0] = u0[m0]
+    b[m0] = 1.0
+
+    m1 = (t >= 0.2) & (t < 0.4)
+    u1 = np.zeros_like(t)
+    u1[m1] = (t[m1] - 0.2) / 0.2
+    g[m1] = 1.0
+    b[m1] = 1.0 - u1[m1]
+
+    m2 = (t >= 0.4) & (t < 0.6)
+    u2 = np.zeros_like(t)
+    u2[m2] = (t[m2] - 0.4) / 0.2
+    r[m2] = u2[m2]
+    g[m2] = 1.0
+
+    m3 = (t >= 0.6) & (t < 0.8)
+    u3 = np.zeros_like(t)
+    u3[m3] = (t[m3] - 0.6) / 0.2
+    r[m3] = 1.0
+    g[m3] = 1.0 - 0.5 * u3[m3]
+
+    m4 = t >= 0.8
+    u4 = np.zeros_like(t)
+    u4[m4] = (t[m4] - 0.8) / 0.2
+    r[m4] = 1.0
+    g[m4] = 0.5 * (1.0 - u4[m4])
+
+    a = np.zeros_like(t)
+    a[finite] = alpha
+
+    rgba[..., 0] = np.clip(np.rint(255.0 * r), 0, 255).astype(np.uint8)
+    rgba[..., 1] = np.clip(np.rint(255.0 * g), 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(np.rint(255.0 * b), 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip(np.rint(255.0 * a), 0, 255).astype(np.uint8)
+
+    # Transparent outside finite region (NaN)
+    rgba[~finite, 3] = 0
+    return rgba
+
+
+
+def _fill_nans_nearest(arr: np.ndarray, fill_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """Fill NaNs with a cheap nearest-neighbor approximation (no SciPy dependency).
+
+    If fill_mask is provided, NaNs are only filled where fill_mask is True.
+    Cells outside fill_mask remain NaN (transparent in the PNG overlay).
+    """
+    if fill_mask is None:
+        mask = np.ones_like(arr, dtype=bool)
+    else:
+        mask = np.asarray(fill_mask, dtype=bool)
+        if mask.shape != arr.shape:
+            raise ValueError("fill_mask shape must match arr")
+
+    out = arr.copy()
+    # Keep outside-mask region as NaN and never fill it.
+    out[~mask] = np.nan
+
+    need = np.isnan(out) & mask
+    if not need.any():
+        return out
+
+    # Iterative wavefront fill from existing samples.
+    # Cap iterations to avoid worst-case slowdowns; higher caps help with sparse rays at large radii.
+    max_iter = 256
+    for _ in range(max_iter):
+        need = np.isnan(out) & mask
+        if not need.any():
+            break
+
+        filled_any = False
+        tmp = out.copy()
+
+        # From north (copy down)
+        src = out[:-1, :]
+        src_ok = np.isfinite(src) & mask[:-1, :]
+        dst_need = np.isnan(out[1:, :]) & mask[1:, :]
+        can = dst_need & src_ok
+        if np.any(can):
+            tmp[1:, :][can] = src[can]
+            filled_any = True
+
+        # From south (copy up)
+        src = out[1:, :]
+        src_ok = np.isfinite(src) & mask[1:, :]
+        dst_need = np.isnan(out[:-1, :]) & mask[:-1, :]
+        can = dst_need & src_ok
+        if np.any(can):
+            tmp[:-1, :][can] = src[can]
+            filled_any = True
+
+        # From west (copy right)
+        src = out[:, :-1]
+        src_ok = np.isfinite(src) & mask[:, :-1]
+        dst_need = np.isnan(out[:, 1:]) & mask[:, 1:]
+        can = dst_need & src_ok
+        if np.any(can):
+            tmp[:, 1:][can] = src[can]
+            filled_any = True
+
+        # From east (copy left)
+        src = out[:, 1:]
+        src_ok = np.isfinite(src) & mask[:, 1:]
+        dst_need = np.isnan(out[:, :-1]) & mask[:, :-1]
+        can = dst_need & src_ok
+        if np.any(can):
+            tmp[:, :-1][can] = src[can]
+            filled_any = True
+
+        out = tmp
+        if not filled_any:
+            break
+
+    # Remaining NaNs inside mask: fill with mean of available values inside mask.
+    remain = np.isnan(out) & mask
+    if remain.any():
+        valid = out[np.isfinite(out) & mask]
+        if valid.size:
+            out[remain] = float(np.mean(valid))
+
+    return out
+
+def _apply_circular_mask_in_latlon(
+    grid: AttenuationGrid,
+    lats_2d: np.ndarray,
+    lons_2d: np.ndarray,
+    rsrp_2d: np.ndarray,
+) -> None:
+    """Mask raster outside max_range_m, operating directly in lat/lon raster."""
     try:
         tx_lat = float(grid.tx.lat)
         tx_lon = float(grid.tx.lon)
         earth_m = 6371000.0
 
-        lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
-        lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
-
-        # Equirectangular approximation (sufficient at city scale).
-        x = np.deg2rad(lon_arr - tx_lon) * np.cos(np.deg2rad((lat_arr + tx_lat) * 0.5))
-        y = np.deg2rad(lat_arr - tx_lat)
-        # Authoritative radius.
         radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
         if radius_m <= 0.0:
-            dist_m = earth_m * np.sqrt(x * x + y * y)
-            radius_m = float(np.nanmax(dist_m)) if dist_m.size else 0.0
+            return
 
-        # Compute distances for raster grid
-        x2 = np.deg2rad(lons_2d - tx_lon) * np.cos(
-            np.deg2rad((lats_2d + tx_lat) * 0.5)
-        )
+        x2 = np.deg2rad(lons_2d - tx_lon) * np.cos(np.deg2rad((lats_2d + tx_lat) * 0.5))
         y2 = np.deg2rad(lats_2d - tx_lat)
         dist2_m = earth_m * np.sqrt(x2 * x2 + y2 * y2)
 
-        # Add a small margin (~1 pixel) to avoid clipping the boundary.
-        px_m = max(1.0, radius_m / max(1.0, min(width, height)))
+        px_m = max(1.0, radius_m / max(1.0, min(lats_2d.shape[0], lats_2d.shape[1])))
         mask = dist2_m <= (radius_m + 2.0 * px_m)
-        rsrp_filled[~mask] = np.nan
+        rsrp_2d[~mask] = np.nan
     except Exception:
-        # If anything goes wrong, fall back to filled raster.
-        pass
-
-    return lats_2d, lons_2d, rsrp_filled
-
-
-
-def _fill_nans(arr: np.ndarray) -> np.ndarray:
-    """
-    Fill NaN values efficiently.
-    
-    Strategy: If few NaNs, use simple mean fill (very fast).
-    Otherwise, use limited-radius nearest neighbor search.
-    """
-    mask = np.isnan(arr)
-    if not np.any(mask):
-        return arr
-    
-    valid_values = arr[~mask]
-    if len(valid_values) == 0:
-        # No valid values, fill with zeros
-        arr[mask] = 0.0
-        return arr
-    
-    num_nans = np.sum(mask)
-    total_cells = arr.size
-    
-    # If NaNs are < 10% of cells, use simple mean fill (much faster)
-    if num_nans < total_cells * 0.1:
-        mean_value = np.nanmean(arr) if np.any(~mask) else 0.0
-        arr[mask] = mean_value
-        return arr
-    
-    # Otherwise, use nearest neighbor with limited search radius
-    nan_coords = np.argwhere(mask)
-    valid_coords = np.argwhere(~mask)
-    search_radius = min(16, min(arr.shape[0], arr.shape[1]) // 8)  # Smaller radius for speed
-    search_radius_sq = search_radius ** 2
-    
-    for nan_coord in nan_coords:
-        # Calculate distances to valid points
-        distances_sq = np.sum((valid_coords - nan_coord) ** 2, axis=1)
-        
-        # Limit to nearby points
-        nearby = distances_sq <= search_radius_sq
-        if np.any(nearby):
-            nearest_idx = np.argmin(distances_sq[nearby])
-            arr[nan_coord[0], nan_coord[1]] = valid_values[nearby][nearest_idx]
-        else:
-            # Fallback: use global nearest
-            nearest_idx = np.argmin(distances_sq)
-            arr[nan_coord[0], nan_coord[1]] = valid_values[nearest_idx]
-    
-    return arr
+        # Best effort only.
+        return
