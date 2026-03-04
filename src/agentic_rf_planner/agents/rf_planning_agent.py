@@ -19,7 +19,7 @@ from ..vision.materials_extraction import return_static_material
 from ..vision.models.base_vlm import BaseVLM
 from ..pipeline.world_builder import build_world_model
 from ..rf.attenuation_models import compute_attenuation_grid
-from ..geo.heatmap import attenuation_grid_to_raster
+from ..geo.heatmap import attenuation_grid_to_raster, attenuation_grid_to_png_ellipse
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ def run_rf_planning_for_point(
     # 2D mode: snap to street (keeps 2D behavior consistent with earlier implementation)
     # 3D mode: DO NOT snap (profiles + Google mesh are computed for the clicked TX)
     ray_mode_eff = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
-    if ray_mode_eff in ("3d", "mesh", "google_mesh", "google-mesh"):
+    if ray_mode_eff in ("3d", "mesh", "google_mesh", "google-mesh", "3d_osm", "3d-osm", "osm3d"):
         logger.info("STEP 1: 3D mode - skipping street snapping; using clicked point as TX")
         snapped = SnappedPoint(LatLon(lat=lat, lon=lon), 0.0)
         logger.info(f"✓ STEP 1 SUCCESS: TX (no-snap): ({snapped.latlon.lat:.6f}, {snapped.latlon.lon:.6f})")
@@ -115,7 +115,7 @@ def run_rf_planning_for_point(
                     rx_height_m=rx_height_m,
                     max_range_m=rf_params.max_range_m,
                     dr_m=rf_params.step_m,
-                    dtheta_deg=5.0,  # must match coverage_grid's discretization
+                    dtheta_deg=getattr(rf_params, "dtheta_deg", 5.0),
                 )
 
                 # Fail fast if mesh profiles are missing (avoid spending time before erroring).
@@ -296,9 +296,38 @@ def run_rf_planning_for_point(
     logger.info(f"Computed attenuation grid with {len(grid.cell_lat)} points")
 
     # 6) heatmap / map overlay
-    logger.debug("Generating heatmap raster...")
-    lats_2d, lons_2d, rsrp_2d = attenuation_grid_to_raster(grid, width=256, height=256)
-    logger.info(f"Generated heatmap raster: {rsrp_2d.shape}")
+    ray_mode_eff2 = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
+
+    # 3D visualization: return a pre-colored PNG (fast client render, small payload).
+    # NOTE: 3D (Google mesh + OSM semantics) must use the SAME render strategy as 3D OSM-only.
+    png_modes = {
+        "3d_osm", "3d-osm", "osm3d",
+        "3d", "mesh", "google_mesh", "google-mesh", "3d_google", "3d-google",
+        "3d_google_mesh", "3d-google-mesh",
+    }
+
+    if ray_mode_eff2 in png_modes:
+        # Return a pre-colored PNG texture.
+        # Choose texture resolution from range and step, but cap to keep transfers reasonable.
+        try:
+            step_m = float(getattr(rf_params, "step_m", 5.0) or 5.0)
+        except Exception:
+            step_m = 5.0
+        base = (2.0 * float(rf_params.max_range_m)) / max(5.0, step_m)
+        tex_size = int(min(1024, max(512, round(base))))
+        logger.debug(f"Generating heatmap PNG texture (size={tex_size})...")
+        heatmap_payload = attenuation_grid_to_png_ellipse(grid, size=tex_size, vmin=-150.0, vmax=50.0)
+        logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
+    else:
+        logger.debug("Generating heatmap raster...")
+        lats_2d, lons_2d, rsrp_2d = attenuation_grid_to_raster(grid, width=256, height=256)
+        logger.info(f"Generated heatmap raster: {rsrp_2d.shape}")
+        heatmap_payload = {
+            "lats": lats_2d.tolist(),
+            "lons": lons_2d.tolist(),
+            "rsrp": rsrp_2d.tolist(),
+        }
+
 
     # Prepare sector information for visualization
     sectors_info = []
@@ -322,6 +351,18 @@ def run_rf_planning_for_point(
         })
     
     # Prepare response
+    
+    # Reduce payload size for PNG-based 3D modes (front-end uses heatmap PNG, not per-point arrays).
+    grid_payload = grid.model_dump()
+    if ray_mode_eff2 in png_modes:
+        try:
+            grid_payload["num_points"] = len(grid.cell_lat)
+        except Exception:
+            pass
+        for k in ("cell_lat", "cell_lon", "rsrp_dbm", "sinr_db", "modulation", "throughput_mbps"):
+            if k in grid_payload:
+                grid_payload[k] = []
+
     result = {
         "original_point": {"lat": lat, "lon": lon},
         "snapped_tx": snapped.latlon.model_dump(),
@@ -334,12 +375,8 @@ def run_rf_planning_for_point(
         "streetview_available": streetview_available,
         "vlm_used": vlm_used,
         "sectors": sectors_info,  # Sector information for visualization
-        "grid": grid.model_dump(),
-        "heatmap": {
-            "lats": lats_2d.tolist(),
-            "lons": lons_2d.tolist(),
-            "rsrp": rsrp_2d.tolist(),
-        },
+        "grid": grid_payload,
+        "heatmap": heatmap_payload,
     }
 
     # Surface 3D mesh profile key (if applicable) so the frontend can diagnose/cache.
