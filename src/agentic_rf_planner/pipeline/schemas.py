@@ -73,6 +73,7 @@ class RFParams(BaseModel):
     noise_figure_db: float = 7.0  # Receiver noise figure (typical: 5-10 dB)
     max_range_m: float = 500.0
     step_m: float = 5.0  # grid resolution
+    dtheta_deg: float = 5.0  # bearing step (deg); must match 3D mesh-profile discretization
     
     # OFDM parameters
     subcarrier_spacing_khz: float = 15.0
@@ -99,6 +100,10 @@ class RFParams(BaseModel):
     # Heights above ground (meters), used only by 3D ray geometry.
     tx_height_m: float = 0.0
     rx_height_m: float = 1.5
+
+    # Building attenuation: overall + per-material (config-driven; no code changes needed).
+    # Dict with "overall": {scale, reduction_db} and optional "materials": {concrete: {...}, ...}
+    building_attenuation: Optional[Dict[str, Any]] = None
 
 
 class WorldCell(BaseModel):

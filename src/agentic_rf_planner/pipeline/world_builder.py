@@ -88,6 +88,14 @@ def build_world_model(
     cells = build_coverage_grid(tx, rf_params, map_provider=map_provider, sectors=sectors)
     logger.info(f"Created {len(cells)} cells in coverage grid (with adaptive termination)")
     
+    # Performance fast-path: 3D OSM-only mode renders from a raster/PNG overlay and only
+    # requires per-cell LOS + cumulative material loss (computed during build_coverage_grid).
+    # The geometry/VLM refinement below is expensive and redundant for this mode.
+    ray_mode_eff = str(getattr(rf_params, "ray_mode", "") or "").strip().lower()
+    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
+        logger.info("3D OSM-only mode: skipping per-cell world refinement (using coverage-grid LOS/material loss)")
+        return WorldModel(tx=tx, rf_params=rf_params, cells=cells)
+    
     # Process cells with cached data (much faster now)
     logger.info("Processing cells with cached OSM data...")
     cells_processed = 0
@@ -137,15 +145,20 @@ def build_world_model(
             if map_provider is not None:
                 cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
                 buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
+                bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
                 for building in buildings_along_path:
                     material = building.get("material", "unknown")
                     if is_material_blocking(material, rf_params.freq_mhz):
                         metal_blocked = True
                         break
-                    penetration_loss = get_penetration_loss_for_material(material, rf_params.freq_mhz)
+                    penetration_loss = get_penetration_loss_for_material(
+                        material, rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
+                    )
                     cumulative_material_loss_db += penetration_loss
                 if map_provider.is_forest_between(tx, cell_latlon):
-                    tree_loss = get_penetration_loss_for_material("wood", rf_params.freq_mhz)
+                    tree_loss = get_penetration_loss_for_material(
+                        "wood", rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
+                    )
                     cumulative_material_loss_db += tree_loss
         
         if map_provider is not None:
