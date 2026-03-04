@@ -10,12 +10,20 @@ import { buildAndUploadProfiles } from "/mesh_profiler_core.js";
 
 let viewer = null;
 let txEntity = null;
-let points = null; // Cesium.PointPrimitiveCollection
-let heatmapEntity = null; // (legacy) Cesium entity (ellipse w/ texture)
-let surfacePrimitive = null; // Cesium.Primitive (draped "fabric" surface)
-let sectorEntities = []; // visualization overlays
+// Planned overlays persist until the user presses "Clear Map".
+// Keep the selection TX marker (txEntity) separate.
+let planEntities = []; // Cesium.Entity[] (heatmaps, planned TX markers, etc.)
+let planPrimitives = []; // Cesium.Primitive[] / collections
+let planCounter = 0;
+
+let sectorEntities = []; // visualization overlays (entities)
 let currentTxLocation = null; // {lat, lon}
 let sectorCounter = 0;
+let osmHeatmapMeshCache = new Map(); // key -> { geometry }
+
+// Fixed RSRP scale (used for legend labels / cross-plan comparability).
+const FIXED_RSRP_MIN = -150.0;
+const FIXED_RSRP_MAX = 50.0;
 
 // Polygon drawing mode (Cesium)
 let polygonDrawingMode = null; // { sectorId, points:[{lat,lon}], polylineEntity, polygonEntity }
@@ -55,6 +63,89 @@ async function fetchConfig() {
   return await r.json();
 }
 
+function _pickGlobePosition(windowPos) {
+  // Use globe pick (ellipsoid) for a stable scale even when 3D tiles aren't fully loaded.
+  try {
+    const ray = viewer.camera.getPickRay(windowPos);
+    if (ray) {
+      const p = viewer.scene.globe.pick(ray, viewer.scene);
+      if (p) return p;
+    }
+  } catch {}
+  try {
+    return viewer.camera.pickEllipsoid(windowPos, viewer.scene.globe.ellipsoid);
+  } catch {}
+  return null;
+}
+
+function _niceDistanceMeters(maxMeters) {
+  if (!Number.isFinite(maxMeters) || maxMeters <= 0) return 0;
+  const pow10 = Math.pow(10, Math.floor(Math.log10(maxMeters)));
+  const steps = [1, 2, 5, 10];
+  let best = pow10;
+  for (const s of steps) {
+    const d = s * pow10;
+    if (d <= maxMeters) best = d;
+  }
+  return best;
+}
+
+function _formatDistance(m) {
+  if (!Number.isFinite(m) || m <= 0) return "-";
+  if (m >= 1000) {
+    const km = m / 1000.0;
+    const digits = km >= 10 ? 0 : 1;
+    return `${km.toFixed(digits)} km`;
+  }
+  return `${Math.round(m)} m`;
+}
+
+function initDistanceScale() {
+  const labelEl = document.getElementById("distance-scale-label");
+  const barEl = document.getElementById("distance-scale-bar");
+  if (!labelEl || !barEl) return;
+
+  const maxBarPx = 100;
+  let last = 0;
+
+  const update = () => {
+    const now = performance.now();
+    if (now - last < 250) return;
+    last = now;
+
+    const w = viewer.canvas.clientWidth || viewer.canvas.width;
+    const h = viewer.canvas.clientHeight || viewer.canvas.height;
+    if (!w || !h) return;
+
+    // Measure at the bottom center of the viewport.
+    const y = h - 2;
+    const x1 = Math.max(0, Math.round(w / 2 - maxBarPx / 2));
+    const x2 = Math.min(w - 1, Math.round(w / 2 + maxBarPx / 2));
+
+    const p1 = _pickGlobePosition(new Cesium.Cartesian2(x1, y));
+    const p2 = _pickGlobePosition(new Cesium.Cartesian2(x2, y));
+    if (!p1 || !p2) {
+      labelEl.textContent = "-";
+      barEl.style.width = `${maxBarPx}px`;
+      return;
+    }
+
+    const c1 = Cesium.Cartographic.fromCartesian(p1);
+    const c2 = Cesium.Cartographic.fromCartesian(p2);
+    const geo = new Cesium.EllipsoidGeodesic(c1, c2);
+    const dist = geo.surfaceDistance;
+    if (!Number.isFinite(dist) || dist <= 0) return;
+
+    const nice = _niceDistanceMeters(dist);
+    const px = Math.max(10, Math.min(maxBarPx, (nice / dist) * maxBarPx));
+    barEl.style.width = `${px.toFixed(0)}px`;
+    labelEl.textContent = _formatDistance(nice);
+  };
+
+  viewer.scene.postRender.addEventListener(update);
+  update();
+}
+
 function updateTxMarker(lat, lon) {
   const pos = Cesium.Cartesian3.fromDegrees(lon, lat, 20.0);
   if (!txEntity) {
@@ -83,23 +174,85 @@ function updateTxMarker(lat, lon) {
   }
 }
 
+function addPlannedTxMarker(lat, lon) {
+  // Persist planned TX markers so multiple plans remain visible.
+  const n = ++planCounter;
+  const pos = Cesium.Cartesian3.fromDegrees(lon, lat, 20.0);
+  const ent = viewer.entities.add({
+    position: pos,
+    point: {
+      pixelSize: 9,
+      color: Cesium.Color.YELLOW.withAlpha(0.85),
+      outlineColor: Cesium.Color.BLACK.withAlpha(0.8),
+      outlineWidth: 2,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    },
+    label: {
+      text: `TX${n}`,
+      font: "12px sans-serif",
+      fillColor: Cesium.Color.YELLOW,
+      outlineColor: Cesium.Color.BLACK,
+      outlineWidth: 2,
+      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+      pixelOffset: new Cesium.Cartesian2(0, -22),
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    },
+  });
+  planEntities.push(ent);
+}
+
 function clearOverlay() {
-  if (heatmapEntity) {
-    try { viewer.entities.remove(heatmapEntity); } catch {}
-    heatmapEntity = null;
+  for (const e of planEntities) {
+    try { viewer.entities.remove(e); } catch {}
   }
-  if (points) {
-    viewer.scene.primitives.remove(points);
-    points = null;
+  planEntities = [];
+
+  for (const p of planPrimitives) {
+    try { viewer.scene.primitives.remove(p); } catch {}
   }
-  if (surfacePrimitive) {
-    try { viewer.scene.primitives.remove(surfacePrimitive); } catch {}
-    surfacePrimitive = null;
-  }
+  planPrimitives = [];
   for (const e of sectorEntities) {
     try { viewer.entities.remove(e); } catch {}
   }
   sectorEntities = [];
+
+  planCounter = 0;
+
+  // Hide legend when overlay is cleared.
+  const legend = document.getElementById("rsrp-legend");
+  if (legend) legend.style.display = "none";
+}
+
+function updateRSRPLegend(scaleMinRSRP, scaleMaxRSRP, actualMinRSRP, actualMaxRSRP) {
+  const legend = document.getElementById("rsrp-legend");
+  if (!legend) return;
+
+  legend.style.display = "block";
+
+  // Match the multi-hue mapping in colorForValue().
+  const gradient = document.getElementById("rsrp-legend-gradient");
+  if (gradient) {
+    gradient.style.background = `linear-gradient(to top,
+      rgb(0, 0, 255) 0%,
+      rgb(0, 255, 255) 20%,
+      rgb(0, 255, 0) 40%,
+      rgb(255, 255, 0) 60%,
+      rgb(255, 128, 0) 80%,
+      rgb(255, 0, 0) 100%
+    )`;
+  }
+
+  const maxLabel = document.getElementById("legend-max");
+  const midLabel = document.getElementById("legend-mid");
+  const minLabel = document.getElementById("legend-min");
+  if (maxLabel) maxLabel.textContent = scaleMaxRSRP.toFixed(0);
+  if (midLabel) midLabel.textContent = ((scaleMinRSRP + scaleMaxRSRP) / 2).toFixed(0);
+  if (minLabel) minLabel.textContent = scaleMinRSRP.toFixed(0);
+
+  const maxValue = document.getElementById("legend-max-value");
+  const minValue = document.getElementById("legend-min-value");
+  if (maxValue) maxValue.textContent = Number.isFinite(actualMaxRSRP) ? actualMaxRSRP.toFixed(1) : "-";
+  if (minValue) minValue.textContent = Number.isFinite(actualMinRSRP) ? actualMinRSRP.toFixed(1) : "-";
 }
 
 function colorForValue(v, vmin, vmax) {
@@ -136,7 +289,6 @@ function colorForValue(v, vmin, vmax) {
 // This intentionally preserves "missing" cells (no forced circular mask, no interpolation),
 // which is what makes the footprint deform and follow streets / blockers.
 function renderGridCoverage(grid) {
-  clearOverlay();
   if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
   const lats = grid.cell_lat;
   const lons = grid.cell_lon;
@@ -153,8 +305,12 @@ function renderGridCoverage(grid) {
   }
   if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
 
+  // Show legend with dBm scale.
+  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, vmin, vmax);
+
   // Point primitives are much faster than entities at this scale.
-  points = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection());
+  const points = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection());
+  planPrimitives.push(points);
   const disableDepth = Number.POSITIVE_INFINITY;
 
   // Rough visual match to Leaflet circles: many small semi-transparent points.
@@ -177,6 +333,55 @@ function renderGridCoverage(grid) {
       disableDepthTestDistance: disableDepth,
     });
   }
+}
+
+// 3D OSM-only rendering: map-aligned raster drape (no radial spokes).
+async function renderHeatmapDrapeOsm3d(heatmap, grid) {
+  // Fast path for 3D OSM-only mode:
+  // - Backend returns a pre-colored PNG texture (base64 data URL).
+  // - We drape it as a single Cesium ellipse clamped to ground/tiles.
+  // This avoids per-vertex clampToHeightMostDetailed, which is too slow for interactive use.
+
+  if (!grid || !grid.tx || !Number.isFinite(grid.tx.lat) || !Number.isFinite(grid.tx.lon)) return;
+
+  const txLat = grid.tx.lat;
+  const txLon = grid.tx.lon;
+
+  const radiusM =
+    (heatmap && Number.isFinite(heatmap.radius_m) ? Number(heatmap.radius_m) : NaN) ||
+    (grid && grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN) ||
+    getNumber("max-range", 500.0);
+
+  if (!Number.isFinite(radiusM) || radiusM <= 0) return;
+
+  // Legend: use the fixed scale for consistency, but show actual min/max from the grid if provided.
+  const actualMin = (heatmap && Number.isFinite(heatmap.vmin)) ? Number(heatmap.vmin) : FIXED_RSRP_MIN;
+  const actualMax = (heatmap && Number.isFinite(heatmap.vmax)) ? Number(heatmap.vmax) : FIXED_RSRP_MAX;
+  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
+
+  const imgSrc = heatmap && heatmap.png_b64 ? heatmap.png_b64 : null;
+
+  if (!imgSrc) {
+    // Fallback: if backend didn't provide a PNG, fall back to point grid (if available).
+    if (grid && Array.isArray(grid.cell_lat) && grid.cell_lat.length) {
+      renderGridCoverage(grid);
+    }
+    return;
+  }
+
+  const ent = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
+    ellipse: {
+      semiMajorAxis: radiusM,
+      semiMinorAxis: radiusM,
+      // Smaller granularity reduces visible faceting.
+      granularity: Cesium.Math.toRadians(0.25),
+      material: new Cesium.ImageMaterialProperty({ image: imgSrc, transparent: true }),
+      heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      outline: false,
+    },
+  });
+  planEntities.push(ent);
 }
 
 function normalizeAngleDeg(a) {
@@ -219,7 +424,11 @@ async function clampToMeshHeights(cartesians, heightOffsetM = 0.5) {
 // - Uses the same per-cell grid data (no forced circle, preserves missing cells).
 // - Builds a polar mesh (rings x bearings) and drapes it onto the Google mesh using clampToHeightMostDetailed.
 async function renderDrapedSurfaceCoverage(grid) {
-  clearOverlay();
+  // Render coverage as a single textured ellipse (old approach), but rasterized from the
+  // current per-cell polar grid output (preserves adaptive ray termination + blocking).
+  //
+  // This avoids the jagged topology that comes from clamping a triangulated surface where
+  // adjacent vertices snap to very different mesh heights (roof edges / facades / streets).
   if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
   if (!grid.tx || !Number.isFinite(grid.tx.lat) || !Number.isFinite(grid.tx.lon)) return;
 
@@ -228,10 +437,9 @@ async function renderDrapedSurfaceCoverage(grid) {
   const rsrp = grid.rsrp_dbm;
   if (lats.length === 0 || lons.length !== lats.length || rsrp.length !== lats.length) return;
 
-  // Range step comes from RF params (coverage_grid uses rf_params.step_m as dr).
+  // Polar discretization must match coverage_grid.py (dtheta=5°) and rf_params.step_m.
   const drM = Number(grid.rf_params?.step_m) || 5.0;
-  // coverage_grid currently uses fixed dtheta=5 degrees.
-  const dthetaDeg = 5.0;
+  const dthetaDeg = Number(grid.rf_params?.dtheta_deg) || 5.0;
   const nTheta = Math.max(1, Math.round(360.0 / dthetaDeg));
 
   let vmin = Infinity;
@@ -244,25 +452,19 @@ async function renderDrapedSurfaceCoverage(grid) {
   }
   if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
 
+  // 3D mode uses the draped surface path (not point primitives), so the legend
+  // must be enabled here as well.
+  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, vmin, vmax);
+
   const txLat = grid.tx.lat;
   const txLon = grid.tx.lon;
 
-  // Ensure tiles are streamed near TX (clamping can return null if nothing is loaded).
-  try {
-    const txCam = Cesium.Cartesian3.fromDegrees(txLon, txLat, 1500.0);
-    const camDist = Cesium.Cartesian3.distance(viewer.camera.positionWC, txCam);
-    if (camDist > 8000.0) {
-      viewer.camera.flyTo({ destination: txCam, duration: 0.0 });
-      viewer.scene.requestRender();
-    }
-  } catch {
-    // ignore
-  }
+  // Bin samples into (ring, theta) slots; also capture per-theta termination envelope.
+  const slotToValue = new Map(); // key: `${ring}_${ti}` -> rsrp
+  const maxRingByTheta = new Int32Array(nTheta);
+  for (let i = 0; i < nTheta; i++) maxRingByTheta[i] = 0;
 
-  // 1) Bin points into (ring, theta) slots.
-  const slotToVertex = new Map(); // key: `${ring}_${ti}` -> vertex index
-  const vertices = []; // {lat,lon,v}
-  let maxRing = 0;
+  let maxRangeM = 0.0;
 
   for (let i = 0; i < lats.length; i++) {
     const lat = lats[i];
@@ -271,125 +473,107 @@ async function renderDrapedSurfaceCoverage(grid) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(v)) continue;
 
     const rb = enuRangeBearing(txLat, txLon, lat, lon);
+    if (!Number.isFinite(rb.range_m) || !Number.isFinite(rb.bearing_deg)) continue;
+    if (rb.range_m > maxRangeM) maxRangeM = rb.range_m;
+
     const ring = Math.max(1, Math.round(rb.range_m / drM));
     const ti = ((Math.round(normalizeAngleDeg(rb.bearing_deg) / dthetaDeg) % nTheta) + nTheta) % nTheta;
     const key = `${ring}_${ti}`;
 
-    // Keep the strongest sample for the slot (helps when snapping produces duplicates).
-    const existing = slotToVertex.get(key);
-    if (existing != null) {
-      if (v > vertices[existing].v) vertices[existing] = { lat, lon, v };
-      continue;
+    const prev = slotToValue.get(key);
+    if (prev == null || v > prev) slotToValue.set(key, v);
+    if (ring > maxRingByTheta[ti]) maxRingByTheta[ti] = ring;
+  }
+
+  if (!Number.isFinite(maxRangeM) || maxRangeM <= 0.0) return;
+
+  // Ellipse radius should cover all samples; the non-circular boundary comes from alpha masking.
+  const radiusM = Math.max(drM, maxRangeM);
+
+  // Texture resolution: tie to rings so it stays smooth as max range changes.
+  const approxRings = Math.max(1, Math.round(radiusM / drM));
+  let texSize = Math.round(approxRings * 4); // ~4 px per ring
+  texSize = Math.max(512, Math.min(2048, texSize));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = texSize;
+  canvas.height = texSize;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const img = ctx.createImageData(texSize, texSize);
+
+  // Rasterize by sampling the polar bin at each pixel. Pixels with no sample (missing cell)
+  // are fully transparent. Pixels beyond the per-theta envelope are fully transparent.
+  //
+  // Texture coordinate mapping: X = east, Y = north.
+  for (let y = 0; y < texSize; y++) {
+    const ny = (0.5 - y / Math.max(1, (texSize - 1))) * 2.0; // +north at top
+    for (let x = 0; x < texSize; x++) {
+      const ex = (x / Math.max(1, (texSize - 1)) - 0.5) * 2.0; // +east to the right
+      const dxm = ex * radiusM;
+      const dym = ny * radiusM;
+      const r = Math.hypot(dxm, dym);
+      const idx = (y * texSize + x) * 4;
+
+      if (r > radiusM) {
+        img.data[idx + 3] = 0;
+        continue;
+      }
+
+      // Center pixel: show vmax under TX marker (avoids a tiny hole).
+      if (r < drM * 0.5) {
+        const c = colorForValue(vmax, vmin, vmax);
+        img.data[idx + 0] = Math.round(255 * c.red);
+        img.data[idx + 1] = Math.round(255 * c.green);
+        img.data[idx + 2] = Math.round(255 * c.blue);
+        img.data[idx + 3] = Math.round(255 * c.alpha);
+        continue;
+      }
+
+      const bearingDeg = normalizeAngleDeg((Math.atan2(dxm, dym) * 180.0) / Math.PI);
+      const ti = ((Math.round(bearingDeg / dthetaDeg) % nTheta) + nTheta) % nTheta;
+
+      const maxRing = maxRingByTheta[ti];
+      if (maxRing <= 0) {
+        img.data[idx + 3] = 0;
+        continue;
+      }
+
+      // Use a half-step margin so the alpha boundary matches the discrete ring termination.
+      if (r > (maxRing + 0.5) * drM) {
+        img.data[idx + 3] = 0;
+        continue;
+      }
+
+      const ring = Math.max(1, Math.round(r / drM));
+      const v = slotToValue.get(`${ring}_${ti}`);
+      if (!Number.isFinite(v)) {
+        img.data[idx + 3] = 0;
+        continue;
+      }
+
+      const c = colorForValue(v, vmin, vmax);
+      img.data[idx + 0] = Math.round(255 * c.red);
+      img.data[idx + 1] = Math.round(255 * c.green);
+      img.data[idx + 2] = Math.round(255 * c.blue);
+      img.data[idx + 3] = Math.round(255 * c.alpha);
     }
-
-    const idx = vertices.length;
-    vertices.push({ lat, lon, v });
-    slotToVertex.set(key, idx);
-    if (ring > maxRing) maxRing = ring;
   }
 
-  if (vertices.length < 3) return;
+  ctx.putImageData(img, 0, 0);
 
-  // Add a center vertex at TX to avoid a hole; color it with vmax.
-  const centerIndex = vertices.length;
-  vertices.push({ lat: txLat, lon: txLon, v: vmax });
-
-  // 2) Build triangle indices (preserve missing cells by skipping incomplete quads).
-  const indices = [];
-
-  // Center fan: connect center -> ring 1
-  for (let ti = 0; ti < nTheta; ti++) {
-    const ti2 = (ti + 1) % nTheta;
-    const a = slotToVertex.get(`1_${ti}`);
-    const b = slotToVertex.get(`1_${ti2}`);
-    if (a == null || b == null) continue;
-    indices.push(centerIndex, a, b);
-  }
-
-  // Ring quads
-  for (let ring = 1; ring < maxRing; ring++) {
-    for (let ti = 0; ti < nTheta; ti++) {
-      const ti2 = (ti + 1) % nTheta;
-      const v00 = slotToVertex.get(`${ring}_${ti}`);
-      const v01 = slotToVertex.get(`${ring}_${ti2}`);
-      const v10 = slotToVertex.get(`${ring + 1}_${ti}`);
-      const v11 = slotToVertex.get(`${ring + 1}_${ti2}`);
-      if (v00 == null || v01 == null || v10 == null || v11 == null) continue;
-      // Two triangles (counter-clockwise as viewed from above)
-      indices.push(v00, v10, v11);
-      indices.push(v00, v11, v01);
-    }
-  }
-
-  if (indices.length < 3) return;
-
-  // 3) Sample mesh height at each vertex and build a Cesium Geometry.
-  // Probe height: put samples well above the surface (same approach as mesh profiler).
-  const probeH = 2000.0;
-  const probeCartesians = vertices.map((p) => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, probeH));
-
-  // Clamp in batches to keep memory / request pressure reasonable.
-  const clamped = new Array(vertices.length);
-  const batchSize = 256;
-  for (let i = 0; i < probeCartesians.length; i += batchSize) {
-    const batch = probeCartesians.slice(i, i + batchSize);
-    // Small vertical offset reduces z-fighting.
-    const out = await clampToMeshHeights(batch, 0.75);
-    for (let j = 0; j < out.length; j++) clamped[i + j] = out[j];
-  }
-
-  // Positions + colors (per-vertex).
-  const pos = new Float64Array(vertices.length * 3);
-  const col = new Uint8Array(vertices.length * 4);
-
-  for (let i = 0; i < vertices.length; i++) {
-    const p = vertices[i];
-    const c = clamped[i] || Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 0.0);
-    pos[i * 3 + 0] = c.x;
-    pos[i * 3 + 1] = c.y;
-    pos[i * 3 + 2] = c.z;
-
-    const cc = colorForValue(p.v, vmin, vmax);
-    col[i * 4 + 0] = Math.round(255 * cc.red);
-    col[i * 4 + 1] = Math.round(255 * cc.green);
-    col[i * 4 + 2] = Math.round(255 * cc.blue);
-    col[i * 4 + 3] = Math.round(255 * cc.alpha);
-  }
-
-  const geom = new Cesium.Geometry({
-    attributes: {
-      position: new Cesium.GeometryAttribute({
-        componentDatatype: Cesium.ComponentDatatype.DOUBLE,
-        componentsPerAttribute: 3,
-        values: pos,
-      }),
-      color: new Cesium.GeometryAttribute({
-        componentDatatype: Cesium.ComponentDatatype.UNSIGNED_BYTE,
-        componentsPerAttribute: 4,
-        normalize: true,
-        values: col,
-      }),
+  const ent = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
+    ellipse: {
+      semiMajorAxis: radiusM,
+      semiMinorAxis: radiusM,
+      // Cesium will tessellate the ellipse; smaller granularity reduces visible faceting.
+      granularity: Cesium.Math.toRadians(0.25),
+      material: new Cesium.ImageMaterialProperty({ image: canvas, transparent: true }),
+      heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      outline: false,
     },
-    indices: indices.length > 65535 ? new Uint32Array(indices) : new Uint16Array(indices),
-    primitiveType: Cesium.PrimitiveType.TRIANGLES,
-    boundingSphere: Cesium.BoundingSphere.fromVertices(pos),
   });
-
-  const instance = new Cesium.GeometryInstance({ geometry: geom });
-
-  surfacePrimitive = viewer.scene.primitives.add(
-    new Cesium.Primitive({
-      geometryInstances: instance,
-      appearance: new Cesium.PerInstanceColorAppearance({
-        flat: true,
-        translucent: true,
-        closed: false,
-      }),
-      asynchronous: true,
-      releaseGeometryInstances: true,
-      allowPicking: false,
-    })
-  );
+  planEntities.push(ent);
 }
 
 function addSectorUI() {
@@ -820,6 +1004,11 @@ async function runPlan() {
     ray_mode: rayMode,
     tx_height_m: txHeightM,
     rx_height_m: rxHeightM,
+
+    // Coverage/grid overrides (must stay in sync with 3D mesh-profile params)
+    max_range_m: getNumber("max-range", 500.0),
+    step_m: getNumber("dr-m", 5.0),
+    dtheta_deg: getNumber("dtheta", 5.0),
   };
 
   let resp;
@@ -861,25 +1050,31 @@ async function runPlan() {
   // Update TX marker to snapped point (backend always snaps today).
   if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
     updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
+    addPlannedTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
   } else {
     updateTxMarker(lat, lon);
+    addPlannedTxMarker(lat, lon);
   }
 
   // Coverage rendering:
-  // - 2D mode: point grid (legacy)
-  // - 3D mode: draped "fabric" surface over the Google mesh, using the same per-cell grid
-  //   (no forced circle, no interpolation), preserving missing cells.
+  // All 3D modes MUST use the same render strategy: a single clamped ellipse textured
+  // with a backend-provided PNG (fast + visually consistent across OSM-only vs mesh).
+  // If a PNG isn't available, fall back to legacy grid rendering.
   if (out.grid) {
-    if (rayMode === "3d") {
-      try {
-        await renderDrapedSurfaceCoverage(out.grid);
-      } catch (e) {
-        // Fallback to point grid if draping fails (e.g., mesh clamp unavailable).
-        console.warn("Surface drape failed, falling back to point grid:", e);
+    if (out.heatmap && out.heatmap.png_b64) {
+      await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
+    } else {
+      // Debug/legacy fallback (should be rare after backend PNG changes).
+      if (rayMode === "3d") {
+        try {
+          await renderDrapedSurfaceCoverage(out.grid);
+        } catch (e) {
+          console.warn("Surface drape failed, falling back to point grid:", e);
+          renderGridCoverage(out.grid);
+        }
+      } else {
         renderGridCoverage(out.grid);
       }
-    } else {
-      renderGridCoverage(out.grid);
     }
   }
 
@@ -919,6 +1114,9 @@ async function init() {
   });
 
   viewer.scene.globe.depthTestAgainstTerrain = true;
+
+  // Distance scale (2D mode has Leaflet scale; 3D mode needs its own).
+  initDistanceScale();
 
   try {
     const tileset = await Cesium.createGooglePhotorealistic3DTileset();

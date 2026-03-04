@@ -28,6 +28,7 @@
         <select id="ray-mode"
           style="width: 100%; padding: 6px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;">
           <option value="2d">2D (OSM geometry)</option>
+                    <option value="3d_osm">3D (OSM only)</option>
           <option value="3d" selected>3D (Google mesh + OSM semantics)</option>
         </select>
       </div>
@@ -177,7 +178,30 @@
   </div>
 
   <div id="cesiumContainer"></div>
+  <!-- Distance scale (similar intent to Leaflet scale in 2D mode). Must be outside Cesium container
+       because Cesium clears container children during initialization. -->
+  <div id="distance-scale" style="position:absolute; left:242px; bottom:12px; z-index:999; pointer-events:none; font-family:sans-serif;">
+    <div id="distance-scale-label" style="color:#eee; font-size:11px; text-shadow:0 0 3px rgba(0,0,0,0.9); margin-bottom:3px;">-</div>
+    <div id="distance-scale-bar" style="height:6px; width:100px; border:2px solid rgba(255,255,255,0.85); border-top:none; background:rgba(0,0,0,0.15);"></div>
+  </div>
   <div id="cesiumProfilerHost"></div>
+
+  <!-- RSRP Power Scale Legend (shown when coverage is rendered) -->
+  <div id="rsrp-legend" style="display: none;">
+    <h3>RSRP (dBm)</h3>
+    <div id="rsrp-legend-container">
+      <div id="rsrp-legend-gradient"></div>
+      <div id="rsrp-legend-labels">
+        <span id="legend-max">-</span>
+        <span id="legend-mid">-</span>
+        <span id="legend-min">-</span>
+      </div>
+    </div>
+    <div id="rsrp-legend-values">
+      <div>Max: <span id="legend-max-value">-</span> dBm</div>
+      <div>Min: <span id="legend-min-value">-</span> dBm</div>
+    </div>
+  </div>
 
   <script type="module" src="/planner_3d.js"></script>
 </body>
