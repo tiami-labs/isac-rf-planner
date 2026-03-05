@@ -92,6 +92,12 @@ def build_coverage_grid(
 
     # Get frequency once (used for all calculations)
     freq_mhz = rf_params.freq_mhz
+
+    # Constant vertical separation for 3D-distance FSPL.
+    # (This codebase uses 2.5D ray-march; obstacle queries are done in a slice,
+    # but FSPL benefits from a 3D straight-line distance.)
+    dz = float(getattr(rf_params, "tx_height_m", 0.0) or 0.0) - float(getattr(rf_params, "rx_height_m", 1.5) or 0.0)
+    dz2 = dz * dz
     
     # 3D OSM-only mode: use a map-aligned (cartesian) grid to avoid radial spokes.
 
@@ -210,10 +216,30 @@ def build_coverage_grid(
                         candidate_ids = None
 
                     if candidate_ids and by_id is not None:
+                        # Height-slice support (3d_osm): if the provider exposes a slice height,
+                        # we must apply the same filtering here as OSMMapProvider.get_buildings_along_ray().
+                        slice_h = getattr(map_provider, "slice_height_m", None)
                         for building_id in candidate_ids:
                             b = by_id.get(building_id)
                             if not b:
                                 continue
+
+                            if slice_h is not None:
+                                # Cache a best-effort height estimate directly on the building dict.
+                                h = b.get("height_m")
+                                if h is None:
+                                    try:
+                                        # Internal helper in osm_map_provider; safe to import here.
+                                        from .osm_map_provider import _estimate_osm_height_m  # type: ignore
+
+                                        h = _estimate_osm_height_m(b.get("tags", {}))
+                                    except Exception:
+                                        h = None
+                                    b["height_m"] = h
+
+                                # If we have an estimate and it's below the slice, skip this obstacle.
+                                if h is not None and float(h) < float(slice_h):
+                                    continue
                             geom = b.get("geometry", [])
                             d_hit = _first_intersection_distance_m(tx, far_latlon, geom)
                             if d_hit is None:
@@ -249,6 +275,15 @@ def build_coverage_grid(
                     # - OSM provider: use landuse polygons/quadtree
                     # - Google-mesh provider: use persisted tree segments (r0_m)
                     forest_hit_dist_m = None
+
+                    # If we're in a height-slice above typical vegetation canopy, do not intersect forests.
+                    # (OSMMapProvider.is_forest_between() already implements this, but our fast per-ray
+                    # precompute path must match it too.)
+                    try:
+                        slice_h2 = getattr(map_provider, "slice_height_m", None)
+                        forest_disabled = (slice_h2 is not None and float(slice_h2) > 8.0)
+                    except Exception:
+                        forest_disabled = False
                     try:
                         tree_by_bin = getattr(map_provider, "_tree_segments_by_bin", None)
                         dtheta_p = float(getattr(map_provider, "dtheta_deg", 0.0) or 0.0)
@@ -261,7 +296,7 @@ def build_coverage_grid(
                     except Exception:
                         forest_hit_dist_m = None
 
-                    if forest_hit_dist_m is None:
+                    if forest_hit_dist_m is None and not forest_disabled:
                         try:
                             forest_hit_dist_m = _first_forest_intersection_distance_m(map_provider, tx, far_latlon)
                         except Exception:
@@ -328,7 +363,8 @@ def build_coverage_grid(
                     cumulative_material_loss_db = cumulative_building_loss_db + (wood_loss_db if has_forest else 0.0)
 
                     # Always compute FSPL (signal weakens with distance in free space)
-                    fspl_db = _free_space_path_loss_db(r, sector_freq_mhz)
+                    d3 = math.sqrt(r * r + dz2)
+                    fspl_db = _free_space_path_loss_db(d3, sector_freq_mhz)
 
                     # Compute signal strength: FSPL + NLOS excess + material loss
                     total_loss_db = fspl_db + nlos_excess_loss_db + cumulative_material_loss_db

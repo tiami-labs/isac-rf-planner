@@ -17,6 +17,63 @@ logger = logging.getLogger(__name__)
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 
+def _estimate_osm_height_m(tags: dict) -> Optional[float]:
+    """Best-effort height estimate from OSM tags.
+
+    Returns None if no reasonable estimate can be derived.
+    """
+    if not isinstance(tags, dict):
+        return None
+
+    # Explicit height tags.
+    for k in ("height", "building:height"):
+        h = tags.get(k)
+        if not h:
+            continue
+        try:
+            token = str(h).strip().split()[0]
+            token = token.replace("m", "")
+            val = float(token)
+            if val > 0.5:
+                return val
+        except Exception:
+            pass
+
+    # Floors/levels (roughly 3m per level).
+    for k in ("building:levels", "levels"):
+        lv = tags.get(k)
+        if not lv:
+            continue
+        try:
+            token = str(lv).strip().split()[0]
+            val = float(token)
+            if val > 0:
+                return val * 3.0
+        except Exception:
+            pass
+
+    # Heuristics based on building type.
+    btype = str(tags.get("building", "") or "").lower().strip()
+    # A very common pattern is building=yes with no further typing.
+    # Treat it as a low/mid-rise default so height-sliced modes respond to TX height.
+    if btype in ("yes", "building"):
+        return 12.0
+    if btype in ("house", "detached", "bungalow", "cabin"):
+        return 6.0
+    if btype in ("apartments", "residential", "terrace"):
+        return 12.0
+    if btype in ("commercial", "retail", "office"):
+        return 15.0
+    if btype in ("industrial", "warehouse"):
+        return 10.0
+    if btype in ("church", "cathedral"):
+        return 20.0
+    if btype in ("tower", "highrise"):
+        return 40.0
+
+    return None
+
+
 class OSMMapProvider(MapProvider):
     """
     Real MapProvider using OSM Overpass API.
@@ -27,12 +84,19 @@ class OSMMapProvider(MapProvider):
     - Classify clutter (open/suburban/urban/dense_urban)
     """
 
-    def __init__(self, cache_radius_m: float = 1000.0):
+    def __init__(self, cache_radius_m: float = 1000.0, slice_height_m: Optional[float] = None):
         """
         Args:
             cache_radius_m: Radius around last query to cache (simple in-memory cache)
         """
         self.cache_radius_m = cache_radius_m
+        # Optional height slice (meters above local ground).
+        # If set, buildings/vegetation whose estimated height is BELOW this value
+        # are ignored for obstacle queries. This enables "3D (OSM only)" behavior
+        # without changing the fast 2.5D ray-march model.
+        self.slice_height_m = float(slice_height_m) if slice_height_m is not None else None
+        if self.slice_height_m is not None:
+            logger.info(f"OSMMapProvider: enabled height slice at {self.slice_height_m:.2f} m")
         self._cache_center: Optional[LatLon] = None
         self._cached_buildings: List[dict] = []
         self._cached_landuse: List[dict] = []
@@ -169,6 +233,12 @@ class OSMMapProvider(MapProvider):
         
         for building in self._cached_buildings:
             building_id = building.get("id", 0)
+            # Ensure height is available (may be missing for cached payloads).
+            if "height_m" not in building:
+                try:
+                    building["height_m"] = _estimate_osm_height_m(building.get("tags", {}))
+                except Exception:
+                    building["height_m"] = None
             geometry = building.get("geometry", [])
             bbox = compute_bbox_from_polygon(geometry)
             if bbox:
@@ -227,6 +297,7 @@ class OSMMapProvider(MapProvider):
                     }
                     # Extract material from OSM tags
                     building["material"] = _extract_building_material(building)
+                    building["height_m"] = _estimate_osm_height_m(building.get("tags", {}))
                     buildings.append(building)
             
             logger.info(f"Successfully fetched {len(buildings)} buildings from OSM")
@@ -287,6 +358,8 @@ class OSMMapProvider(MapProvider):
         Uses quadtree spatial index if available for fast queries.
         Falls back to linear search if no index.
         """
+        slice_h = self.slice_height_m
+
         # Phase 2: Use quadtree if available
         if self._prefetched and self._building_quadtree is not None:
             # Query quadtree for candidate building IDs
@@ -297,7 +370,18 @@ class OSMMapProvider(MapProvider):
             for building_id in candidate_ids:
                 # Fast O(1) lookup by ID
                 building = self._building_by_id.get(building_id)
-                if building and _ray_intersects_polygon(start, end, building.get("geometry", [])):
+                if not building:
+                    continue
+
+                if slice_h is not None:
+                    h = building.get("height_m")
+                    if h is None:
+                        h = _estimate_osm_height_m(building.get("tags", {}))
+                        building["height_m"] = h
+                    if h is not None and h < slice_h:
+                        continue
+
+                if _ray_intersects_polygon(start, end, building.get("geometry", [])):
                     count += 1
             
             return count
@@ -311,6 +395,13 @@ class OSMMapProvider(MapProvider):
         
         count = 0
         for building in buildings:
+            if slice_h is not None:
+                h = building.get("height_m")
+                if h is None:
+                    h = _estimate_osm_height_m(building.get("tags", {}))
+                    building["height_m"] = h
+                if h is not None and h < slice_h:
+                    continue
             if _ray_intersects_polygon(start, end, building.get("geometry", [])):
                 count += 1
         
@@ -322,13 +413,26 @@ class OSMMapProvider(MapProvider):
         
         Returns buildings with material information for material-aware path loss.
         """
+        slice_h = self.slice_height_m
+
         # Phase 2: Use quadtree if available
         if self._prefetched and self._building_quadtree is not None:
             candidate_ids = self._building_quadtree.query_ray(start, end)
             buildings = []
             for building_id in candidate_ids:
                 building = self._building_by_id.get(building_id)
-                if building and _ray_intersects_polygon(start, end, building.get("geometry", [])):
+                if not building:
+                    continue
+
+                if slice_h is not None:
+                    h = building.get("height_m")
+                    if h is None:
+                        h = _estimate_osm_height_m(building.get("tags", {}))
+                        building["height_m"] = h
+                    if h is not None and h < slice_h:
+                        continue
+
+                if _ray_intersects_polygon(start, end, building.get("geometry", [])):
                     buildings.append(building)
             return buildings
         
@@ -344,6 +448,13 @@ class OSMMapProvider(MapProvider):
         
         result = []
         for building in buildings:
+            if slice_h is not None:
+                h = building.get("height_m")
+                if h is None:
+                    h = _estimate_osm_height_m(building.get("tags", {}))
+                    building["height_m"] = h
+                if h is not None and h < slice_h:
+                    continue
             if _ray_intersects_polygon(start, end, building.get("geometry", [])):
                 result.append(building)
         
@@ -356,6 +467,14 @@ class OSMMapProvider(MapProvider):
         Uses quadtree spatial index if available for fast queries.
         Falls back to linear search if no index.
         """
+        # If we're in a height-sliced mode and the slice is above typical vegetation,
+        # treat foliage as not intersecting the ray.
+        slice_h = self.slice_height_m
+        if slice_h is not None:
+            # Conservative default: 8m canopy height.
+            if slice_h > 8.0:
+                return False
+
         # Phase 2: Use quadtree if available
         if self._prefetched and self._landuse_quadtree is not None:
             # Query quadtree for candidate area IDs

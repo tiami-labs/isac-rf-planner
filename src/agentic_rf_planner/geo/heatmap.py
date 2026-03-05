@@ -152,14 +152,13 @@ def attenuation_grid_to_png_ellipse(
     circle_mask = r_pix <= radius_m
 
     # Estimate per-bearing reach based on which samples exist.
-    # IMPORTANT: rendering must not look like discrete "wedges" when dtheta is coarse.
-    # So we bin bearings at <= 1° and interpolate r_max across missing bins.
+    # We bin bearings at the simulation's effective dtheta (or finer) and compute r_max per bin.
     try:
         bin_deg = float(getattr(grid.rf_params, "dtheta_deg", 1.0) or 1.0)
     except Exception:
         bin_deg = 1.0
-    bin_deg = max(0.25, min(1.0, bin_deg))
-    n_bins = int(max(360, round(360.0 / bin_deg)))
+    bin_deg = max(0.25, min(5.0, bin_deg))
+    n_bins = int(max(72, round(360.0 / bin_deg)))
 
     theta_s = (np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0
     r_s = np.sqrt(dx * dx + dy * dy)
@@ -170,29 +169,8 @@ def attenuation_grid_to_png_ellipse(
     rmax = np.zeros((n_bins,), dtype=np.float32)
     np.maximum.at(rmax, bi_s, r_s.astype(np.float32))
 
-    # Interpolate rmax across missing bins (circular) so the support mask is continuous.
-    valid = rmax > 0.0
-    if np.any(valid) and not np.all(valid):
-        idx = np.arange(n_bins, dtype=np.float64)
-        valid_idx = idx[valid]
-        valid_r = rmax[valid].astype(np.float64)
-        if valid_idx.size == 1:
-            rmax[:] = float(valid_r[0])
-        else:
-            # Rotate so the first valid bin is at 0, making interpolation well-defined.
-            first = int(valid_idx[0])
-            rmax_rot = np.roll(rmax, -first)
-            valid_rot = np.roll(valid, -first)
-            idx2 = np.arange(n_bins, dtype=np.float64)
-            v_idx = idx2[valid_rot]
-            v_r = rmax_rot[valid_rot].astype(np.float64)
-            v_idx_ext = np.concatenate([v_idx, v_idx + n_bins])
-            v_r_ext = np.concatenate([v_r, v_r])
-            rmax_rot_f = np.interp(idx2, v_idx_ext, v_r_ext)
-            rmax = np.roll(rmax_rot_f.astype(np.float32), first)
-
-    # Gentle max-smoothing to avoid pinholes from numeric jitter.
-    for k in (1, 2, 3):
+    # Smooth rmax a bit across neighboring bins to avoid tiny gaps from numeric jitter.
+    for k in (1, 2):
         rmax = np.maximum(rmax, np.roll(rmax, k))
         rmax = np.maximum(rmax, np.roll(rmax, -k))
 
