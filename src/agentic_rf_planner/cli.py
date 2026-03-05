@@ -87,6 +87,7 @@ def main() -> None:
         ray_mode=ray_mode,
         tx_height_m=float(tx_height_m),
         rx_height_m=float(rx_height_m),
+        building_attenuation=rf_cfg.get("building_attenuation"),
     )
 
     # Load VLM

@@ -14,6 +14,16 @@ def load_yaml(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def load_rf_config(rf_config_path: str = "configs/rf.params.yaml") -> Dict[str, Any]:
+    """Load RF params config only (for API etc. when full config not needed)."""
+    path = Path(rf_config_path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        return {}
+    return load_yaml(path)
+
+
 def load_config(
     default_config_path: str = "configs/default.yaml",
     model_config_path: Optional[str] = None,
