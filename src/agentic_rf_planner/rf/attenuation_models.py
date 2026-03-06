@@ -76,7 +76,17 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
     for cell in world.cells:
         # Fix 1: Use straight-line distance only (d_actual was fake accuracy)
         # All NLOS effects are handled via material loss, not geometric distance
-        d = max(cell.distance_m, 1.0)  # Straight-line distance only
+        d2 = max(cell.distance_m, 1.0)  # ground-range distance (meters)
+
+        # Height handling:
+        # This codebase uses a fast 2.5D ray-march. Geometry/obstacles are queried in a
+        # horizontal slice (3D modes) or in 2D (2D mode). We still incorporate antenna
+        # heights into the *free-space* component by using a 3D distance with constant
+        # vertical separation.
+        tx_h = float(getattr(world.rf_params, "tx_height_m", 0.0) or 0.0)
+        rx_h = float(getattr(world.rf_params, "rx_height_m", 1.5) or 0.0)
+        dz = tx_h - rx_h
+        d = math.sqrt(d2 * d2 + dz * dz)
         
         # Fix 2: LOS/NLOS base path loss models
         # LOS: pure FSPL
