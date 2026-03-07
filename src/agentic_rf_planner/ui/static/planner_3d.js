@@ -1057,24 +1057,26 @@ async function runPlan() {
   }
 
   // Coverage rendering:
-  // All 3D modes MUST use the same render strategy: a single clamped ellipse textured
-  // with a backend-provided PNG (fast + visually consistent across OSM-only vs mesh).
-  // If a PNG isn't available, fall back to legacy grid rendering.
+  // - 2D mode: point grid (legacy)
+  // - 3D mode: draped "fabric" surface over the Google mesh, using the same per-cell grid
+  //   (no forced circle, no interpolation), preserving missing cells.
   if (out.grid) {
-    if (out.heatmap && out.heatmap.png_b64) {
-      await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
-    } else {
-      // Debug/legacy fallback (should be rare after backend PNG changes).
-      if (rayMode === "3d") {
-        try {
-          await renderDrapedSurfaceCoverage(out.grid);
-        } catch (e) {
-          console.warn("Surface drape failed, falling back to point grid:", e);
-          renderGridCoverage(out.grid);
-        }
+    if (rayMode === "3d") {
+      try {
+        await renderDrapedSurfaceCoverage(out.grid);
+      } catch (e) {
+        // Fallback to point grid if draping fails (e.g., mesh clamp unavailable).
+        console.warn("Surface drape failed, falling back to point grid:", e);
+        renderGridCoverage(out.grid);
+      }
+    } else if (rayMode === "3d_osm") {
+      if (out.heatmap) {
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
       } else {
         renderGridCoverage(out.grid);
       }
+    } else {
+      renderGridCoverage(out.grid);
     }
   }
 
