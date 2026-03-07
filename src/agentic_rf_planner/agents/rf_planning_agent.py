@@ -94,7 +94,9 @@ def run_rf_planning_for_point(
     logger.info("STEP 2: Initializing map provider...")
 
     # Allow RFParams to carry these fields if caller uses the REST API.
-    ray_mode = getattr(rf_params, "ray_mode", ray_mode)
+    # NOTE: ray_mode may be updated later if we fall back (e.g., missing mesh profiles).
+    requested_ray_mode = getattr(rf_params, "ray_mode", ray_mode)
+    ray_mode = requested_ray_mode
     tx_height_m = float(getattr(rf_params, "tx_height_m", tx_height_m))
     rx_height_m = float(getattr(rf_params, "rx_height_m", rx_height_m))
     if map_provider is None:
@@ -102,7 +104,8 @@ def run_rf_planning_for_point(
         #   - 2D: OSMMapProvider (polygons)
         #   - 3D: GoogleMeshOSMMapProvider (persisted mesh ray profiles, OSM semantics)
         try:
-            if str(ray_mode).lower() in ("3d", "mesh", "google_mesh", "google-mesh"):
+            ray_mode_l = str(ray_mode).lower()
+            if ray_mode_l in ("3d", "mesh", "google_mesh", "google-mesh"):
                 logger.info("  Creating GoogleMeshOSMMapProvider (3D)...")
                 from ..geo.google_mesh import GoogleMeshOSMMapProvider, MeshProfileStore, MissingMeshProfiles
 
@@ -132,6 +135,14 @@ def run_rf_planning_for_point(
 
                 if map_provider is not None and not isinstance(map_provider, OSMMapProvider):
                     logger.info("✓ Using Google-mesh MapProvider (3D ray propagation)")
+            elif ray_mode_l in ("3d_osm", "3d-osm", "osm3d"):
+                # 3D (OSM-only) is a height-sliced variant of OSM polygons.
+                # We keep the same ray-march + material-loss logic, but filter
+                # building/foliage obstacles by an estimated OSM height vs the
+                # configured TX slice height.
+                logger.info("  Creating OSMMapProvider (3D OSM-only height slice)...")
+                map_provider = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
+                logger.info("✓ Using OSM MapProvider (3D OSM-only height slice)")
             else:
                 logger.info("  Creating OSMMapProvider...")
                 map_provider = OSMMapProvider(cache_radius_m=1000.0)
@@ -298,16 +309,8 @@ def run_rf_planning_for_point(
     # 6) heatmap / map overlay
     ray_mode_eff2 = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
 
-    # 3D visualization: return a pre-colored PNG (fast client render, small payload).
-    # NOTE: 3D (Google mesh + OSM semantics) must use the SAME render strategy as 3D OSM-only.
-    png_modes = {
-        "3d_osm", "3d-osm", "osm3d",
-        "3d", "mesh", "google_mesh", "google-mesh", "3d_google", "3d-google",
-        "3d_google_mesh", "3d-google-mesh",
-    }
-
-    if ray_mode_eff2 in png_modes:
-        # Return a pre-colored PNG texture.
+    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d"):
+        # 3D OSM-only: return a pre-colored PNG (fast client render, small payload).
         # Choose texture resolution from range and step, but cap to keep transfers reasonable.
         try:
             step_m = float(getattr(rf_params, "step_m", 5.0) or 5.0)
@@ -352,9 +355,9 @@ def run_rf_planning_for_point(
     
     # Prepare response
     
-    # Reduce payload size for PNG-based 3D modes (front-end uses heatmap PNG, not per-point arrays).
+    # Reduce payload size for 3D OSM-only mode (front-end uses heatmap PNG, not per-point arrays).
     grid_payload = grid.model_dump()
-    if ray_mode_eff2 in png_modes:
+    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d"):
         try:
             grid_payload["num_points"] = len(grid.cell_lat)
         except Exception:
@@ -363,11 +366,15 @@ def run_rf_planning_for_point(
             if k in grid_payload:
                 grid_payload[k] = []
 
+    # Use the effective mode after provider init/fallbacks.
+    effective_ray_mode = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode)
+
     result = {
         "original_point": {"lat": lat, "lon": lon},
         "snapped_tx": snapped.latlon.model_dump(),
         "snap_distance_m": snapped.distance_m,
-        "ray_mode": str(ray_mode),
+        "ray_mode": effective_ray_mode,
+        "requested_ray_mode": str(requested_ray_mode),
         "tx_height_m": tx_height_m,
         "rx_height_m": rx_height_m,
         "clutter_type": clutter_type,
