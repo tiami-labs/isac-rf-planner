@@ -199,7 +199,7 @@ For custom polygon sectors:
   - Polygons for abstract polygon sectors
 - **Toggle Visibility**: Use the "Show Sector Overlays" checkbox to hide/show sector boundaries
 - **Multiple Sectors**: You can add multiple sectors with different frequencies, powers, and shapes
-- **Multiple Heatmaps**: Each RF plan creates a new heatmap layer, allowing comparison of coverage from different TX locations
+- **Multiple Heatmaps**: Each RF plan in a batch adds a new heatmap layer; sector overlays are cleared before each plan to avoid stacked semi-transparent circles
 
 ### Assessing Coverage
 
@@ -210,7 +210,7 @@ After running RF planning:
   - **Yellow/Green**: Moderate signal
   - **Blue/Cyan**: Weak signal (far from TX, poor coverage)
 - **RSRP Legend**: Shows the actual signal strength range for the current heatmap
-- **Multiple Plans**: Click new points and run "Plan RF" to compare coverage from different locations (previous heatmaps are preserved)
+- **Multiple Plans**: Each plan in a batch adds its heatmap; sector overlays show only the latest plan; use "Clear Map" to remove all
 - **Clear Map**: Use "Clear Map" button to remove all heatmaps and start fresh
 
 ### Tips
