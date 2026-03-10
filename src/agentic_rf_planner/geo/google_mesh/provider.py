@@ -53,7 +53,7 @@ class GoogleMeshOSMMapProvider(MapProvider):
         *,
         tx_height_m: float = 0.0,
         rx_height_m: float = 1.5,
-        max_range_m: float = 500.0,
+        max_range_m: float = 2000.0,
         dr_m: float = 5.0,
         dtheta_deg: float = 5.0,
         version: str = PROFILE_VERSION,
