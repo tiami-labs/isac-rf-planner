@@ -2,7 +2,7 @@
 
 import math
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from ..pipeline.schemas import LatLon, RFParams, WorldCell, MaterialType
 from .physical_spanning import MapProvider
@@ -23,11 +23,13 @@ def build_coverage_grid(
     If no sectors (or None), generates omnidirectional coverage (360°).
     
     Rays stop when:
-    1. Signal strength < noise_floor + margin (too weak)
-    2. Metal structure blocks path (100+ dB loss)
-    3. Maximum range reached
-    
-    This ensures rays are physically affected by materials, not just post-processed.
+    1. Signal strength drops below the configured termination threshold
+    2. Maximum range is reached
+
+    Vendor-grade roadmap notes:
+    - penetration is only applied while the ray is actually inside a blocker interval
+    - after the first blocker, LOS is lost and the ray transitions into a shadow/recovery state
+    - we do not carry every prior wall forever once the ray exits the structure
     """
     from ..rf.sector_config import SectorConfig, create_omnidirectional_sector, validate_sectors
     
@@ -70,13 +72,6 @@ def build_coverage_grid(
         bandwidth_hz = rf_params.channel_bandwidth_mhz * 1e6
         noise_floor_dbm = -174.0 + 10.0 * math.log10(bandwidth_hz) + rf_params.noise_figure_db
     
-    # Termination threshold: stop rays once RSRP drops below -150 dBm
-    # (or at max range, whichever comes first).
-    # This ensures:
-    # 1. Rays stop at realistic distances (especially higher frequencies)
-    # 2. Frequency affects propagation distance (lower freq = longer range via FSPL)
-    # 3. FSPL always applies (signal weakens with distance even in free space)
-    # 4. Material/NLOS loss makes rays stop even earlier
     min_rsrp_threshold = float(getattr(rf_params, "termination_rsrp_dbm", -140.0))
     logger.info(f"Ray termination threshold: {min_rsrp_threshold:.1f} dBm (noise floor: {noise_floor_dbm:.1f} dBm)")
     logger.debug(f"  This ensures rays stop when signal becomes too weak for reliable detection")
@@ -85,7 +80,13 @@ def build_coverage_grid(
     
     # Import here to avoid circular dependency
     from ..rf.material_penetration import get_penetration_loss_for_material, is_material_blocking
-    from ..rf.attenuation_models import _free_space_path_loss_db
+    from ..rf.attenuation_models import (
+        _horizontal_pattern_attenuation_db,
+        _reference_signal_eirp_dbm,
+        _resolve_sector_params,
+        _scenario_path_loss_db,
+        _vertical_pattern_attenuation_db,
+    )
 
     # Building attenuation config (overall + per-material from rf.params.yaml)
     bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
@@ -117,7 +118,7 @@ def build_coverage_grid(
 
     # Adaptive dtheta for 3D OSM-only mode:
     # target arc-length ~= 4*dr (clamped) at max range.
-    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
+    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
         target_arc_m = max(12.0, min(30.0, 4.0 * dr))
         dtheta_target = math.degrees(target_arc_m / max(1.0, max_r))
         dtheta = max(0.25, min(dtheta_user, dtheta_target))
@@ -133,7 +134,7 @@ def build_coverage_grid(
     else:
         dtheta = dtheta_user
 
-    store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
+    store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace")
 
 # Generate cells for each sector
     # For each sector, iterate through angles covered by that sector
@@ -148,6 +149,7 @@ def build_coverage_grid(
         # Use sector-specific frequency and power for this sector
         sector_freq_mhz = sector.freq_mhz
         sector_tx_power_dbm = sector.tx_power_dbm
+        sector_rs_eirp_dbm = _reference_signal_eirp_dbm(rf_params, tx_power_dbm_override=sector_tx_power_dbm)
         
         # Determine angle range for this sector
         if sector.sector_type == "polygon":
@@ -181,18 +183,15 @@ def build_coverage_grid(
                 # - Compute first-intersection distance per building
                 # - Incrementally accumulate loss as r increases
                 r = dr
-                cumulative_building_loss_db = 0.0
                 metal_blocked = False
 
                 # When rendering as a raster/PNG (3d_osm), we don't need to attach full building
                 # metadata per cell. Avoid per-cell list copies for memory/perf.
                 encountered_buildings = [] if store_building_lists else None
 
-                building_hits = []  # list of (dist_m, building_dict)
+                building_intervals: list[dict[str, Any]] = []
+                forest_intervals: list[dict[str, Any]] = []
                 next_hit_idx = 0
-
-                # Forest: compute first intersection once per ray (OSM provider fast-path).
-                forest_hit_dist_m = None
 
                 # Far endpoint for ray queries.
                 far_lat, far_lon = _project_from_tx(tx.lat, tx.lon, max_r, theta)
@@ -241,10 +240,18 @@ def build_coverage_grid(
                                 if h is not None and float(h) < float(slice_h):
                                     continue
                             geom = b.get("geometry", [])
-                            d_hit = _first_intersection_distance_m(tx, far_latlon, geom)
-                            if d_hit is None:
+                            interval = _intersection_interval_m(tx, far_latlon, geom)
+                            if interval is None:
                                 continue
-                            building_hits.append((d_hit, b))
+                            r0_m, r1_m = interval
+                            building_intervals.append(
+                                {
+                                    "start_m": r0_m,
+                                    "end_m": r1_m,
+                                    "building": b,
+                                    "material": b.get("material", "unknown"),
+                                }
+                            )
                     else:
                         # Fallback: provider method (may be less robust, but keeps functionality for non-OSM providers)
                         try:
@@ -257,24 +264,47 @@ def build_coverage_grid(
                             # OSM provider returns polygons with "geometry".
                             if "r0_m" in b:
                                 try:
-                                    d_hit = float(b.get("r0_m", 0.0))
+                                    r0_m = float(b.get("r0_m", 0.0))
+                                    r1_m = float(b.get("r1_m", r0_m))
                                 except Exception:
                                     continue
-                                building_hits.append((d_hit, b))
+                                building_intervals.append(
+                                    {
+                                        "start_m": max(0.0, min(r0_m, r1_m)),
+                                        "end_m": max(r0_m, r1_m),
+                                        "building": b,
+                                        "material": b.get("material", "unknown"),
+                                    }
+                                )
                                 continue
 
                             geom = b.get("geometry", [])
-                            d_hit = _first_intersection_distance_m(tx, far_latlon, geom)
-                            if d_hit is None:
+                            interval = _intersection_interval_m(tx, far_latlon, geom)
+                            if interval is None:
                                 continue
-                            building_hits.append((d_hit, b))
+                            r0_m, r1_m = interval
+                            building_intervals.append(
+                                {
+                                    "start_m": r0_m,
+                                    "end_m": r1_m,
+                                    "building": b,
+                                    "material": b.get("material", "unknown"),
+                                }
+                            )
 
-                    building_hits.sort(key=lambda t: t[0])
+                    building_intervals.sort(key=lambda item: item["start_m"])
+                    for interval in building_intervals:
+                        interval["penetration_loss_db"] = get_penetration_loss_for_material(
+                            str(interval["material"]),
+                            sector_freq_mhz,
+                            attenuation_config=bldg_atten_cfg,
+                        )
+                        interval["is_blocking"] = is_material_blocking(str(interval["material"]), sector_freq_mhz)
 
-                    # Forest/vegetation: compute first hit if possible (one query per theta).
+                    # Forest/vegetation intervals (one query per theta).
                     # - OSM provider: use landuse polygons/quadtree
                     # - Google-mesh provider: use persisted tree segments (r0_m)
-                    forest_hit_dist_m = None
+                    forest_intervals = []
 
                     # If we're in a height-slice above typical vegetation canopy, do not intersect forests.
                     # (OSMMapProvider.is_forest_between() already implements this, but our fast per-ray
@@ -292,42 +322,60 @@ def build_coverage_grid(
                             ti = int(round(theta / dtheta_p)) % n_bins
                             segs = tree_by_bin.get(ti, []) or []
                             if segs:
-                                forest_hit_dist_m = min(float(s.get("r0_m", 0.0)) for s in segs if s.get("r0_m") is not None)
+                                for seg in segs:
+                                    if seg.get("r0_m") is None:
+                                        continue
+                                    r0_m = float(seg.get("r0_m", 0.0))
+                                    r1_m = float(seg.get("r1_m", r0_m))
+                                    forest_intervals.append(
+                                        {"start_m": max(0.0, min(r0_m, r1_m)), "end_m": max(r0_m, r1_m)}
+                                    )
                     except Exception:
-                        forest_hit_dist_m = None
+                        forest_intervals = []
 
-                    if forest_hit_dist_m is None and not forest_disabled:
+                    if not forest_intervals and not forest_disabled:
                         try:
-                            forest_hit_dist_m = _first_forest_intersection_distance_m(map_provider, tx, far_latlon)
+                            forest_intervals = _forest_intervals_m(map_provider, tx, far_latlon)
                         except Exception:
-                            forest_hit_dist_m = None
+                            forest_intervals = []
 
-                # Precompute wood loss constant (applied once when forest is encountered).
+                # Precompute wood loss constant for active vegetation intervals.
                 wood_loss_db = (
                     get_penetration_loss_for_material("wood", sector_freq_mhz, attenuation_config=bldg_atten_cfg)
                     if map_provider is not None else 0.0
                 )
+                sector_params = _resolve_sector_params(
+                    type(
+                        "CoverageCellSector",
+                        (),
+                        {
+                            "sector_id": sector.sector_id,
+                            "sector_freq_mhz": sector_freq_mhz,
+                            "sector_tx_power_dbm": sector_tx_power_dbm,
+                            "sector_channel_bandwidth_mhz": sector.channel_bandwidth_mhz,
+                            "sector_azimuth_deg": getattr(sector, "azimuth_deg", None),
+                            "sector_beamwidth_h_deg": getattr(sector, "beamwidth_h_deg", None),
+                            "sector_beamwidth_v_deg": getattr(sector, "beamwidth_v_deg", None),
+                            "sector_electrical_tilt_deg": getattr(sector, "electrical_tilt_deg", None),
+                            "sector_mechanical_tilt_deg": getattr(sector, "mechanical_tilt_deg", None),
+                            "sector_max_horizontal_attenuation_db": getattr(sector, "max_horizontal_attenuation_db", None),
+                            "sector_front_to_back_attenuation_db": getattr(sector, "front_to_back_attenuation_db", None),
+                            "sector_max_vertical_attenuation_db": getattr(sector, "max_vertical_attenuation_db", None),
+                        },
+                    )(),
+                    rf_params,
+                    {},
+                )
 
                 while r <= max_r:
                     lat, lon = _project_from_tx(tx.lat, tx.lon, r, theta)
-                    cell_latlon = LatLon(lat=lat, lon=lon)
 
-                    # Update cumulative building loss for this r (even if this cell is skipped by a polygon sector),
-                    # so farther points still include all prior obstruction loss.
-                    while next_hit_idx < len(building_hits) and building_hits[next_hit_idx][0] <= (r + 1e-6):
-                        b = building_hits[next_hit_idx][1]
-                        material = b.get("material", "unknown")
-                        penetration_loss = get_penetration_loss_for_material(
-                            material, sector_freq_mhz, attenuation_config=bldg_atten_cfg
-                        )
-                        cumulative_building_loss_db += penetration_loss
-
-                        if is_material_blocking(material, sector_freq_mhz):
+                    while next_hit_idx < len(building_intervals) and building_intervals[next_hit_idx]["start_m"] <= (r + 1e-6):
+                        interval = building_intervals[next_hit_idx]
+                        if interval["is_blocking"]:
                             metal_blocked = True
-
                         if encountered_buildings is not None:
-                            encountered_buildings.append(b)
-
+                            encountered_buildings.append(interval["building"])
                         next_hit_idx += 1
 
                     # For polygon sectors, check if point is inside polygon. If not, skip creating a cell.
@@ -337,38 +385,107 @@ def build_coverage_grid(
                             r += dr
                             continue
 
-                    # LOS depends only on buildings.
-                    is_los = (next_hit_idx == 0)
+                    active_buildings = [
+                        interval
+                        for interval in building_intervals
+                        if interval["start_m"] <= (r + 1e-6) < interval["end_m"]
+                    ]
+                    active_forest = [
+                        interval
+                        for interval in forest_intervals
+                        if interval["start_m"] <= (r + 1e-6) < interval["end_m"]
+                    ]
+                    all_started = [
+                        interval["start_m"]
+                        for interval in building_intervals
+                        if interval["start_m"] <= (r + 1e-6)
+                    ] + [
+                        interval["start_m"]
+                        for interval in forest_intervals
+                        if interval["start_m"] <= (r + 1e-6)
+                    ]
+                    all_exited = [
+                        interval["end_m"]
+                        for interval in building_intervals
+                        if interval["end_m"] <= (r + 1e-6)
+                    ] + [
+                        interval["end_m"]
+                        for interval in forest_intervals
+                        if interval["end_m"] <= (r + 1e-6)
+                    ]
 
-                    # Forest encountered?
-                    has_forest = False
-                    if map_provider is not None:
-                        if forest_hit_dist_m is not None:
-                            has_forest = forest_hit_dist_m <= (r + 1e-6)
-                        else:
-                            # Fallback (slower): query per cell.
-                            try:
-                                has_forest = map_provider.is_forest_between(tx, cell_latlon)
-                            except Exception:
-                                has_forest = False
+                    first_blocker_distance_m = min(all_started) if all_started else None
+                    last_exit_distance_m = max(all_exited) if all_exited else None
+                    is_los = first_blocker_distance_m is None
+                    penetration_loss_db = (
+                        sum(float(interval["penetration_loss_db"]) for interval in active_buildings)
+                        + len(active_forest) * wood_loss_db
+                    )
+                    behind_first_blocker_m = (
+                        max(0.0, r - first_blocker_distance_m)
+                        if first_blocker_distance_m is not None
+                        else 0.0
+                    )
+                    shadow_loss_db = 0.0
+                    if not is_los and penetration_loss_db <= 0.0:
+                        shadow_loss_db = min(
+                            float(getattr(rf_params, "shadow_loss_cap_db", 22.0) or 22.0),
+                            float(getattr(rf_params, "shadow_loss_db", 6.0) or 6.0)
+                            + float(getattr(rf_params, "shadow_decay_db_per_100m", 4.0) or 4.0)
+                            * (behind_first_blocker_m / 100.0),
+                        )
+                    open_gap_after_exit_m = (
+                        max(0.0, r - last_exit_distance_m)
+                        if last_exit_distance_m is not None and penetration_loss_db <= 0.0
+                        else 0.0
+                    )
+                    diffraction_loss_db = 0.0
+                    canyon_recovery_db = 0.0
+                    if not is_los and penetration_loss_db <= 0.0:
+                        diffraction_loss_db = min(
+                            float(getattr(rf_params, "diffraction_loss_cap_db", 18.0) or 18.0),
+                            float(getattr(rf_params, "diffraction_base_loss_db", 6.0) or 6.0)
+                            + float(getattr(rf_params, "diffraction_slope_db_per_100m", 3.0) or 3.0)
+                            * (behind_first_blocker_m / 100.0),
+                        )
+                        canyon_recovery_db = min(
+                            float(getattr(rf_params, "canyon_recovery_max_db", 8.0) or 8.0),
+                            float(getattr(rf_params, "canyon_recovery_slope_db_per_100m", 6.0) or 6.0)
+                            * (open_gap_after_exit_m / 100.0),
+                        )
 
-                    # NLOS excess loss (matches attenuation_models.py)
-                    nlos_excess_loss_db = 0.0
-                    if not is_los:
-                        nlos_excess_loss_db = 12.0
-                        if r > 50.0:
-                            nlos_excess_loss_db += 0.02 * (r - 50.0)
-
-                    # Total material loss persists after exiting obstacles.
-                    cumulative_material_loss_db = cumulative_building_loss_db + (wood_loss_db if has_forest else 0.0)
-
-                    # Always compute FSPL (signal weakens with distance in free space)
+                    extra_loss_db = max(
+                        0.0,
+                        penetration_loss_db + shadow_loss_db + diffraction_loss_db - canyon_recovery_db,
+                    )
                     d3 = math.sqrt(r * r + dz2)
-                    fspl_db = _free_space_path_loss_db(d3, sector_freq_mhz)
-
-                    # Compute signal strength: FSPL + NLOS excess + material loss
-                    total_loss_db = fspl_db + nlos_excess_loss_db + cumulative_material_loss_db
-                    estimated_rsrp = sector_tx_power_dbm - total_loss_db
+                    scenario_path_loss_db = _scenario_path_loss_db(
+                        distance_2d_m=r,
+                        distance_3d_m=d3,
+                        freq_mhz=sector_freq_mhz,
+                        tx_height_m=float(getattr(rf_params, "tx_height_m", 0.0) or 0.0),
+                        rx_height_m=float(getattr(rf_params, "rx_height_m", 1.5) or 0.0),
+                        is_los=is_los,
+                        rf_params=rf_params,
+                    )
+                    vertical_pattern_loss_db = _vertical_pattern_attenuation_db(
+                        distance_m=r,
+                        tx_height_m=float(getattr(rf_params, "tx_height_m", 0.0) or 0.0),
+                        rx_height_m=float(getattr(rf_params, "rx_height_m", 1.5) or 0.0),
+                        rf_params=rf_params,
+                        sector_params=sector_params,
+                    )
+                    horizontal_pattern_loss_db = _horizontal_pattern_attenuation_db(
+                        bearing_deg=theta,
+                        sector_params=sector_params,
+                        rf_params=rf_params,
+                    )
+                    estimated_rsrp = sector_rs_eirp_dbm - (
+                        scenario_path_loss_db
+                        + extra_loss_db
+                        + horizontal_pattern_loss_db
+                        + vertical_pattern_loss_db
+                    )
 
                     # Stop ray if signal too weak
                     if estimated_rsrp < min_rsrp_threshold:
@@ -387,12 +504,34 @@ def build_coverage_grid(
                             dominant_material=MaterialType.UNKNOWN,
                             obstacles_count=0,
                             extra_loss_db=0.0,
+                            sector_id=sector.sector_id,
+                            sector_freq_mhz=sector_freq_mhz,
+                            sector_tx_power_dbm=sector_tx_power_dbm,
+                            sector_channel_bandwidth_mhz=sector.channel_bandwidth_mhz,
+                            sector_azimuth_deg=getattr(sector, "azimuth_deg", None),
+                            sector_beamwidth_h_deg=getattr(sector, "beamwidth_h_deg", None),
+                            sector_beamwidth_v_deg=getattr(sector, "beamwidth_v_deg", None),
+                            sector_electrical_tilt_deg=getattr(sector, "electrical_tilt_deg", None),
+                            sector_mechanical_tilt_deg=getattr(sector, "mechanical_tilt_deg", None),
+                            sector_max_horizontal_attenuation_db=getattr(sector, "max_horizontal_attenuation_db", None),
+                            sector_front_to_back_attenuation_db=getattr(sector, "front_to_back_attenuation_db", None),
+                            sector_max_vertical_attenuation_db=getattr(sector, "max_vertical_attenuation_db", None),
                             is_los=is_los,
                             actual_path_length_m=r,
-                            num_buildings=next_hit_idx,
-                            num_trees=(1 if has_forest else 0),
-                            diffraction_flag=False,
-                            cumulative_material_loss_db=cumulative_material_loss_db,
+                            num_buildings=sum(1 for interval in building_intervals if interval["start_m"] <= (r + 1e-6)),
+                            num_trees=sum(1 for interval in forest_intervals if interval["start_m"] <= (r + 1e-6)),
+                            blocking_state=("los" if is_los else ("penetration" if penetration_loss_db > 0.0 else "shadow")),
+                            propagation_mode=(
+                                "los"
+                                if is_los
+                                else ("penetration" if penetration_loss_db > 0.0 else ("nlos_recovery" if canyon_recovery_db > 0.0 else "shadow"))
+                            ),
+                            first_blocker_distance_m=first_blocker_distance_m,
+                            diffraction_flag=(diffraction_loss_db > 0.0),
+                            penetration_loss_db=penetration_loss_db,
+                            shadow_loss_db=shadow_loss_db,
+                            diffraction_loss_db=diffraction_loss_db,
+                            canyon_recovery_db=canyon_recovery_db,
                             metal_blocked=metal_blocked,
                             buildings_along_path=(list(encountered_buildings) if encountered_buildings is not None else []),
                         )
@@ -474,11 +613,8 @@ def _segment_intersection_t(
     return None
 
 
-def _first_intersection_distance_m(start: LatLon, end: LatLon, polygon: List[dict]) -> Optional[float]:
-    """Return earliest intersection distance along (start->end) with polygon boundary, in meters.
-
-    Returns 0.0 if the start point lies inside the polygon (attenuation begins immediately).
-    """
+def _intersection_interval_m(start: LatLon, end: LatLon, polygon: List[dict]) -> Optional[tuple[float, float]]:
+    """Return the [entry, exit] distances where the ray overlaps a polygon."""
     if not polygon or len(polygon) < 3:
         return None
 
@@ -512,16 +648,12 @@ def _first_intersection_distance_m(start: LatLon, end: LatLon, polygon: List[dic
             j = i
         return inside
 
-    # If TX is inside the polygon, treat the first hit as distance 0.
-    if _point_in_poly(0.0, 0.0, pts):
-        return 0.0
-
     end_e, end_n = _enu_from_tx(start, end)
     seg_len = math.hypot(end_e, end_n)
     if seg_len <= 1e-6:
         return None
 
-    best_t: Optional[float] = None
+    ts: list[float] = []
     npts = len(pts)
     for i in range(npts):
         ax, ay = pts[i]
@@ -529,12 +661,24 @@ def _first_intersection_distance_m(start: LatLon, end: LatLon, polygon: List[dic
         t = _segment_intersection_t(0.0, 0.0, end_e, end_n, ax, ay, bx, by)
         if t is None:
             continue
-        if best_t is None or t < best_t:
-            best_t = t
+        ts.append(float(t))
 
-    if best_t is None:
+    ts = sorted(max(0.0, min(1.0, t)) for t in ts)
+    inside_at_start = _point_in_poly(0.0, 0.0, pts)
+    if inside_at_start:
+        ts = [0.0] + ts
+    if len(ts) % 2 == 1:
+        ts.append(1.0)
+    if len(ts) < 2:
         return None
-    return best_t * seg_len
+    return (ts[0] * seg_len, ts[1] * seg_len)
+
+
+def _first_intersection_distance_m(start: LatLon, end: LatLon, polygon: List[dict]) -> Optional[float]:
+    interval = _intersection_interval_m(start, end, polygon)
+    if interval is None:
+        return None
+    return interval[0]
 
 
 def _first_forest_intersection_distance_m(map_provider: object, start: LatLon, end: LatLon) -> Optional[float]:
@@ -579,6 +723,42 @@ def _first_forest_intersection_distance_m(map_provider: object, start: LatLon, e
             best = d
 
     return best
+
+
+def _forest_intervals_m(map_provider: object, start: LatLon, end: LatLon) -> list[dict[str, float]]:
+    """Best-effort forest overlap intervals along the ray."""
+    landuse_qt = getattr(map_provider, "_landuse_quadtree", None)
+    landuse_by_id = getattr(map_provider, "_landuse_by_id", None)
+    cached_landuse = getattr(map_provider, "_cached_landuse", None)
+
+    candidates = None
+    if landuse_qt is not None and landuse_by_id is not None:
+        try:
+            candidates = [landuse_by_id.get(area_id) for area_id in landuse_qt.query_ray(start, end)]
+        except Exception:
+            candidates = None
+    if candidates is None and cached_landuse:
+        candidates = list(cached_landuse)
+    if not candidates:
+        return []
+
+    intervals: list[dict[str, float]] = []
+    for area in candidates:
+        if not area:
+            continue
+        tags = area.get("tags", {}) or {}
+        landuse_type = str(tags.get("landuse", "")).lower()
+        natural_type = str(tags.get("natural", "")).lower()
+        is_forest = landuse_type in ("forest", "wood", "meadow") or natural_type in ("wood", "forest", "tree_row")
+        if not is_forest:
+            continue
+        geom = area.get("geometry", [])
+        interval = _intersection_interval_m(start, end, geom)
+        if interval is None:
+            continue
+        intervals.append({"start_m": interval[0], "end_m": interval[1]})
+    intervals.sort(key=lambda item: item["start_m"])
+    return intervals
 
 def _project_from_tx(lat: float, lon: float, distance_m: float, bearing_deg: float) -> tuple[float, float]:
     """

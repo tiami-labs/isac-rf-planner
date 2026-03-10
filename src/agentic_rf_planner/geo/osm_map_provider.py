@@ -176,25 +176,35 @@ class OSMMapProvider(MapProvider):
             
             # Fetch buildings if not cached
             if not cache_hit_buildings:
-                self._cached_buildings = self._fetch_buildings_from_osm(center, radius_m)
-                logger.info(f"  Pre-fetched {len(self._cached_buildings)} buildings")
-                # Save to persistent cache (even if empty - this is valid if location has no buildings)
-                # But warn if we got 0 buildings from a fresh fetch
-                if len(self._cached_buildings) == 0:
-                    logger.warning(f"⚠ WARNING: Fresh OSM API query returned 0 buildings")
-                    logger.warning(f"  This means the location ({center.lat:.6f}, {center.lon:.6f}) has no building data in OSM")
-                    logger.warning(f"  Check https://www.openstreetmap.org/ to verify building coverage at this location")
-                save_cached_osm_data(center, radius_m, 'buildings', self._cached_buildings)
+                fetched_buildings = self._fetch_buildings_from_osm(center, radius_m)
+                if fetched_buildings is None:
+                    logger.warning("  Building fetch failed; continuing without seeding an empty cache entry")
+                    self._cached_buildings = []
+                else:
+                    self._cached_buildings = fetched_buildings
+                    logger.info(f"  Pre-fetched {len(self._cached_buildings)} buildings")
+                    # Save to persistent cache (even if empty - this is valid if location has no buildings)
+                    # But warn if we got 0 buildings from a fresh fetch
+                    if len(self._cached_buildings) == 0:
+                        logger.warning(f"⚠ WARNING: Fresh OSM API query returned 0 buildings")
+                        logger.warning(f"  This means the location ({center.lat:.6f}, {center.lon:.6f}) has no building data in OSM")
+                        logger.warning(f"  Check https://www.openstreetmap.org/ to verify building coverage at this location")
+                    save_cached_osm_data(center, radius_m, 'buildings', self._cached_buildings)
             else:
                 self._cached_buildings = cached_buildings
                 logger.info(f"  Using cached buildings: {len(self._cached_buildings)}")
             
             # Fetch landuse if not cached
             if not cache_hit_landuse:
-                self._cached_landuse = self._fetch_landuse_from_osm(center, radius_m)
-                logger.info(f"  Pre-fetched {len(self._cached_landuse)} landuse areas")
-                # Save to persistent cache
-                save_cached_osm_data(center, radius_m, 'landuse', self._cached_landuse)
+                fetched_landuse = self._fetch_landuse_from_osm(center, radius_m)
+                if fetched_landuse is None:
+                    logger.warning("  Landuse fetch failed; continuing without seeding an empty cache entry")
+                    self._cached_landuse = []
+                else:
+                    self._cached_landuse = fetched_landuse
+                    logger.info(f"  Pre-fetched {len(self._cached_landuse)} landuse areas")
+                    # Save to persistent cache
+                    save_cached_osm_data(center, radius_m, 'landuse', self._cached_landuse)
             else:
                 self._cached_landuse = cached_landuse
                 logger.info(f"  Using cached landuse: {len(self._cached_landuse)}")
@@ -264,7 +274,7 @@ class OSMMapProvider(MapProvider):
         
         logger.info(f"  Built landuse quadtree with {len(self._landuse_bboxes)} polygons")
     
-    def _fetch_buildings_from_osm(self, center: LatLon, radius_m: float) -> List[dict]:
+    def _fetch_buildings_from_osm(self, center: LatLon, radius_m: float) -> Optional[List[dict]]:
         """Fetch buildings directly from OSM (bypasses cache check)."""
         bbox = _bbox_around_point(center.lat, center.lon, radius_m)
         query = f"""
@@ -312,12 +322,12 @@ class OSMMapProvider(MapProvider):
             logger.error(f"✗ Network error fetching buildings from OSM: {e}")
             logger.error(f"  URL: {OVERPASS_URL}")
             logger.error(f"  Query bbox: {bbox}")
-            return []
+            return None
         except Exception as e:
             logger.error(f"✗ Error fetching buildings from OSM: {e}", exc_info=True)
-            return []
+            return None
     
-    def _fetch_landuse_from_osm(self, center: LatLon, radius_m: float) -> List[dict]:
+    def _fetch_landuse_from_osm(self, center: LatLon, radius_m: float) -> Optional[List[dict]]:
         """Fetch landuse directly from OSM (bypasses cache check)."""
         bbox = _bbox_around_point(center.lat, center.lon, radius_m)
         query = f"""
@@ -349,7 +359,7 @@ class OSMMapProvider(MapProvider):
             
         except Exception as e:
             logger.warning(f"Failed to fetch landuse from OSM: {e}")
-            return []
+            return None
 
     def count_buildings_between(self, start: LatLon, end: LatLon) -> int:
         """
@@ -575,6 +585,26 @@ class OSMMapProvider(MapProvider):
         else:
             return "urban"
 
+    def get_building_area_sqm(self, center: LatLon, radius_m: float) -> float:
+        """Total building footprint area (m²) within radius_m of center.
+
+        Uses prefetched buildings if available; otherwise returns 0.
+        """
+        if not self._prefetched or not self._cached_buildings:
+            return 0.0
+        total = 0.0
+        for building in self._cached_buildings:
+            geom = building.get("geometry", [])
+            if len(geom) < 3:
+                continue
+            centroid = _polygon_centroid(geom)
+            if centroid is None:
+                continue
+            if _distance_m(center, centroid) > radius_m:
+                continue
+            total += _polygon_area_sqm(geom, center.lat)
+        return total
+
     def _get_buildings_near_point(self, center: LatLon, radius_m: float) -> List[dict]:
         """Fetch building polygons near a point."""
         # Check cache - if prefetched, use it if point is within prefetch radius
@@ -765,6 +795,47 @@ def _distance_m(p1: LatLon, p2: LatLon) -> float:
     a = math.sin(dlat / 2.0) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2.0) ** 2
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return R * c
+
+
+def _polygon_area_sqm(geometry: List[dict], ref_lat: float) -> float:
+    """Compute polygon area in m² using Shoelace formula with equirectangular projection.
+
+    At ref_lat, 1 deg lat ≈ 111320 m, 1 deg lon ≈ 111320*cos(ref_lat) m.
+    """
+    if len(geometry) < 3:
+        return 0.0
+    points = []
+    for node in geometry:
+        if "lat" in node and "lon" in node:
+            points.append((float(node["lat"]), float(node["lon"])))
+    if len(points) < 3:
+        return 0.0
+    lat0_rad = math.radians(ref_lat)
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(lat0_rad)
+    xs = [(p[1] * m_per_deg_lon) for p in points]
+    ys = [(p[0] * m_per_deg_lat) for p in points]
+    n = len(xs)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += xs[i] * ys[j] - xs[j] * ys[i]
+    return abs(area) * 0.5
+
+
+def _polygon_centroid(geometry: List[dict]) -> Optional[LatLon]:
+    """Return centroid of polygon for distance check."""
+    if len(geometry) < 3:
+        return None
+    lats = []
+    lons = []
+    for node in geometry:
+        if "lat" in node and "lon" in node:
+            lats.append(float(node["lat"]))
+            lons.append(float(node["lon"]))
+    if not lats or not lons:
+        return None
+    return LatLon(lat=sum(lats) / len(lats), lon=sum(lons) / len(lons))
 
 
 def _ray_intersects_polygon(start: LatLon, end: LatLon, polygon: List[dict]) -> bool:

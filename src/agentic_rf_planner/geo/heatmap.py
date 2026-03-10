@@ -99,6 +99,8 @@ def attenuation_grid_to_png_ellipse(
         "radius_m": max_range_m,
         "vmin": vmin_used,
         "vmax": vmax_used,
+        "actual_min": actual_min,
+        "actual_max": actual_max,
       }
     """
     if not grid.cell_lat or not grid.cell_lon or not grid.rsrp_dbm:
@@ -195,15 +197,27 @@ def attenuation_grid_to_png_ellipse(
 
     finite = np.isfinite(rsrp)
     if not np.any(finite):
-        vmin_used = float(vmin) if vmin is not None else -150.0
-        vmax_used = float(vmax) if vmax is not None else 50.0
+        actual_min = float(vmin) if vmin is not None else -140.0
+        actual_max = float(vmax) if vmax is not None else -60.0
+        vmin_used = float(vmin) if vmin is not None else -140.0
+        vmax_used = float(vmax) if vmax is not None else -60.0
     else:
+        actual_min = float(np.nanmin(rsrp))
+        actual_max = float(np.nanmax(rsrp))
         vmin_used = float(np.nanmin(rsrp)) if vmin is None else float(vmin)
         vmax_used = float(np.nanmax(rsrp)) if vmax is None else float(vmax)
         if not np.isfinite(vmin_used) or not np.isfinite(vmax_used) or vmax_used <= vmin_used:
-            vmin_used, vmax_used = -150.0, 50.0
+            vmin_used, vmax_used = -140.0, -60.0
 
     rgba = _colorize_rsrp(rsrp, vmin_used, vmax_used, alpha=alpha)
+
+    # Soften the circular boundary to avoid a visible faint circle outline.
+    # Fade alpha to 0 over the last ~3% of the radius so the edge blends into transparent.
+    feather_m = max(30.0, radius_m * 0.03)
+    fade = np.clip((radius_m - r_pix) / feather_m, 0.0, 1.0)
+    rgba[..., 3] = np.clip(
+        np.rint(rgba[..., 3].astype(np.float64) * fade).astype(np.int32), 0, 255
+    ).astype(np.uint8)
 
     # Encode PNG
     try:
@@ -224,6 +238,8 @@ def attenuation_grid_to_png_ellipse(
         "radius_m": radius_m,
         "vmin": vmin_used,
         "vmax": vmax_used,
+        "actual_min": actual_min,
+        "actual_max": actual_max,
     }
 
 

@@ -3,6 +3,7 @@
 import json
 import logging
 import hashlib
+import math
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -65,6 +66,30 @@ def _is_cache_valid(cache_path: Path) -> bool:
         return False
 
 
+def _distance_m(a: LatLon, b: LatLon) -> float:
+    """Approximate great-circle distance in meters."""
+    r = 6371000.0
+    lat1 = math.radians(a.lat)
+    lat2 = math.radians(b.lat)
+    dlat = math.radians(b.lat - a.lat)
+    dlon = math.radians(b.lon - a.lon)
+    h = math.sin(dlat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    return 2.0 * r * math.atan2(math.sqrt(h), math.sqrt(max(0.0, 1.0 - h)))
+
+
+def _load_cache_payload(cache_path: Path) -> Optional[Dict]:
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+        if 'center' not in data or 'radius_m' not in data or 'data' not in data:
+            logger.warning(f"Invalid cache format: {cache_path}")
+            return None
+        return data
+    except Exception as e:
+        logger.warning(f"Failed to load cache {cache_path}: {e}")
+        return None
+
+
 def load_cached_osm_data(center: LatLon, radius_m: float, data_type: str) -> Optional[List[Dict]]:
     """
     Load cached OSM data for a region.
@@ -83,46 +108,71 @@ def load_cached_osm_data(center: LatLon, radius_m: float, data_type: str) -> Opt
     logger.debug(f"Checking cache for {data_type}: key={cache_key}, path={cache_path}")
     logger.debug(f"  Cache path exists: {cache_path.exists()}")
     
-    if not _is_cache_valid(cache_path):
+    data = None
+    if _is_cache_valid(cache_path):
+        data = _load_cache_payload(cache_path)
+    else:
         if cache_path.exists():
             logger.debug(f"Cache miss for {data_type}: file exists but expired or invalid")
         else:
             logger.debug(f"Cache miss for {data_type}: file doesn't exist")
-        return None
-    
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-        
-        # Validate cache metadata
-        if 'center' not in data or 'radius_m' not in data or 'data' not in data:
-            logger.warning(f"Invalid cache format: {cache_path}")
-            return None
-        
-        # Check if cache covers the requested region (with some tolerance)
-        cached_center = LatLon(lat=data['center']['lat'], lon=data['center']['lon'])
-        cached_radius = data['radius_m']
-        
-        # Simple distance check (if requested center is within cached region)
-        # For now, we require exact match (grid-based)
+
+    exact_empty_data: Optional[List[Dict]] = None
+    if data is not None:
         num_items = len(data['data'])
         logger.info(f"✓ Cache HIT: Loaded {num_items} {data_type} from cache")
         logger.debug(f"  Cache file: {cache_path}")
         logger.debug(f"  Cached at: {data.get('cached_at', 'unknown')}")
         logger.debug(f"  Cached center: {data.get('center', {})}")
         logger.debug(f"  Cached radius: {data.get('radius_m', 'unknown')}m")
-        
-        if num_items == 0:
-            logger.warning(f"⚠ WARNING: Cache returned 0 {data_type} - this may indicate:")
-            logger.warning(f"  1. Previous query found no {data_type} at this location")
-            logger.warning(f"  2. Location has no OSM {data_type} data")
-            logger.warning(f"  3. Cache file contains empty result from previous fetch")
-        
-        return data['data']
-    
-    except Exception as e:
-        logger.warning(f"Failed to load cache {cache_path}: {e}")
+
+        if num_items > 0:
+            return data['data']
+
+        logger.warning(f"⚠ WARNING: Cache returned 0 {data_type} - this may indicate:")
+        logger.warning(f"  1. Previous query found no {data_type} at this location")
+        logger.warning(f"  2. Location has no OSM {data_type} data")
+        logger.warning(f"  3. Cache file contains empty result from previous fetch")
+        logger.info(f"  Exact cache is empty; checking nearby non-empty {data_type} caches before accepting it")
+        exact_empty_data = data['data']
+
+    # Exact grid match missed. Reuse a nearby successful cache if its center is close
+    # enough to be useful for this request, then seed the exact cache key for later.
+    if not CACHE_DIR.exists():
         return None
+
+    best_payload: Optional[Dict] = None
+    best_distance_m: Optional[float] = None
+    for candidate_path in CACHE_DIR.glob(f"*_{data_type}.json"):
+        if candidate_path == cache_path or not _is_cache_valid(candidate_path):
+            continue
+        payload = _load_cache_payload(candidate_path)
+        if payload is None or not payload.get('data'):
+            continue
+        try:
+            candidate_center = LatLon(
+                lat=float(payload['center']['lat']),
+                lon=float(payload['center']['lon']),
+            )
+            candidate_radius = float(payload['radius_m'])
+        except Exception:
+            continue
+        distance_m = _distance_m(center, candidate_center)
+        if distance_m > max(radius_m, candidate_radius):
+            continue
+        if best_distance_m is None or distance_m < best_distance_m:
+            best_payload = payload
+            best_distance_m = distance_m
+
+    if best_payload is None:
+        return exact_empty_data
+
+    logger.info(
+        f"✓ Nearby cache HIT: Reusing {len(best_payload['data'])} {data_type} "
+        f"from {best_distance_m:.1f}m away"
+    )
+    save_cached_osm_data(center, radius_m, data_type, best_payload['data'])
+    return best_payload['data']
 
 
 def save_cached_osm_data(center: LatLon, radius_m: float, data_type: str, data: List[Dict]) -> None:
