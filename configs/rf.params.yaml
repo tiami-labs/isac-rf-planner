@@ -1,38 +1,83 @@
 # RF simulation parameters
+# All knobs below are moveable: edit this file and run CLI/API to tune without code changes.
 
+# --- Basic RF ---
 freq_mhz: 3500.0  # 5G mid-band frequency
 tx_power_dbm: 30.0  # Transmitter power in dBm
-noise_floor_dbm: -100.0  # Receiver noise floor
-max_range_m: 500.0  # Maximum simulation range in meters
+noise_floor_dbm: -100.0  # Receiver noise floor (optional; if null, computed from bandwidth + noise_figure_db)
+noise_figure_db: 7.0  # Receiver noise figure (typical 5–10 dB), used when noise_floor_dbm not set
+max_range_m: 2000.0  # Maximum simulation range in meters
 step_m: 5.0  # Grid resolution in meters
+dtheta_deg: 5.0  # Bearing step (deg); must match 3D mesh-profile discretization
 
-# OFDM parameters
-subcarrier_spacing_khz: 30.0  # Subcarrier spacing (15 kHz for LTE, 30/60/120 for 5G)
-num_resource_blocks: 100  # Number of resource blocks (12 subcarriers per RB)
-channel_bandwidth_mhz: 20.0  # Total channel bandwidth
+# --- Ray / 3D geometry (for 3D mesh mode) ---
+ray_mode: "2d"  # "2d" = polygon OSM; "3d" = persisted Google mesh + OSM
+tx_height_m: 0.0  # TX height above ground (m)
+rx_height_m: 1.5  # RX height above ground (m)
 
-# MIMO parameters
-num_tx_antennas: 1  # Number of transmit antennas
-num_rx_antennas: 1  # Number of receive antennas
-mimo_mode: "SISO"  # SISO, SIMO, MISO, MIMO
+# --- Macro 5G NR RSRP calibration ---
+# tx_power_dbm is total carrier power, not direct RSRP source power.
+# These convert total carrier power into a conservative reference-signal source term.
+tx_antenna_gain_dbi: 17.0
+tx_feeder_loss_db: 2.0
+reference_signal_offset_db: -18.0
+ue_antenna_gain_dbi: 0.0
+max_rsrp_dbm: -62.0
 
-# Link adaptation
-enable_link_adaptation: true  # Auto-select modulation based on SINR
-fixed_modulation: null  # If set, use this modulation (e.g., "QPSK", "16-QAM", "64-QAM", "256-QAM")
+# --- Antenna pattern (electrical/mechanical tilt and beam shape) ---
+electrical_tilt_deg: 0.0
+mechanical_tilt_deg: 0.0
+vertical_beamwidth_deg: 8.0
+max_vertical_attenuation_db: 28.0   # Cap on vertical pattern loss (dB)
+max_horizontal_attenuation_db: 28.0 # Cap on horizontal pattern loss (dB)
+front_to_back_attenuation_db: 23.0  # Back-lobe / front-to-back (dB)
 
-# Building attenuation: per-material absolute values (dB) - primary
-# Optional: overall or per-material scale/subtract when absolute not set
-# Raw baseline (3.5 GHz): concrete 12, brick 10, wood 7, glass 9, metal 25, unknown 12 dB
+# --- Vendor-grade path loss and post-LOS behavior ---
+# Deterministic 3GPP median path loss first; penetration only while inside blockers;
+# shadow / diffraction / recovery used after LOS is lost.
+path_loss_model: "3gpp_38901"
+propagation_scenario: "umi_street_canyon"
+termination_rsrp_dbm: -140.0  # Ray stops when RSRP drops below this
+
+# Shadow (behind-blocker loss)
+shadow_loss_db: 4.0           # Base shadow loss (dB)
+shadow_decay_db_per_100m: 2.0 # Extra loss per 100 m behind blocker
+shadow_loss_cap_db: 20.0      # Cap on total shadow loss (dB)
+
+# Diffraction (edge/corner continuation)
+diffraction_base_loss_db: 4.0      # Base diffraction loss (dB)
+diffraction_slope_db_per_100m: 1.0 # Extra loss per 100 m
+diffraction_loss_cap_db: 16.0      # Cap on total diffraction loss (dB)
+
+# Canyon recovery (post-blocker credit in street canyon)
+canyon_recovery_max_db: 6.0           # Max recovery (dB)
+canyon_recovery_slope_db_per_100m: 4.0 # Recovery per 100 m (up to cap)
+
+# --- Building attenuation (penetration: loss while inside material) ---
+# Per-material absolute values (dB). Optional overall scale/reduction when material not listed.
+# Reduced by 2 dB from prior baseline for all materials.
 building_attenuation:
-  # Per-material absolute values (dB) - use directly
   materials:
-    concrete: 9.0
-    brick: 7.5
-    wood: 5.25
-    glass: 6.75
-    metal: 18.75
-    unknown: 9.0
-  # Optional: overall scale and subtract (fallback when material not in materials)
+    concrete: 5.0
+    brick: 3.5
+    wood: 1.25
+    glass: 2.75
+    metal: 14.75
+    unknown: 3.0
   overall:
     scale: 0.75
-    reduction_db: 2.0
+    reduction_db: 6.0  # +2 dB reduction for fallback materials
+
+# --- OFDM / bandwidth ---
+subcarrier_spacing_khz: 30.0  # 15 LTE, 30/60/120 5G
+num_resource_blocks: 100
+channel_bandwidth_mhz: 20.0
+
+# --- MIMO ---
+num_tx_antennas: 4  
+num_rx_antennas: 4
+mimo_mode: "SISO"  # SISO, SIMO, MISO, MIMO
+
+# --- Link adaptation ---
+enable_link_adaptation: true
+fixed_modulation: null  # If set, e.g. "QPSK", "16-QAM", "64-QAM", "256-QAM"
