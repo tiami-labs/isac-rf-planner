@@ -35,10 +35,15 @@ class SectorConfig(BaseModel):
     tx_power_dbm: float = Field(..., description="Transmit power in dBm for this sector")
     channel_bandwidth_mhz: float = Field(..., gt=0.0, description="Channel bandwidth in MHz")
     
-    # Optional: antenna pattern parameters (for future use)
+    # Antenna pattern parameters.
     azimuth_deg: Optional[float] = Field(None, ge=0.0, le=360.0, description="Boresight azimuth in degrees (center of sector)")
     beamwidth_h_deg: Optional[float] = Field(None, gt=0.0, le=360.0, description="Horizontal beamwidth in degrees")
     beamwidth_v_deg: Optional[float] = Field(None, gt=0.0, le=180.0, description="Vertical beamwidth in degrees")
+    electrical_tilt_deg: Optional[float] = Field(None, ge=-30.0, le=30.0, description="Electrical tilt in degrees")
+    mechanical_tilt_deg: Optional[float] = Field(None, ge=-30.0, le=30.0, description="Mechanical tilt in degrees")
+    max_horizontal_attenuation_db: Optional[float] = Field(None, ge=0.0, le=60.0, description="Maximum horizontal attenuation")
+    front_to_back_attenuation_db: Optional[float] = Field(None, ge=0.0, le=60.0, description="Back-lobe/front-to-back attenuation")
+    max_vertical_attenuation_db: Optional[float] = Field(None, ge=0.0, le=60.0, description="Maximum vertical attenuation")
     
     @model_validator(mode='after')
     def validate_sector_type(self):
@@ -67,6 +72,30 @@ class SectorConfig(BaseModel):
                     raise ValueError(f"polygon_points[{i}] has invalid coordinates: [{lat}, {lon}]")
             self.start_angle_deg = None
             self.end_angle_deg = None
+
+        if self.sector_type == "polygon":
+            if self.azimuth_deg is None:
+                self.azimuth_deg = 0.0
+            if self.beamwidth_h_deg is None:
+                self.beamwidth_h_deg = 360.0
+        else:
+            if self.azimuth_deg is None:
+                self.azimuth_deg = self.get_center_angle()
+            if self.beamwidth_h_deg is None:
+                self.beamwidth_h_deg = max(1.0, self.get_span_deg())
+
+        if self.beamwidth_v_deg is None:
+            self.beamwidth_v_deg = 8.0
+        if self.electrical_tilt_deg is None:
+            self.electrical_tilt_deg = 0.0
+        if self.mechanical_tilt_deg is None:
+            self.mechanical_tilt_deg = 0.0
+        if self.max_horizontal_attenuation_db is None:
+            self.max_horizontal_attenuation_db = 30.0
+        if self.front_to_back_attenuation_db is None:
+            self.front_to_back_attenuation_db = 25.0
+        if self.max_vertical_attenuation_db is None:
+            self.max_vertical_attenuation_db = 30.0
         return self
     
     def covers_angle(self, angle_deg: float) -> bool:
@@ -251,6 +280,8 @@ def validate_sectors(sectors: List[SectorConfig]) -> None:
     for i in range(len(sectors)):
         for j in range(i + 1, len(sectors)):
             s1, s2 = sectors[i], sectors[j]
+            if s1.sector_type == "polygon" or s2.sector_type == "polygon":
+                continue
             # Simple overlap check: if centers are close, likely overlap
             center1 = s1.get_center_angle()
             center2 = s2.get_center_angle()
@@ -276,5 +307,13 @@ def create_omnidirectional_sector(rf_params) -> SectorConfig:
         freq_mhz=rf_params.freq_mhz,
         tx_power_dbm=rf_params.tx_power_dbm,
         channel_bandwidth_mhz=rf_params.channel_bandwidth_mhz,
+        azimuth_deg=0.0,
+        beamwidth_h_deg=360.0,
+        beamwidth_v_deg=float(getattr(rf_params, "vertical_beamwidth_deg", 8.0) or 8.0),
+        electrical_tilt_deg=float(getattr(rf_params, "electrical_tilt_deg", 0.0) or 0.0),
+        mechanical_tilt_deg=float(getattr(rf_params, "mechanical_tilt_deg", 0.0) or 0.0),
+        max_horizontal_attenuation_db=float(getattr(rf_params, "max_horizontal_attenuation_db", 30.0) or 30.0),
+        front_to_back_attenuation_db=float(getattr(rf_params, "front_to_back_attenuation_db", 25.0) or 25.0),
+        max_vertical_attenuation_db=float(getattr(rf_params, "max_vertical_attenuation_db", 30.0) or 30.0),
     )
 
