@@ -17,6 +17,7 @@ from ..agents.rf_planning_agent import run_rf_planning_for_point
 
 from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
 from ..geo.google_mesh.provider import MissingMeshProfiles
+from ..geo.road_labels import fetch_road_labels
 
 # Configure logging to show INFO and above, with detailed format
 logging.basicConfig(
@@ -76,6 +77,29 @@ class PlanRequest(BaseModel):
     ray_mode: Optional[str] = None  # "2d" or "3d"
     tx_height_m: float = 0.0
     rx_height_m: float = 1.5
+    tx_antenna_gain_dbi: Optional[float] = None
+    tx_feeder_loss_db: Optional[float] = None
+    reference_signal_offset_db: Optional[float] = None
+    ue_antenna_gain_dbi: Optional[float] = None
+    max_rsrp_dbm: Optional[float] = None
+    electrical_tilt_deg: Optional[float] = None
+    mechanical_tilt_deg: Optional[float] = None
+    vertical_beamwidth_deg: Optional[float] = None
+    max_vertical_attenuation_db: Optional[float] = None
+    max_horizontal_attenuation_db: Optional[float] = None
+    front_to_back_attenuation_db: Optional[float] = None
+    path_loss_model: Optional[str] = None
+    propagation_scenario: Optional[str] = None
+    shadow_loss_db: Optional[float] = None
+    shadow_decay_db_per_100m: Optional[float] = None
+    shadow_loss_cap_db: Optional[float] = None
+    diffraction_base_loss_db: Optional[float] = None
+    diffraction_slope_db_per_100m: Optional[float] = None
+    diffraction_loss_cap_db: Optional[float] = None
+    canyon_recovery_max_db: Optional[float] = None
+    canyon_recovery_slope_db_per_100m: Optional[float] = None
+    termination_rsrp_dbm: Optional[float] = None
+    building_attenuation: Optional[Dict[str, Any]] = None  # Override config; { materials: {...}, overall: {...} }
 
     # Coverage / grid resolution (optional overrides; defaults match RFParams)
     # In 3D mode these must match the mesh-profile cache key that the UI
@@ -117,14 +141,19 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         # Load RF config for building attenuation etc. (config-driven, no code changes needed)
         try:
             rf_cfg = load_rf_config("configs/rf.params.yaml")
-        except Exception:
+            if not rf_cfg:
+                logger.warning("RF config not found (configs/rf.params.yaml); building_attenuation will be None")
+            elif "building_attenuation" not in rf_cfg:
+                logger.warning("RF config has no building_attenuation; penetration loss will use hardcoded defaults")
+        except Exception as e:
             rf_cfg = {}
+            logger.warning("Failed to load RF config: %s", e)
         rf_params = RFParams(
             freq_mhz=req.freq_mhz,
             tx_power_dbm=req.tx_power_dbm,
             noise_floor_dbm=req.noise_floor_dbm,
             noise_figure_db=req.noise_figure_db,
-            max_range_m=(req.max_range_m if req.max_range_m is not None else RFParams.model_fields["max_range_m"].default),
+            max_range_m=(req.max_range_m if req.max_range_m is not None else rf_cfg.get("max_range_m", RFParams.model_fields["max_range_m"].default)),
             step_m=(req.step_m if req.step_m is not None else RFParams.model_fields["step_m"].default),
             dtheta_deg=(req.dtheta_deg if req.dtheta_deg is not None else RFParams.model_fields.get("dtheta_deg").default if "dtheta_deg" in RFParams.model_fields else 5.0),
             subcarrier_spacing_khz=req.subcarrier_spacing_khz,
@@ -139,7 +168,29 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             ray_mode=effective_ray_mode,
             tx_height_m=req.tx_height_m,
             rx_height_m=req.rx_height_m,
-            building_attenuation=rf_cfg.get("building_attenuation"),
+            tx_antenna_gain_dbi=(req.tx_antenna_gain_dbi if req.tx_antenna_gain_dbi is not None else rf_cfg.get("tx_antenna_gain_dbi", RFParams.model_fields["tx_antenna_gain_dbi"].default)),
+            tx_feeder_loss_db=(req.tx_feeder_loss_db if req.tx_feeder_loss_db is not None else rf_cfg.get("tx_feeder_loss_db", RFParams.model_fields["tx_feeder_loss_db"].default)),
+            reference_signal_offset_db=(req.reference_signal_offset_db if req.reference_signal_offset_db is not None else rf_cfg.get("reference_signal_offset_db", RFParams.model_fields["reference_signal_offset_db"].default)),
+            ue_antenna_gain_dbi=(req.ue_antenna_gain_dbi if req.ue_antenna_gain_dbi is not None else rf_cfg.get("ue_antenna_gain_dbi", RFParams.model_fields["ue_antenna_gain_dbi"].default)),
+            max_rsrp_dbm=(req.max_rsrp_dbm if req.max_rsrp_dbm is not None else rf_cfg.get("max_rsrp_dbm", RFParams.model_fields["max_rsrp_dbm"].default)),
+            electrical_tilt_deg=(req.electrical_tilt_deg if req.electrical_tilt_deg is not None else rf_cfg.get("electrical_tilt_deg", RFParams.model_fields["electrical_tilt_deg"].default)),
+            mechanical_tilt_deg=(req.mechanical_tilt_deg if req.mechanical_tilt_deg is not None else rf_cfg.get("mechanical_tilt_deg", RFParams.model_fields["mechanical_tilt_deg"].default)),
+            vertical_beamwidth_deg=(req.vertical_beamwidth_deg if req.vertical_beamwidth_deg is not None else rf_cfg.get("vertical_beamwidth_deg", RFParams.model_fields["vertical_beamwidth_deg"].default)),
+            max_vertical_attenuation_db=(req.max_vertical_attenuation_db if req.max_vertical_attenuation_db is not None else rf_cfg.get("max_vertical_attenuation_db", RFParams.model_fields["max_vertical_attenuation_db"].default)),
+            max_horizontal_attenuation_db=(req.max_horizontal_attenuation_db if req.max_horizontal_attenuation_db is not None else rf_cfg.get("max_horizontal_attenuation_db", RFParams.model_fields["max_horizontal_attenuation_db"].default)),
+            front_to_back_attenuation_db=(req.front_to_back_attenuation_db if req.front_to_back_attenuation_db is not None else rf_cfg.get("front_to_back_attenuation_db", RFParams.model_fields["front_to_back_attenuation_db"].default)),
+            path_loss_model=(req.path_loss_model if req.path_loss_model is not None else rf_cfg.get("path_loss_model", RFParams.model_fields["path_loss_model"].default)),
+            propagation_scenario=(req.propagation_scenario if req.propagation_scenario is not None else rf_cfg.get("propagation_scenario", RFParams.model_fields["propagation_scenario"].default)),
+            shadow_loss_db=(req.shadow_loss_db if req.shadow_loss_db is not None else rf_cfg.get("shadow_loss_db", RFParams.model_fields["shadow_loss_db"].default)),
+            shadow_decay_db_per_100m=(req.shadow_decay_db_per_100m if req.shadow_decay_db_per_100m is not None else rf_cfg.get("shadow_decay_db_per_100m", RFParams.model_fields["shadow_decay_db_per_100m"].default)),
+            shadow_loss_cap_db=(req.shadow_loss_cap_db if req.shadow_loss_cap_db is not None else rf_cfg.get("shadow_loss_cap_db", RFParams.model_fields["shadow_loss_cap_db"].default)),
+            diffraction_base_loss_db=(req.diffraction_base_loss_db if req.diffraction_base_loss_db is not None else rf_cfg.get("diffraction_base_loss_db", RFParams.model_fields["diffraction_base_loss_db"].default)),
+            diffraction_slope_db_per_100m=(req.diffraction_slope_db_per_100m if req.diffraction_slope_db_per_100m is not None else rf_cfg.get("diffraction_slope_db_per_100m", RFParams.model_fields["diffraction_slope_db_per_100m"].default)),
+            diffraction_loss_cap_db=(req.diffraction_loss_cap_db if req.diffraction_loss_cap_db is not None else rf_cfg.get("diffraction_loss_cap_db", RFParams.model_fields["diffraction_loss_cap_db"].default)),
+            canyon_recovery_max_db=(req.canyon_recovery_max_db if req.canyon_recovery_max_db is not None else rf_cfg.get("canyon_recovery_max_db", RFParams.model_fields["canyon_recovery_max_db"].default)),
+            canyon_recovery_slope_db_per_100m=(req.canyon_recovery_slope_db_per_100m if req.canyon_recovery_slope_db_per_100m is not None else rf_cfg.get("canyon_recovery_slope_db_per_100m", RFParams.model_fields["canyon_recovery_slope_db_per_100m"].default)),
+            termination_rsrp_dbm=(req.termination_rsrp_dbm if req.termination_rsrp_dbm is not None else rf_cfg.get("termination_rsrp_dbm", RFParams.model_fields["termination_rsrp_dbm"].default)),
+            building_attenuation=(req.building_attenuation if req.building_attenuation is not None else rf_cfg.get("building_attenuation")),
         )
         logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
         if req.sectors:
@@ -203,13 +254,90 @@ def api_config() -> Dict[str, Any]:
     This endpoint is intended for local development only.
     """
     key = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_MAPS_APIKEY")
-    # Default ray mode is always "2d" - UI controls the actual mode via ray-mode selector
     default_ray_mode = "2d"
+    rf_cfg = load_rf_config("configs/rf.params.yaml")
     return {
         "google_maps_api_key": key or "",
         "google_maps_api_key_present": bool(key),
         "mesh_profile_version": PROFILE_VERSION,
         "default_ray_mode": default_ray_mode,
+        "rf_params": rf_cfg,
+    }
+
+
+@app.get("/api/rf-params")
+def api_rf_params() -> Dict[str, Any]:
+    """Return RF params from rf.params.yaml for GUI defaults (attenuation knobs, etc.)."""
+    return load_rf_config("configs/rf.params.yaml")
+
+
+@app.get("/api/roads/labels")
+def api_road_labels(
+    lat: float,
+    lon: float,
+    radius_m: float = 2500.0,
+    major_limit: int = 24,
+    minor_limit: int = 40,
+) -> Dict[str, Any]:
+    """Return named OSM road labels for the 3D map."""
+    labels = fetch_road_labels(
+        lat,
+        lon,
+        radius_m=radius_m,
+        major_limit=major_limit,
+        minor_limit=minor_limit,
+    )
+    return {
+        "status": "ok",
+        "labels": labels,
+        "query": {
+            "lat": lat,
+            "lon": lon,
+            "radius_m": max(200.0, min(5000.0, float(radius_m))),
+            "major_limit": max(0, int(major_limit)),
+            "minor_limit": max(0, int(minor_limit)),
+        },
+    }
+
+
+@app.get("/api/ray-trace/preview")
+def api_ray_trace_preview(
+    tx_lat: float,
+    tx_lon: float,
+    tx_height_m: float = 10.0,
+    rx_height_m: float = 1.5,
+    max_range_m: float = 1200.0,
+    num_bearings: int = 24,
+    max_reflections: int = 1,
+) -> Dict[str, Any]:
+    """Return renderable ray-trace paths for the 3D OSM + ray-trace mode."""
+    from ..geo.ray_trace import RayTraceOSMMapProvider
+
+    tx = LatLon(lat=float(tx_lat), lon=float(tx_lon))
+    provider = RayTraceOSMMapProvider(
+        cache_radius_m=max(500.0, float(max_range_m) + 100.0),
+        tx_height_m=float(tx_height_m),
+        rx_height_m=float(rx_height_m),
+    )
+    provider.prefetch_all_data(tx, float(max_range_m) + 100.0)
+    traces = provider.radial_trace_preview(
+        tx,
+        max_range_m=float(max_range_m),
+        num_bearings=max(4, min(72, int(num_bearings))),
+        max_reflections=max(0, min(2, int(max_reflections))),
+    )
+    return {
+        "status": "ok",
+        "engine": "osm_single_bounce_v1",
+        "tx": tx.model_dump(),
+        "traces": [t.model_dump() for t in traces],
+        "query": {
+            "max_range_m": float(max_range_m),
+            "num_bearings": max(4, min(72, int(num_bearings))),
+            "max_reflections": max(0, min(2, int(max_reflections))),
+            "tx_height_m": float(tx_height_m),
+            "rx_height_m": float(rx_height_m),
+        },
     }
 
 
@@ -242,7 +370,7 @@ def mesh_profiles_has(
     tx_lon: float,
     tx_height_m: float = 0.0,
     rx_height_m: float = 1.5,
-    max_range_m: float = 500.0,
+    max_range_m: float = 2000.0,
     dr_m: float = 5.0,
     dtheta_deg: float = 5.0,
     version: str = PROFILE_VERSION,
@@ -267,7 +395,7 @@ def mesh_profiles_get(
     tx_lon: float,
     tx_height_m: float = 0.0,
     rx_height_m: float = 1.5,
-    max_range_m: float = 500.0,
+    max_range_m: float = 2000.0,
     dr_m: float = 5.0,
     dtheta_deg: float = 5.0,
     version: str = PROFILE_VERSION,
@@ -423,7 +551,7 @@ if static_dir.exists():
     async def serve_app_js():
         file_path = static_dir / "app.js"
         if file_path.exists():
-            return FileResponse(str(file_path))
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
@@ -440,6 +568,14 @@ if static_dir.exists():
         file_path = static_dir / "style.css"
         if file_path.exists():
             return FileResponse(str(file_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/export_utils.js")
+    async def serve_export_utils():
+        file_path = static_dir / "export_utils.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
