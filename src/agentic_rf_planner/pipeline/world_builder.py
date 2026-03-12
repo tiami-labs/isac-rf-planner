@@ -89,11 +89,11 @@ def build_world_model(
     logger.info(f"Created {len(cells)} cells in coverage grid (with adaptive termination)")
     
     # Performance fast-path: 3D OSM-only mode renders from a raster/PNG overlay and only
-    # requires per-cell LOS + cumulative material loss (computed during build_coverage_grid).
+    # requires the propagation state already stamped into each cell by build_coverage_grid.
     # The geometry/VLM refinement below is expensive and redundant for this mode.
     ray_mode_eff = str(getattr(rf_params, "ray_mode", "") or "").strip().lower()
-    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
-        logger.info("3D OSM-only mode: skipping per-cell world refinement (using coverage-grid LOS/material loss)")
+    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
+        logger.info("3D OSM-only mode: skipping per-cell world refinement (using coverage-grid propagation state)")
         return WorldModel(tx=tx, rf_params=rf_params, cells=cells)
     
     # Process cells with cached data (much faster now)
@@ -129,37 +129,35 @@ def build_world_model(
         num_trees = 0
         actual_path_length_m = cell.distance_m  # Default to straight-line
         
-        # Use pre-computed cumulative loss from coverage_grid if available
-        # This ensures loss persists after exiting obstacles - DO NOT RECOMPUTE
-        if hasattr(cell, 'cumulative_material_loss_db'):
-            # Preserve the pre-computed cumulative loss (critical for persistence)
-            cumulative_material_loss_db = cell.cumulative_material_loss_db
-            metal_blocked = getattr(cell, 'metal_blocked', False)
-            buildings_along_path = getattr(cell, 'buildings_along_path', [])
-        else:
-            # Fallback: compute it here (shouldn't happen if coverage_grid was called correctly)
-            # But if we do compute it, we still need to preserve it
-            cumulative_material_loss_db = 0.0
-            metal_blocked = False
-            buildings_along_path = []
-            if map_provider is not None:
-                cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
-                buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
-                bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
-                for building in buildings_along_path:
-                    material = building.get("material", "unknown")
-                    if is_material_blocking(material, rf_params.freq_mhz):
-                        metal_blocked = True
-                        break
-                    penetration_loss = get_penetration_loss_for_material(
-                        material, rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
-                    )
-                    cumulative_material_loss_db += penetration_loss
-                if map_provider.is_forest_between(tx, cell_latlon):
-                    tree_loss = get_penetration_loss_for_material(
-                        "wood", rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
-                    )
-                    cumulative_material_loss_db += tree_loss
+        penetration_loss_db = float(getattr(cell, 'penetration_loss_db', 0.0) or 0.0)
+        shadow_loss_db = float(getattr(cell, 'shadow_loss_db', 0.0) or 0.0)
+        diffraction_loss_db = float(getattr(cell, 'diffraction_loss_db', 0.0) or 0.0)
+        canyon_recovery_db = float(getattr(cell, 'canyon_recovery_db', 0.0) or 0.0)
+        metal_blocked = getattr(cell, 'metal_blocked', False)
+        buildings_along_path = getattr(cell, 'buildings_along_path', [])
+
+        if (
+            penetration_loss_db == 0.0
+            and shadow_loss_db == 0.0
+            and diffraction_loss_db == 0.0
+            and canyon_recovery_db == 0.0
+            and map_provider is not None
+        ):
+            # Legacy fallback for any cells that predate the split-loss model.
+            cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
+            buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
+            bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
+            for building in buildings_along_path:
+                material = building.get("material", "unknown")
+                if is_material_blocking(material, rf_params.freq_mhz):
+                    metal_blocked = True
+                penetration_loss_db += get_penetration_loss_for_material(
+                    material, rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
+                )
+            if map_provider.is_forest_between(tx, cell_latlon):
+                penetration_loss_db += get_penetration_loss_for_material(
+                    "wood", rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
+                )
         
         if map_provider is not None:
             cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
@@ -169,7 +167,8 @@ def build_world_model(
             if not buildings_along_path:
                 buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
             num_buildings = len(buildings_along_path)
-            is_los = (num_buildings == 0)
+            if not hasattr(cell, 'first_blocker_distance_m') or cell.first_blocker_distance_m is None:
+                is_los = (num_buildings == 0)
             
             # Count trees separately
             if map_provider.is_forest_between(tx, cell_latlon):
@@ -197,7 +196,10 @@ def build_world_model(
         cell.actual_path_length_m = actual_path_length_m
         cell.num_buildings = num_buildings
         cell.num_trees = num_trees
-        cell.cumulative_material_loss_db = cumulative_material_loss_db
+        cell.penetration_loss_db = penetration_loss_db
+        cell.shadow_loss_db = shadow_loss_db
+        cell.diffraction_loss_db = diffraction_loss_db
+        cell.canyon_recovery_db = canyon_recovery_db
         cell.metal_blocked = metal_blocked
         cell.buildings_along_path = buildings_along_path
         

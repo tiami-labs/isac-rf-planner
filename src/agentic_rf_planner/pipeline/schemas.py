@@ -71,7 +71,7 @@ class RFParams(BaseModel):
     # Default: -100 dBm (equivalent to ~20 MHz, NF=7 dB)
     noise_floor_dbm: Optional[float] = None  # If None, calculated from bandwidth + NF
     noise_figure_db: float = 7.0  # Receiver noise figure (typical: 5-10 dB)
-    max_range_m: float = 500.0
+    max_range_m: float = 2000.0
     step_m: float = 5.0  # grid resolution
     dtheta_deg: float = 5.0  # bearing step (deg); must match 3D mesh-profile discretization
     
@@ -101,6 +101,38 @@ class RFParams(BaseModel):
     tx_height_m: float = 0.0
     rx_height_m: float = 1.5
 
+    # Macro-cell power model:
+    # - tx_power_dbm is total carrier power, not per-reference-signal power.
+    # - RSRP is derived from a reference-signal-equivalent source term using
+    #   EPRE-style spreading plus antenna/feed assumptions and a conservative
+    #   reference-signal offset tuned for typical mid-band macro deployments.
+    tx_antenna_gain_dbi: float = 17.0
+    tx_feeder_loss_db: float = 2.0
+    reference_signal_offset_db: float = -18.0
+    ue_antenna_gain_dbi: float = 0.0
+    max_rsrp_dbm: float = -62.0
+    electrical_tilt_deg: float = 0.0
+    mechanical_tilt_deg: float = 0.0
+    vertical_beamwidth_deg: float = 8.0
+    max_vertical_attenuation_db: float = 30.0
+    max_horizontal_attenuation_db: float = 30.0
+    front_to_back_attenuation_db: float = 25.0
+
+    # Scenario / calibration controls for the vendor-grade roadmap.
+    # We start with deterministic median path loss and deterministic shadow/recovery
+    # terms, then expose the knobs in config so calibration can happen without code edits.
+    path_loss_model: str = "3gpp_38901"
+    propagation_scenario: str = "umi_street_canyon"
+    shadow_loss_db: float = 6.0
+    shadow_decay_db_per_100m: float = 4.0
+    shadow_loss_cap_db: float = 22.0
+    diffraction_base_loss_db: float = 6.0
+    diffraction_slope_db_per_100m: float = 3.0
+    diffraction_loss_cap_db: float = 18.0
+    canyon_recovery_max_db: float = 8.0
+    canyon_recovery_slope_db_per_100m: float = 6.0
+    termination_rsrp_dbm: float = -140.0
+
     # Building attenuation: overall + per-material (config-driven; no code changes needed).
     # Dict with "overall": {scale, reduction_db} and optional "materials": {concrete: {...}, ...}
     building_attenuation: Optional[Dict[str, Any]] = None
@@ -121,18 +153,43 @@ class WorldCell(BaseModel):
     dominant_material: MaterialType
     obstacles_count: int  # e.g. number of building "faces" crossed
     extra_loss_db: float  # precomputed extra attenuation vs free space
-    
-    # Phase 1: LOS detection and path length
-    is_los: bool = True  # Line-of-sight flag (True if no buildings block direct path)
-    actual_path_length_m: float = 0.0  # Actual path length (>= distance_m, accounts for obstacles)
-    num_buildings: int = 0  # Explicit building count (separate from obstacles_count)
-    num_trees: int = 0  # Explicit tree/foliage count
-    diffraction_flag: bool = False  # True if path involves diffraction around edges
-    
-    # Objective 1: Material-aware path loss
-    cumulative_material_loss_db: float = 0.0  # Cumulative material penetration loss along ray
-    metal_blocked: bool = False  # True if metal structure blocks path
-    buildings_along_path: List[Dict[str, Any]] = []  # List of buildings along ray (for material info)
+
+    # Sector/sample identity.
+    sector_id: str = "omnidirectional"
+    sector_freq_mhz: Optional[float] = None
+    sector_tx_power_dbm: Optional[float] = None
+    sector_channel_bandwidth_mhz: Optional[float] = None
+    sector_azimuth_deg: Optional[float] = None
+    sector_beamwidth_h_deg: Optional[float] = None
+    sector_beamwidth_v_deg: Optional[float] = None
+    sector_electrical_tilt_deg: Optional[float] = None
+    sector_mechanical_tilt_deg: Optional[float] = None
+    sector_max_horizontal_attenuation_db: Optional[float] = None
+    sector_front_to_back_attenuation_db: Optional[float] = None
+    sector_max_vertical_attenuation_db: Optional[float] = None
+
+    # LOS / obstruction-state model.
+    is_los: bool = True
+    actual_path_length_m: float = 0.0
+    num_buildings: int = 0
+    num_trees: int = 0
+    blocking_state: str = "los"  # los | penetration | shadow
+    propagation_mode: str = "los"  # los | penetration | shadow | nlos_recovery
+    first_blocker_distance_m: Optional[float] = None
+    diffraction_flag: bool = False
+
+    # Split-loss model:
+    # - penetration_loss_db applies only while the current ray segment is actually inside
+    #   a blocker or foliage interval.
+    # - shadow_loss_db represents behind-blocker attenuation after LOS has been lost.
+    # - diffraction_loss_db and canyon_recovery_db are continuation terms used once LOS
+    #   is gone, instead of stacking every prior wall forever.
+    penetration_loss_db: float = 0.0
+    shadow_loss_db: float = 0.0
+    diffraction_loss_db: float = 0.0
+    canyon_recovery_db: float = 0.0
+    metal_blocked: bool = False
+    buildings_along_path: List[Dict[str, Any]] = []
 
 
 class WorldModel(BaseModel):
@@ -157,5 +214,9 @@ class AttenuationGrid(BaseModel):
     sinr_db: List[float]  # Signal-to-Interference-plus-Noise Ratio (dB)
     modulation: List[str]  # Selected modulation scheme per cell
     throughput_mbps: List[float]  # Estimated throughput (Mbps) per cell
+    serving_sector_id: List[str]
+    interferer_count: List[int]
+    top_interferer_rsrp_dbm: List[float]
+    pilot_pollution_metric_db: List[float]
 
 
