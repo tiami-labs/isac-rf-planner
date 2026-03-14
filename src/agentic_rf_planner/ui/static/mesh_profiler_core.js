@@ -78,7 +78,7 @@ export async function buildAndUploadProfiles(opts) {
     lon,
     txHeightM = 0.0,
     rxHeightM = 1.5,
-    maxRangeM = 500.0,
+    maxRangeM = 2000.0,
     drM = 5.0,
     dthetaDeg = 5.0,
     mode = "slice",

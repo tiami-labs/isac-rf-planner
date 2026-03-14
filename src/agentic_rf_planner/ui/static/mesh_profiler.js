@@ -72,7 +72,7 @@ async function initCesium() {
     tx = { lat, lon };
     const btn = document.getElementById("generate");
     if (btn) btn.disabled = false;
-    setStatus(`TX set:\n  lat=${lat.toFixed(6)}\n  lon=${lon.toFixed(6)}\n\nClick Generate + Upload.`);
+    setStatus(`TX set:\n  lat=${lat}\n  lon=${lon}\n\nClick Generate + Upload.`);
   }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
   viewer.camera.flyTo({
@@ -91,7 +91,7 @@ async function generate() {
 
   const txHeightM = getNumber("tx-height", 10.0);
   const rxHeightM = getNumber("rx-height", 1.5);
-  const maxRangeM = getNumber("max-range", 500.0);
+  const maxRangeM = getNumber("max-range", 2000.0);
   const drM = getNumber("step-m", 5.0);
   const dthetaDeg = getNumber("dtheta", 5.0);
   const modeEl = document.getElementById("mode");

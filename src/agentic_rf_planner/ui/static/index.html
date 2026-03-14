@@ -57,27 +57,21 @@
 
     
     <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
-      <h3 style="font-size: 14px; margin-bottom: 10px;">Enter Coordinates</h3>
+      <h3 style="font-size: 14px; margin-bottom: 10px;">TX Coordinates</h3>
       <form id="coord-form" style="display: flex; flex-direction: column; gap: 8px;">
         <div>
-          <label for="lat-input" style="display: block; font-size: 11px; margin-bottom: 3px;">Latitude:</label>
-          <input 
-            type="number" 
-            id="lat-input" 
-            step="any" 
-            placeholder="37.7749" 
-            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
-          />
-        </div>
-        <div>
-          <label for="lon-input" style="display: block; font-size: 11px; margin-bottom: 3px;">Longitude:</label>
-          <input 
-            type="number" 
-            id="lon-input" 
-            step="any" 
-            placeholder="-122.4194" 
-            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
-          />
+          <label for="tx-input" style="display: block; font-size: 11px; margin-bottom: 3px;">One `lat,lon` per line</label>
+          <textarea
+            id="tx-input"
+            rows="7"
+            spellcheck="false"
+            placeholder="32.756017,-97.083172&#10;32.752995,-97.081749"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px; resize: vertical; font-family: monospace;"
+          ></textarea>
+          <div style="margin-top: 5px; font-size: 10px; color: #aaa;">
+            Paste multiple TX points here. Clicking the map appends another line.
+          </div>
+          <div id="tx-input-summary" style="margin-top: 5px; font-size: 10px; color: #bbb;"></div>
         </div>
         <button 
           type="submit" 
@@ -85,9 +79,165 @@
           onmouseover="this.style.background='#0052a3'"
           onmouseout="this.style.background='#0066cc'"
         >
-          Plan RF
+          Plan RF Queue
         </button>
       </form>
+
+      <details open style="margin-top: 10px;">
+        <summary style="font-size: 12px; color: #ccc;">Advanced RF params</summary>
+        <div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Freq (MHz)</label>
+            <input id="freq-mhz" type="number" step="0.1" value="3500"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">TX power (dBm)</label>
+            <input id="tx-power-dbm" type="number" step="0.1" value="43"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Noise figure (dB)</label>
+            <input id="noise-figure-db" type="number" step="0.1" value="7.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">SCS (kHz)</label>
+            <input id="scs-khz" type="number" step="1" value="30"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">RB</label>
+            <input id="num-rb" type="number" step="1" value="100"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">BW (MHz)</label>
+            <input id="bw-mhz" type="number" step="0.1" value="40"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Electrical tilt (deg)</label>
+            <input id="electrical-tilt-deg" type="number" step="0.1" value="0.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Mechanical tilt (deg)</label>
+            <input id="mechanical-tilt-deg" type="number" step="0.1" value="0.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Vertical BW (deg)</label>
+            <input id="vertical-beamwidth-deg" type="number" step="0.1" value="8.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Max vertical atten. (dB)</label>
+            <input id="max-vertical-atten-db" type="number" step="0.1" value="30.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Path loss model</label>
+            <select id="path-loss-model"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;">
+              <option value="3gpp_38901" selected>3GPP 38.901</option>
+              <option value="legacy">Legacy FSPL + NLOS</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Scenario</label>
+            <select id="propagation-scenario"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;">
+              <option value="umi_street_canyon" selected>UMi street canyon</option>
+              <option value="uma">UMa macro</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Max horizontal atten. (dB)</label>
+            <input id="max-horizontal-atten-db" type="number" step="0.1" value="30.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Front-to-back atten. (dB)</label>
+            <input id="front-to-back-atten-db" type="number" step="0.1" value="25.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Shadow base (dB)</label>
+            <input id="shadow-loss-db" type="number" step="0.1" value="6.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Shadow slope (dB/100m)</label>
+            <input id="shadow-slope-db-per-100m" type="number" step="0.1" value="4.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Shadow cap (dB)</label>
+            <input id="shadow-loss-cap-db" type="number" step="0.1" value="20.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Diffraction base (dB)</label>
+            <input id="diffraction-base-loss-db" type="number" step="0.1" value="6.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Diffraction slope (dB/100m)</label>
+            <input id="diffraction-slope-db-per-100m" type="number" step="0.1" value="3.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Diffraction cap (dB)</label>
+            <input id="diffraction-loss-cap-db" type="number" step="0.1" value="16.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Canyon recovery max (dB)</label>
+            <input id="canyon-recovery-max-db" type="number" step="0.1" value="8.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Canyon recovery slope (dB/100m)</label>
+            <input id="canyon-recovery-slope-db-per-100m" type="number" step="0.1" value="6.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Termination RSRP (dBm)</label>
+            <input id="termination-rsrp-dbm" type="number" step="0.1" value="-140.0"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" />
+          </div>
+          <div style="grid-column: 1 / -1; margin-top: 8px; padding-top: 8px; border-top: 1px solid #333;">
+            <span style="font-size: 10px; color: #888;">Building materials (dB)</span>
+          </div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Concrete</label><input id="bldg-concrete" type="number" step="0.1" value="5.0" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Brick</label><input id="bldg-brick" type="number" step="0.1" value="3.5" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Wood</label><input id="bldg-wood" type="number" step="0.1" value="1.25" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Glass</label><input id="bldg-glass" type="number" step="0.1" value="2.75" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Metal</label><input id="bldg-metal" type="number" step="0.1" value="14.75" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Unknown</label><input id="bldg-unknown" type="number" step="0.1" value="5.0" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Overall scale</label><input id="bldg-scale" type="number" step="0.01" value="0.75" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div><label style="display:block; font-size:10px; color:#ccc;">Overall reduction (dB)</label><input id="bldg-reduction-db" type="number" step="0.1" value="6.0" style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;" /></div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">MIMO mode</label>
+            <select id="mimo-mode"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;">
+              <option value="SISO">SISO</option>
+              <option value="SIMO">SIMO</option>
+              <option value="MISO">MISO</option>
+              <option value="MIMO" selected>MIMO</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block; font-size:10px; color:#ccc;">Link adaptation</label>
+            <select id="link-adapt"
+              style="width:100%; padding:4px; box-sizing:border-box; background:#222; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px;">
+              <option value="1" selected>Enabled</option>
+              <option value="0">Disabled</option>
+            </select>
+          </div>
+        </div>
+      </details>
     </div>
     
     <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
@@ -121,6 +271,15 @@
           <span>Show Sector Overlays</span>
         </label>
       </div>
+      <button 
+        id="export-btn"
+        type="button"
+        style="width: 100%; margin-bottom: 8px; padding: 8px; background: #0066cc; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; font-weight: bold;"
+        onmouseover="this.style.background='#0052a3'"
+        onmouseout="this.style.background='#0066cc'"
+      >
+        Export ZIP
+      </button>
       <button 
         id="clear-map-btn"
         style="width: 100%; padding: 8px; background: #cc0000; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; font-weight: bold;"
@@ -157,6 +316,9 @@
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="/export_utils.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>
