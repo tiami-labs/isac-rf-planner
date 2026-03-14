@@ -14,16 +14,44 @@ let txEntity = null;
 // Keep the selection TX marker (txEntity) separate.
 let planEntities = []; // Cesium.Entity[] (heatmaps, planned TX markers, etc.)
 let planPrimitives = []; // Cesium.Primitive[] / collections
+let rfEntities = []; // RF-only entities (heatmap drapes)
+let rfPrimitives = []; // RF-only primitives (point heatmaps)
 let planCounter = 0;
 
 let sectorEntities = []; // visualization overlays (entities)
+let planResults = []; // { lat, lon, out, cacheCenter } per successful plan (for export)
+
+// Expose for F12 console debugging
+window.RFPLANNER_DEBUG = {
+  get planEntities() { return planEntities; },
+  get rfEntities() { return rfEntities; },
+  get sectorEntities() { return sectorEntities; },
+  get planPrimitives() { return planPrimitives; },
+  get rfPrimitives() { return rfPrimitives; },
+};
+
+let streetLabelEntities = []; // street-name labels
+let streetLabelCache = new Map(); // rounded center/radius -> { center, radiusM, labels }
+let streetLabelRefreshTimer = null;
+let streetLabelRequestSeq = 0;
 let currentTxLocation = null; // {lat, lon}
 let sectorCounter = 0;
 let osmHeatmapMeshCache = new Map(); // key -> { geometry }
 
 // Fixed RSRP scale (used for legend labels / cross-plan comparability).
-const FIXED_RSRP_MIN = -150.0;
-const FIXED_RSRP_MAX = 50.0;
+const FIXED_RSRP_MIN = -140.0;
+const FIXED_RSRP_MAX = -60.0;
+const STREET_LABEL_MAJOR_FAR_M = 32000.0;
+const STREET_LABEL_MINOR_FAR_M = 14000.0;
+const STREET_LABEL_RADIUS_MIN_M = 1500.0;
+const STREET_LABEL_RADIUS_MAX_M = 5000.0;
+const STREET_LABEL_FETCH_DEBOUNCE_MS = 350;
+const STREET_LABEL_MAJOR_SCALE = new Cesium.NearFarScalar(800.0, 1.15, 24000.0, 0.7);
+const STREET_LABEL_MINOR_SCALE = new Cesium.NearFarScalar(400.0, 0.95, 12000.0, 0.65);
+const STREET_LABEL_MAJOR_ALPHA = new Cesium.NearFarScalar(800.0, 1.0, 26000.0, 0.35);
+const STREET_LABEL_MINOR_ALPHA = new Cesium.NearFarScalar(400.0, 1.0, 14000.0, 0.25);
+const MULTI_TX_PULL_DELAY_MS = 1500;
+let isPlanningQueue = false;
 
 // Polygon drawing mode (Cesium)
 let polygonDrawingMode = null; // { sectorId, points:[{lat,lon}], polylineEntity, polygonEntity }
@@ -52,15 +80,500 @@ function getString(id, fallback) {
   return v.length ? v : fallback;
 }
 
+function setInputValue(id, value) {
+  const el = document.getElementById(id);
+  if (el && value != null && value !== "") el.value = String(value);
+}
+
+async function loadRfParamsDefaults() {
+  try {
+    const resp = await fetch("/api/rf-params");
+    if (!resp.ok) return;
+    const cfg = await resp.json();
+    if (!cfg) return;
+    setInputValue("shadow-loss-cap-db", cfg.shadow_loss_cap_db);
+    setInputValue("diffraction-loss-cap-db", cfg.diffraction_loss_cap_db);
+    setInputValue("canyon-recovery-max-db", cfg.canyon_recovery_max_db);
+    setInputValue("canyon-recovery-slope-db-per-100m", cfg.canyon_recovery_slope_db_per_100m);
+    const bldg = cfg.building_attenuation;
+    if (bldg) {
+      const m = bldg.materials;
+      if (m) {
+        setInputValue("bldg-concrete", m.concrete);
+        setInputValue("bldg-brick", m.brick);
+        setInputValue("bldg-wood", m.wood);
+        setInputValue("bldg-glass", m.glass);
+        setInputValue("bldg-metal", m.metal);
+        setInputValue("bldg-unknown", m.unknown);
+      }
+      const o = bldg.overall;
+      if (o) {
+        setInputValue("bldg-scale", o.scale);
+        setInputValue("bldg-reduction-db", o.reduction_db);
+      }
+    }
+  } catch (_) { /* keep HTML defaults */ }
+}
+
+
+async function fetchRayTracePreview(lat, lon, txHeightM, rxHeightM, maxRangeM) {
+  const url = new URL('/api/ray-trace/preview', window.location.origin);
+  url.searchParams.set('tx_lat', String(lat));
+  url.searchParams.set('tx_lon', String(lon));
+  url.searchParams.set('tx_height_m', String(txHeightM));
+  url.searchParams.set('rx_height_m', String(rxHeightM));
+  url.searchParams.set('max_range_m', String(Math.min(maxRangeM, 1500.0)));
+  url.searchParams.set('num_bearings', '24');
+  url.searchParams.set('max_reflections', '1');
+  const resp = await fetch(url.toString());
+  if (!resp.ok) throw new Error(`ray-trace preview failed (${resp.status})`);
+  return await resp.json();
+}
+
+function renderRayTracePreview(preview) {
+  if (!viewer || !preview || !Array.isArray(preview.traces)) return;
+  for (const trace of preview.traces) {
+    const paths = Array.isArray(trace.paths) ? trace.paths : [];
+    for (const path of paths) {
+      const pts = Array.isArray(path.points) ? path.points : [];
+      if (pts.length < 2) continue;
+      const positions = [];
+      for (const p of pts) {
+        positions.push(Cesium.Cartesian3.fromDegrees(p.lon, p.lat, Number.isFinite(p.height_m) ? p.height_m : 0.0));
+      }
+      let material = Cesium.Color.LIME.withAlpha(0.85);
+      let width = 2.0;
+      if (path.path_type === 'reflection') {
+        material = Cesium.Color.CYAN.withAlpha(0.85);
+        width = 1.5;
+      }
+      if (path.blocked) {
+        material = Cesium.Color.RED.withAlpha(0.55);
+        width = 1.0;
+      }
+      const ent = viewer.entities.add({
+        polyline: {
+          positions,
+          width,
+          arcType: Cesium.ArcType.NONE,
+          clampToGround: false,
+          material,
+        }
+      });
+      rfEntities.push(ent);
+    }
+  }
+}
+
+
 function setInput(id, value) {
   const el = document.getElementById(id);
   if (el) el.value = String(value);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function setPlanButtonBusy(busy) {
+  const btn = document.querySelector('#coord-form button[type="submit"]');
+  if (!btn) return;
+  btn.disabled = !!busy;
+  btn.style.opacity = busy ? "0.7" : "1";
+  btn.style.cursor = busy ? "wait" : "pointer";
+}
+
+function formatTxCoordinate(lat, lon) {
+  return `${lat},${lon}`;
+}
+
+function parseTxInput() {
+  const raw = String(document.getElementById("tx-input")?.value || "");
+  const points = [];
+  const errors = [];
+  const lines = raw.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const parts = line.split(",");
+    if (parts.length !== 2) {
+      errors.push(`Line ${i + 1}: expected "lat,lon".`);
+      continue;
+    }
+    const lat = Number.parseFloat(parts[0].trim());
+    const lon = Number.parseFloat(parts[1].trim());
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      errors.push(`Line ${i + 1}: invalid latitude/longitude.`);
+      continue;
+    }
+    if (lat < -90 || lat > 90) {
+      errors.push(`Line ${i + 1}: latitude must be between -90 and 90.`);
+      continue;
+    }
+    if (lon < -180 || lon > 180) {
+      errors.push(`Line ${i + 1}: longitude must be between -180 and 180.`);
+      continue;
+    }
+    points.push({ lat, lon, lineNumber: i + 1 });
+  }
+
+  return { points, errors };
+}
+
+function updateTxInputSummary() {
+  const el = document.getElementById("tx-input-summary");
+  if (!el) return;
+  const { points, errors } = parseTxInput();
+  if (errors.length) {
+    el.textContent = errors.slice(0, 2).join(" ");
+    el.style.color = "#ff9b9b";
+    return;
+  }
+  if (!points.length) {
+    el.textContent = "No TX queued yet.";
+    el.style.color = "#bbb";
+    return;
+  }
+  el.textContent = points.length === 1
+    ? "1 TX queued."
+    : `${points.length} TX points queued. They will run one at a time.`;
+  el.style.color = "#bbb";
+}
+
+function setTxInputPoints(points) {
+  const el = document.getElementById("tx-input");
+  if (!el) return;
+  el.value = points.map((p) => formatTxCoordinate(p.lat, p.lon)).join("\n");
+  updateTxInputSummary();
+}
+
+function appendTxInputPoint(lat, lon) {
+  const parsed = parseTxInput();
+  const points = parsed.points.slice();
+  const exists = points.some((p) => Math.abs(p.lat - lat) < 1e-10 && Math.abs(p.lon - lon) < 1e-10);
+  if (!exists) {
+    points.push({ lat, lon });
+    setTxInputPoints(points);
+    return points.length;
+  }
+  updateTxInputSummary();
+  return points.length;
+}
+
+function getQueuedTxPoints() {
+  const parsed = parseTxInput();
+  if (parsed.errors.length) {
+    setStatus(parsed.errors.slice(0, 3).join("\n"));
+    return null;
+  }
+  if (parsed.points.length) return parsed.points;
+  if (currentTxLocation && Number.isFinite(currentTxLocation.lat) && Number.isFinite(currentTxLocation.lon)) {
+    return [{ lat: currentTxLocation.lat, lon: currentTxLocation.lon, lineNumber: 1 }];
+  }
+  setStatus("Enter one or more TX coordinates or click on the mesh to add them.");
+  return null;
+}
+
+function getLastQueuedTxPoint() {
+  const parsed = parseTxInput();
+  return parsed.points.length ? parsed.points[parsed.points.length - 1] : null;
 }
 
 async function fetchConfig() {
   const r = await fetch("/api/config");
   if (!r.ok) throw new Error(`GET /api/config failed (${r.status})`);
   return await r.json();
+}
+
+function trackRfEntity(ent) {
+  rfEntities.push(ent);
+  planEntities.push(ent);
+  return ent;
+}
+
+function trackRfPrimitive(prim) {
+  rfPrimitives.push(prim);
+  planPrimitives.push(prim);
+  return prim;
+}
+
+function isStreetLabelsEnabled() {
+  return document.getElementById("show-street-labels-toggle")?.checked ?? true;
+}
+
+function clearStreetLabels() {
+  for (const e of streetLabelEntities) {
+    try { viewer.entities.remove(e); } catch {}
+  }
+  streetLabelEntities = [];
+}
+
+function setStreetLabelsVisible(show) {
+  for (const e of streetLabelEntities) {
+    try { e.show = !!show; } catch {}
+  }
+}
+
+function setRfOverlayVisible(show) {
+  for (const e of rfEntities) {
+    try { e.show = !!show; } catch {}
+  }
+  for (const p of rfPrimitives) {
+    try { p.show = !!show; } catch {}
+  }
+}
+
+function getCameraHeightM() {
+  try {
+    return Number(viewer?.camera?.positionCartographic?.height) || 0.0;
+  } catch {}
+  return 0.0;
+}
+
+function getStreetLabelCenterLatLon() {
+  if (currentTxLocation && Number.isFinite(currentTxLocation.lat) && Number.isFinite(currentTxLocation.lon)) {
+    return currentTxLocation;
+  }
+  const queued = getLastQueuedTxPoint();
+  if (queued) {
+    return { lat: queued.lat, lon: queued.lon };
+  }
+  return null;
+}
+
+function getCurrentViewCenterLatLon() {
+  if (!viewer) return null;
+  try {
+    const w = viewer.canvas.clientWidth || viewer.canvas.width;
+    const h = viewer.canvas.clientHeight || viewer.canvas.height;
+    if (w > 0 && h > 0) {
+      const pos = _pickGlobePosition(new Cesium.Cartesian2(Math.round(w / 2), Math.round(h / 2)));
+      if (pos) {
+        const carto = Cesium.Cartographic.fromCartesian(pos);
+        return {
+          lat: Cesium.Math.toDegrees(carto.latitude),
+          lon: Cesium.Math.toDegrees(carto.longitude),
+        };
+      }
+    }
+  } catch {}
+  try {
+    const carto = viewer.camera.positionCartographic;
+    return {
+      lat: Cesium.Math.toDegrees(carto.latitude),
+      lon: Cesium.Math.toDegrees(carto.longitude),
+    };
+  } catch {}
+  return null;
+}
+
+function getStreetLabelRadiusM() {
+  const maxRangeM = getNumber("max-range", 2000.0);
+  return Math.max(
+    STREET_LABEL_RADIUS_MIN_M,
+    Math.min(STREET_LABEL_RADIUS_MAX_M, maxRangeM)
+  );
+}
+
+function buildStreetLabelCacheKey(lat, lon, radiusM) {
+  const latKey = (Math.round(lat * 10000) / 10000).toFixed(4);
+  const lonKey = (Math.round(lon * 10000) / 10000).toFixed(4);
+  const radiusKey = String(Math.round(radiusM / 100) * 100);
+  return `${latKey}:${lonKey}:${radiusKey}`;
+}
+
+function haversineDistanceM(lat1, lon1, lat2, lon2) {
+  const r = 6371000.0;
+  const p1 = Cesium.Math.toRadians(lat1);
+  const p2 = Cesium.Math.toRadians(lat2);
+  const dLat = Cesium.Math.toRadians(lat2 - lat1);
+  const dLon = Cesium.Math.toRadians(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(p1) * Math.cos(p2) * Math.sin(dLon / 2) ** 2;
+  return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function flyToQueuedPoints(queue) {
+  if (!viewer || !queue || queue.length === 0) return;
+  const FLY_TO_NEAR_THRESHOLD_M = 50000; // 50km - if points farther apart, center on first only
+  let maxDist = 0;
+  for (let i = 0; i < queue.length; i++) {
+    for (let j = i + 1; j < queue.length; j++) {
+      const d = haversineDistanceM(queue[i].lat, queue[i].lon, queue[j].lat, queue[j].lon);
+      if (d > maxDist) maxDist = d;
+    }
+  }
+  const p = queue[0];
+  const heightM = getViewModeHeightM("perspective");
+  if (queue.length === 1 || maxDist > FLY_TO_NEAR_THRESHOLD_M) {
+    const destination = Cesium.Cartesian3.fromDegrees(p.lon, p.lat, heightM);
+    viewer.camera.flyTo({
+      destination,
+      orientation: {
+        heading: Cesium.Math.toRadians(0.0),
+        pitch: Cesium.Math.toRadians(-45.0),
+        roll: 0.0,
+      },
+      duration: 0.9,
+    });
+  } else {
+    const west = Math.min(...queue.map(q => q.lon));
+    const south = Math.min(...queue.map(q => q.lat));
+    const east = Math.max(...queue.map(q => q.lon));
+    const north = Math.max(...queue.map(q => q.lat));
+    const paddingDeg = 0.002;
+    const rectangle = Cesium.Rectangle.fromDegrees(
+      west - paddingDeg, south - paddingDeg, east + paddingDeg, north + paddingDeg
+    );
+    let destination;
+    if (typeof viewer.camera.getRectangleCameraCoordinates === "function") {
+      destination = viewer.camera.getRectangleCameraCoordinates(rectangle);
+      viewer.camera.flyTo({ destination, convert: false, duration: 0.9 });
+    } else {
+      destination = Cesium.Cartesian3.fromDegrees((west + east) / 2, (south + north) / 2, heightM);
+      viewer.camera.flyTo({
+        destination,
+        orientation: {
+          heading: Cesium.Math.toRadians(0.0),
+          pitch: Cesium.Math.toRadians(-45.0),
+          roll: 0.0,
+        },
+        duration: 0.9,
+      });
+    }
+  }
+}
+
+function findNearbyStreetLabelCacheEntry(center, radiusM) {
+  let best = null;
+  for (const entry of streetLabelCache.values()) {
+    if (!entry || !entry.center || !Array.isArray(entry.labels)) continue;
+    const distM = haversineDistanceM(
+      center.lat,
+      center.lon,
+      entry.center.lat,
+      entry.center.lon
+    );
+    const reuseThresholdM = Math.max(radiusM, entry.radiusM || 0.0);
+    if (distM > reuseThresholdM) continue;
+    if (!best || distM < best.distM) {
+      best = { entry, distM };
+    }
+  }
+  return best ? best.entry : null;
+}
+
+function renderStreetLabels(labels) {
+  clearStreetLabels();
+  if (!viewer || !Array.isArray(labels) || !labels.length) return;
+
+  for (const item of labels) {
+    const lat = Number(item.anchor_lat);
+    const lon = Number(item.anchor_lon);
+    const name = String(item.name || "").trim();
+    const importance = String(item.importance || "minor");
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !name) continue;
+
+    const isMajor = importance === "major";
+    const far = isMajor ? STREET_LABEL_MAJOR_FAR_M : STREET_LABEL_MINOR_FAR_M;
+    const ent = viewer.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, 8.0),
+      label: {
+        text: name,
+        font: isMajor ? "600 15px sans-serif" : "12px sans-serif",
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK.withAlpha(0.95),
+        outlineWidth: 3,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(isMajor ? 0.28 : 0.22),
+        backgroundPadding: new Cesium.Cartesian2(5, 3),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0.0, far),
+        scaleByDistance: isMajor ? STREET_LABEL_MAJOR_SCALE : STREET_LABEL_MINOR_SCALE,
+        translucencyByDistance: isMajor ? STREET_LABEL_MAJOR_ALPHA : STREET_LABEL_MINOR_ALPHA,
+        pixelOffset: new Cesium.Cartesian2(0, -5),
+      },
+    });
+    streetLabelEntities.push(ent);
+  }
+  setStreetLabelsVisible(isStreetLabelsEnabled());
+}
+
+async function refreshStreetLabels(force = false) {
+  if (!viewer) return;
+  if (!isStreetLabelsEnabled()) {
+    setStreetLabelsVisible(false);
+    return;
+  }
+
+  const center = getStreetLabelCenterLatLon();
+  if (!center || !Number.isFinite(center.lat) || !Number.isFinite(center.lon)) return;
+  const radiusM = getStreetLabelRadiusM();
+  const cacheKey = buildStreetLabelCacheKey(center.lat, center.lon, radiusM);
+
+  if (!force && streetLabelCache.has(cacheKey)) {
+    renderStreetLabels(streetLabelCache.get(cacheKey).labels);
+    return;
+  }
+
+  if (!force) {
+    const nearbyEntry = findNearbyStreetLabelCacheEntry(center, radiusM);
+    if (nearbyEntry) {
+      renderStreetLabels(nearbyEntry.labels);
+      streetLabelCache.set(cacheKey, {
+        center: { lat: center.lat, lon: center.lon },
+        radiusM,
+        labels: nearbyEntry.labels,
+      });
+      if (streetLabelCache.size > 24) {
+        const oldestKey = streetLabelCache.keys().next().value;
+        if (oldestKey) streetLabelCache.delete(oldestKey);
+      }
+      console.debug("Street labels cache hit (nearby TX reuse).");
+      return;
+    }
+  }
+
+  console.debug("Street labels cache miss; fetching labels.");
+  const reqSeq = ++streetLabelRequestSeq;
+  const url = `/api/roads/labels?lat=${encodeURIComponent(center.lat)}`
+    + `&lon=${encodeURIComponent(center.lon)}`
+    + `&radius_m=${encodeURIComponent(radiusM)}`
+    + `&major_limit=60&minor_limit=160`;
+
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`GET ${url} failed (${resp.status})`);
+    const payload = await resp.json();
+    if (reqSeq !== streetLabelRequestSeq) return;
+    const labels = Array.isArray(payload?.labels) ? payload.labels : [];
+    streetLabelCache.set(cacheKey, {
+      center: { lat: center.lat, lon: center.lon },
+      radiusM,
+      labels,
+    });
+    if (streetLabelCache.size > 24) {
+      const oldestKey = streetLabelCache.keys().next().value;
+      if (oldestKey) streetLabelCache.delete(oldestKey);
+    }
+    renderStreetLabels(labels);
+  } catch (err) {
+    console.warn("Street label fetch failed:", err);
+    if (reqSeq === streetLabelRequestSeq) clearStreetLabels();
+  }
+}
+
+function queueStreetLabelRefresh(force = false) {
+  if (streetLabelRefreshTimer) {
+    window.clearTimeout(streetLabelRefreshTimer);
+    streetLabelRefreshTimer = null;
+  }
+  streetLabelRefreshTimer = window.setTimeout(() => {
+    streetLabelRefreshTimer = null;
+    refreshStreetLabels(force);
+  }, STREET_LABEL_FETCH_DEBOUNCE_MS);
 }
 
 function _pickGlobePosition(windowPos) {
@@ -206,15 +719,18 @@ function clearOverlay() {
     try { viewer.entities.remove(e); } catch {}
   }
   planEntities = [];
+  rfEntities = [];
 
   for (const p of planPrimitives) {
     try { viewer.scene.primitives.remove(p); } catch {}
   }
   planPrimitives = [];
+  rfPrimitives = [];
   for (const e of sectorEntities) {
     try { viewer.entities.remove(e); } catch {}
   }
   sectorEntities = [];
+  planResults = [];
 
   planCounter = 0;
 
@@ -309,8 +825,7 @@ function renderGridCoverage(grid) {
   updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, vmin, vmax);
 
   // Point primitives are much faster than entities at this scale.
-  const points = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection());
-  planPrimitives.push(points);
+  const points = trackRfPrimitive(viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection()));
   const disableDepth = Number.POSITIVE_INFINITY;
 
   // Rough visual match to Leaflet circles: many small semi-transparent points.
@@ -350,13 +865,15 @@ async function renderHeatmapDrapeOsm3d(heatmap, grid) {
   const radiusM =
     (heatmap && Number.isFinite(heatmap.radius_m) ? Number(heatmap.radius_m) : NaN) ||
     (grid && grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN) ||
-    getNumber("max-range", 500.0);
+    getNumber("max-range", 2000.0);
 
   if (!Number.isFinite(radiusM) || radiusM <= 0) return;
 
   // Legend: use the fixed scale for consistency, but show actual min/max from the grid if provided.
-  const actualMin = (heatmap && Number.isFinite(heatmap.vmin)) ? Number(heatmap.vmin) : FIXED_RSRP_MIN;
-  const actualMax = (heatmap && Number.isFinite(heatmap.vmax)) ? Number(heatmap.vmax) : FIXED_RSRP_MAX;
+  const actualMin = (heatmap && Number.isFinite(heatmap.actual_min)) ? Number(heatmap.actual_min) :
+    ((heatmap && Number.isFinite(heatmap.vmin)) ? Number(heatmap.vmin) : FIXED_RSRP_MIN);
+  const actualMax = (heatmap && Number.isFinite(heatmap.actual_max)) ? Number(heatmap.actual_max) :
+    ((heatmap && Number.isFinite(heatmap.vmax)) ? Number(heatmap.vmax) : FIXED_RSRP_MAX);
   updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
 
   const imgSrc = heatmap && heatmap.png_b64 ? heatmap.png_b64 : null;
@@ -369,7 +886,7 @@ async function renderHeatmapDrapeOsm3d(heatmap, grid) {
     return;
   }
 
-  const ent = viewer.entities.add({
+  const ent = trackRfEntity(viewer.entities.add({
     position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
     ellipse: {
       semiMajorAxis: radiusM,
@@ -380,8 +897,7 @@ async function renderHeatmapDrapeOsm3d(heatmap, grid) {
       heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
       outline: false,
     },
-  });
-  planEntities.push(ent);
+  }));
 }
 
 function normalizeAngleDeg(a) {
@@ -420,9 +936,9 @@ async function clampToMeshHeights(cartesians, heightOffsetM = 0.5) {
   return out;
 }
 
-// "Fabric" surface rendering for 3D mode:
-// - Uses the same per-cell grid data (no forced circle, preserves missing cells).
-// - Builds a polar mesh (rings x bearings) and drapes it onto the Google mesh using clampToHeightMostDetailed.
+// Legacy 3D renderer that projects the raw polar grid into a canvas on the client.
+// We keep it as a fallback/debug path, but the main 3D renderer now uses the same
+// backend-generated PNG ellipse drape as 3D OSM-only mode for visual consistency.
 async function renderDrapedSurfaceCoverage(grid) {
   // Render coverage as a single textured ellipse (old approach), but rasterized from the
   // current per-cell polar grid output (preserves adaptive ray termination + blocking).
@@ -561,7 +1077,7 @@ async function renderDrapedSurfaceCoverage(grid) {
 
   ctx.putImageData(img, 0, 0);
 
-  const ent = viewer.entities.add({
+  const ent = trackRfEntity(viewer.entities.add({
     position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
     ellipse: {
       semiMajorAxis: radiusM,
@@ -572,8 +1088,7 @@ async function renderDrapedSurfaceCoverage(grid) {
       heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
       outline: false,
     },
-  });
-  planEntities.push(ent);
+  }));
 }
 
 function addSectorUI() {
@@ -645,6 +1160,43 @@ function addSectorUI() {
           style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
       </div>
     </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:10px; margin-top:6px;">
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Azimuth (deg, optional):</label>
+        <input type="number" class="sector-azimuth" step="0.1" min="0" max="360" placeholder="auto"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Horiz BW (deg, optional):</label>
+        <input type="number" class="sector-beamwidth-h" step="0.1" min="1" max="360" placeholder="auto"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Vert BW (deg)</label>
+        <input type="number" class="sector-beamwidth-v" step="0.1" min="0.1" max="180" value="8.0"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Elec tilt (deg)</label>
+        <input type="number" class="sector-electrical-tilt" step="0.1" value="0.0"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Mech tilt (deg)</label>
+        <input type="number" class="sector-mechanical-tilt" step="0.1" value="0.0"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Max horiz atten. (dB)</label>
+        <input type="number" class="sector-max-horizontal-atten" step="0.1" value="30.0"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Front-to-back (dB)</label>
+        <input type="number" class="sector-front-to-back-atten" step="0.1" value="25.0"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+    </div>
   `;
 
   container.appendChild(sectorDiv);
@@ -693,6 +1245,20 @@ function collectSectorConfigs() {
       tx_power_dbm: power,
       channel_bandwidth_mhz: getNumber("bw-mhz", 20.0),
     };
+    const azimuth = parseFloat(div.querySelector(".sector-azimuth").value);
+    const beamwidthH = parseFloat(div.querySelector(".sector-beamwidth-h").value);
+    const beamwidthV = parseFloat(div.querySelector(".sector-beamwidth-v").value);
+    const electricalTilt = parseFloat(div.querySelector(".sector-electrical-tilt").value);
+    const mechanicalTilt = parseFloat(div.querySelector(".sector-mechanical-tilt").value);
+    const maxHorizontalAtten = parseFloat(div.querySelector(".sector-max-horizontal-atten").value);
+    const frontToBackAtten = parseFloat(div.querySelector(".sector-front-to-back-atten").value);
+    if (Number.isFinite(azimuth)) sectorConfig.azimuth_deg = azimuth;
+    if (Number.isFinite(beamwidthH)) sectorConfig.beamwidth_h_deg = beamwidthH;
+    if (Number.isFinite(beamwidthV)) sectorConfig.beamwidth_v_deg = beamwidthV;
+    if (Number.isFinite(electricalTilt)) sectorConfig.electrical_tilt_deg = electricalTilt;
+    if (Number.isFinite(mechanicalTilt)) sectorConfig.mechanical_tilt_deg = mechanicalTilt;
+    if (Number.isFinite(maxHorizontalAtten)) sectorConfig.max_horizontal_attenuation_db = maxHorizontalAtten;
+    if (Number.isFinite(frontToBackAtten)) sectorConfig.front_to_back_attenuation_db = frontToBackAtten;
 
     if (sectorType === "360") {
       sectors.push(sectorConfig);
@@ -715,7 +1281,7 @@ function collectSectorConfigs() {
       try {
         const polygonPoints = JSON.parse(polygonPointsData);
         if (Array.isArray(polygonPoints) && polygonPoints.length >= 2) {
-          sectorConfig.polygon_points = polygonPoints;
+          sectorConfig.polygon_points = polygonPoints.map((p) => Array.isArray(p) ? p : [p.lat, p.lon]);
           sectors.push(sectorConfig);
         }
       } catch {
@@ -826,7 +1392,7 @@ function finishPolygonDrawing() {
   sectorDiv.querySelector(".finish-polygon-btn").style.display = "none";
 
   stopPolygonDrawing();
-  setStatus("Polygon sector saved. Click Plan RF.");
+  setStatus("Polygon sector saved. Click Plan RF Queue.");
 }
 
 function addPolygonVertex(lat, lon) {
@@ -848,6 +1414,225 @@ function toggleSectorVisibility(show) {
   }
 }
 
+function getPreferredViewCenter() {
+  return getCurrentViewCenterLatLon()
+    || currentTxLocation
+    || getLastQueuedTxPoint()
+    || { lat: 37.7749, lon: -122.4194 };
+}
+
+function getViewModeHeightM(mode) {
+  const radiusM = getNumber("max-range", 2000.0);
+  const baseHeight = mode === "birdseye" ? radiusM * 2.2 : radiusM * 1.4;
+  return Math.max(mode === "birdseye" ? 1400.0 : 1000.0, baseHeight);
+}
+
+function applyViewMode(mode, { animate = true } = {}) {
+  if (!viewer) return;
+  const center = getPreferredViewCenter();
+  if (!center || !Number.isFinite(center.lat) || !Number.isFinite(center.lon)) return;
+
+  const pitchDeg = mode === "birdseye" ? -89.0 : -45.0;
+  const orientation = {
+    heading: Number.isFinite(viewer.camera.heading) ? viewer.camera.heading : Cesium.Math.toRadians(0.0),
+    pitch: Cesium.Math.toRadians(pitchDeg),
+    roll: 0.0,
+  };
+  const destination = Cesium.Cartesian3.fromDegrees(center.lon, center.lat, getViewModeHeightM(mode));
+
+  if (animate) {
+    viewer.camera.flyTo({ destination, orientation, duration: 0.9 });
+  } else {
+    viewer.camera.setView({ destination, orientation });
+  }
+}
+
+function getAttributionText() {
+  const candidates = [
+    viewer?.bottomContainer,
+    document.querySelector(".cesium-viewer-bottom"),
+    document.querySelector(".cesium-credit-textContainer"),
+  ];
+  for (const node of candidates) {
+    const text = String(node?.innerText || "").replace(/\s+/g, " ").trim();
+    if (text) return text;
+  }
+  return "Google Maps and Cesium attribution required.";
+}
+
+function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  let line = "";
+  let lineCount = 0;
+  for (const word of words) {
+    const testLine = line ? `${line} ${word}` : word;
+    if (ctx.measureText(testLine).width > maxWidth && line) {
+      ctx.fillText(line, x, y + lineCount * lineHeight);
+      line = word;
+      lineCount += 1;
+    } else {
+      line = testLine;
+    }
+  }
+  if (line) {
+    ctx.fillText(line, x, y + lineCount * lineHeight);
+    lineCount += 1;
+  }
+  return lineCount;
+}
+
+function waitForNextFrame() {
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+function restoreRfVisibility(entityStates, primitiveStates) {
+  for (let i = 0; i < rfEntities.length; i++) {
+    if (entityStates[i] == null) continue;
+    try { rfEntities[i].show = entityStates[i]; } catch {}
+  }
+  for (let i = 0; i < rfPrimitives.length; i++) {
+    if (primitiveStates[i] == null) continue;
+    try { rfPrimitives[i].show = primitiveStates[i]; } catch {}
+  }
+}
+
+function collectRoadNamesFromCache() {
+  const roadNames = [];
+  const seen = new Set();
+  for (const entry of streetLabelCache.values()) {
+    if (!entry || !Array.isArray(entry.labels)) continue;
+    for (const item of entry.labels) {
+      const name = String(item.name || "").trim();
+      const lat = Number(item.anchor_lat);
+      const lon = Number(item.anchor_lon);
+      const importance = String(item.importance || "minor");
+      if (!name || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      const key = `${name}|${lat}|${lon}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      roadNames.push({ name, lat, lon, importance });
+    }
+  }
+  return roadNames;
+}
+
+function getViewState() {
+  if (!viewer || !viewer.camera) return {};
+  try {
+    const pos = viewer.camera.positionCartographic;
+    if (!pos) return {};
+    return {
+      center_lat: Cesium.Math.toDegrees(pos.latitude),
+      center_lon: Cesium.Math.toDegrees(pos.longitude),
+      height_m: pos.height,
+      heading_deg: Cesium.Math.toDegrees(viewer.camera.heading),
+      pitch_deg: Cesium.Math.toDegrees(viewer.camera.pitch),
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function captureViewBlob(includeRf) {
+  const entityStates = rfEntities.map((e) => (e?.show ?? true));
+  const primitiveStates = rfPrimitives.map((p) => (p?.show ?? true));
+  try {
+    if (!includeRf) setRfOverlayVisible(false);
+    viewer.scene.requestRender();
+    await waitForNextFrame();
+    await waitForNextFrame();
+    const sceneUrl = viewer.scene.canvas.toDataURL("image/png");
+    const sceneImage = await loadImage(sceneUrl);
+    const footerHeight = 54;
+    const out = document.createElement("canvas");
+    out.width = sceneImage.width;
+    out.height = sceneImage.height + footerHeight;
+    const ctx = out.getContext("2d");
+    ctx.drawImage(sceneImage, 0, 0);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.92)";
+    ctx.fillRect(0, sceneImage.height, out.width, footerHeight);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillText(
+      includeRf ? "3D RF Planner export: with RF overlay" : "3D RF Planner export: without RF overlay",
+      12,
+      sceneImage.height + 18
+    );
+    ctx.font = "11px sans-serif";
+    wrapCanvasText(ctx, getAttributionText(), 12, sceneImage.height + 36, out.width - 24, 13);
+    return await new Promise((res, rej) => {
+      out.toBlob((b) => (b ? res(b) : rej(new Error("toBlob failed"))), "image/png");
+    });
+  } finally {
+    restoreRfVisibility(entityStates, primitiveStates);
+    viewer.scene.requestRender();
+  }
+}
+
+async function exportCurrentView() {
+  if (!viewer) return;
+
+  try {
+    setStatus("Exporting (capturing with RF)...");
+    const fullViewWithRf = await captureViewBlob(true);
+    setStatus("Exporting (capturing without RF)...");
+    const fullViewWithoutRf = await captureViewBlob(false);
+
+    const heatmapBlobs = [];
+    if (window.RFExportUtils && planResults.length) {
+      for (const pr of planResults) {
+        const pngB64 = pr.out?.heatmap?.png_b64;
+        if (pngB64) {
+          const blob = window.RFExportUtils.base64DataUrlToBlob(pngB64);
+          heatmapBlobs.push(blob);
+        } else {
+          heatmapBlobs.push(null);
+        }
+      }
+    }
+
+    const roadNames = collectRoadNamesFromCache();
+    const metadata = window.RFExportUtils
+      ? window.RFExportUtils.buildExportMetadata(planResults, {
+          plannerVersion: "3d",
+          viewState: getViewState(),
+          roadNames,
+        })
+      : { plans: [], road_names: roadNames };
+
+    const ts = new Date();
+    const filename = `rf_planner_export_${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, "0")}-${String(ts.getDate()).padStart(2, "0")}_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}.zip`;
+
+    const extraBlobs = { "full_view_without_rf.png": fullViewWithoutRf };
+
+    if (window.RFExportUtils && typeof JSZip !== "undefined") {
+      await window.RFExportUtils.createExportZip(fullViewWithRf, heatmapBlobs, metadata, filename, extraBlobs);
+      setStatus("Exported ZIP with full views (with/without RF), heatmap overlays, and metadata.");
+    } else {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(fullViewWithRf);
+      a.download = "rf_planner_3d_with_rf.png";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
+      setStatus("Exported 3D map with RF overlay.");
+    }
+  } catch (err) {
+    console.error("3D export failed:", err);
+    setStatus(`Export failed: ${err}`);
+  }
+}
+
 function clearMap() {
   clearOverlay();
   // Keep TX marker but clear heatmap + sector overlays
@@ -858,6 +1643,13 @@ function clearMap() {
 function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
   const show = document.getElementById("show-sectors-toggle")?.checked ?? true;
   if (!show) return;
+
+  // Clear only sector overlays (white semi-transparent circles) before drawing new ones.
+  // Keeps heatmaps from previous plans in the batch; prevents sector overlay stacking.
+  for (const e of sectorEntities) {
+    try { viewer.entities.remove(e); } catch {}
+  }
+  sectorEntities = [];
 
   // Quick polar-to-latlon helper
   const earth = 6371000.0;
@@ -879,7 +1671,9 @@ function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
     if (s.sector_type === "polygon" && Array.isArray(s.polygon_points) && s.polygon_points.length >= 2) {
       const coords = [
         Cesium.Cartesian3.fromDegrees(txLon, txLat, 5.0),
-        ...s.polygon_points.map(p => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 5.0)),
+        ...s.polygon_points.map((p) => Array.isArray(p)
+          ? Cesium.Cartesian3.fromDegrees(p[1], p[0], 5.0)
+          : Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 5.0)),
       ];
       const poly = viewer.entities.add({
         polygon: {
@@ -920,7 +1714,7 @@ function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
 async function ensureProfiles(txLat, txLon) {
   const txHeightM = getNumber("tx-height-m", 10.0);
   const rxHeightM = getNumber("rx-height-m", 1.5);
-  const maxRangeM = getNumber("max-range", 500.0);
+  const maxRangeM = getNumber("max-range", 2000.0);
   const drM = getNumber("dr-m", 5.0);
   const dthetaDeg = getNumber("dtheta", 5.0);
 
@@ -955,61 +1749,91 @@ async function ensureProfiles(txLat, txLon) {
   return { exists: true, key: null };
 }
 
-async function runPlan() {
-  // Prefer current TX if set by clicking mesh; otherwise use input boxes.
-  let lat = getNumber("lat-input", NaN);
-  let lon = getNumber("lon-input", NaN);
-  if ((!Number.isFinite(lat) || !Number.isFinite(lon)) && currentTxLocation) {
-    lat = currentTxLocation.lat;
-    lon = currentTxLocation.lon;
-  }
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    setStatus("Enter coordinates or click on the mesh to set TX.");
-    return;
-  }
-
-  const rayMode = getString("ray-mode", "3d").toLowerCase();
-  const txHeightM = getNumber("tx-height-m", 10.0);
-  const rxHeightM = getNumber("rx-height-m", 1.5);
-
-  const sectors = collectSectorConfigs();
-
-  // Auto-provision 3D mesh profiles from the main UI if needed.
-  if (rayMode === "3d") {
-    try {
-      setStatus("3D: checking cached ray profiles…");
-      await ensureProfiles(lat, lon);
-    } catch (e) {
-      setStatus(`3D: failed to build mesh profiles.\n\n${e}`);
-      return;
-    }
-  }
-
-  setStatus("Running RF planning…");
-
-  const body = {
+function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) {
+  return {
     lat,
     lon,
     freq_mhz: getNumber("freq-mhz", 3500.0),
     tx_power_dbm: getNumber("tx-power-dbm", 43.0),
     noise_figure_db: getNumber("noise-figure-db", 7.0),
-    subcarrier_spacing_khz: getNumber("scs-khz", 15.0),
+    subcarrier_spacing_khz: getNumber("scs-khz", 30.0),
     num_resource_blocks: Math.round(getNumber("num-rb", 100)),
-    channel_bandwidth_mhz: getNumber("bw-mhz", 20.0),
-    mimo_mode: getString("mimo-mode", "SISO"),
+    channel_bandwidth_mhz: getNumber("bw-mhz", 40.0),
+    mimo_mode: getString("mimo-mode", "MIMO"),
     enable_link_adaptation: getString("link-adapt", "1") === "1",
     fixed_modulation: null,
+    electrical_tilt_deg: getNumber("electrical-tilt-deg", 0.0),
+    mechanical_tilt_deg: getNumber("mechanical-tilt-deg", 0.0),
+    vertical_beamwidth_deg: getNumber("vertical-beamwidth-deg", 8.0),
+    max_vertical_attenuation_db: getNumber("max-vertical-atten-db", 30.0),
+    path_loss_model: getString("path-loss-model", "3gpp_38901"),
+    propagation_scenario: getString("propagation-scenario", "umi_street_canyon"),
+    max_horizontal_attenuation_db: getNumber("max-horizontal-atten-db", 30.0),
+    front_to_back_attenuation_db: getNumber("front-to-back-atten-db", 25.0),
+    shadow_loss_db: getNumber("shadow-loss-db", 6.0),
+    shadow_decay_db_per_100m: getNumber("shadow-slope-db-per-100m", 4.0),
+    diffraction_base_loss_db: getNumber("diffraction-base-loss-db", 6.0),
+    diffraction_slope_db_per_100m: getNumber("diffraction-slope-db-per-100m", 3.0),
+    canyon_recovery_max_db: getNumber("canyon-recovery-max-db", 8.0),
+    canyon_recovery_slope_db_per_100m: getNumber("canyon-recovery-slope-db-per-100m", 6.0),
+    termination_rsrp_dbm: getNumber("termination-rsrp-dbm", -140.0),
+    shadow_loss_cap_db: getNumber("shadow-loss-cap-db", 20.0),
+    diffraction_loss_cap_db: getNumber("diffraction-loss-cap-db", 16.0),
+    building_attenuation: {
+      materials: {
+        concrete: getNumber("bldg-concrete", 5.0),
+        brick: getNumber("bldg-brick", 3.5),
+        wood: getNumber("bldg-wood", 1.25),
+        glass: getNumber("bldg-glass", 2.75),
+        metal: getNumber("bldg-metal", 14.75),
+        unknown: getNumber("bldg-unknown", 5.0),
+      },
+      overall: {
+        scale: getNumber("bldg-scale", 0.75),
+        reduction_db: getNumber("bldg-reduction-db", 6.0),
+      },
+    },
     sectors: sectors.length ? sectors : null,
     ray_mode: rayMode,
     tx_height_m: txHeightM,
     rx_height_m: rxHeightM,
 
     // Coverage/grid overrides (must stay in sync with 3D mesh-profile params)
-    max_range_m: getNumber("max-range", 500.0),
+    max_range_m: getNumber("max-range", 2000.0),
     step_m: getNumber("dr-m", 5.0),
     dtheta_deg: getNumber("dtheta", 5.0),
   };
+}
+
+async function runPlanForTx(lat, lon, {
+  queueIndex = 1,
+  total = 1,
+  attempt = 1,
+  refreshStreetLabelsOnSuccess = true,
+} = {}) {
+  const rayMode = getString("ray-mode", "3d").toLowerCase();
+  const txHeightM = getNumber("tx-height-m", 10.0);
+  const rxHeightM = getNumber("rx-height-m", 1.5);
+  const sectors = collectSectorConfigs();
+  const prefix = total > 1 ? `TX ${queueIndex}/${total}` : "TX";
+  const attemptText = attempt > 1 ? ` (retry ${attempt - 1})` : "";
+
+  currentTxLocation = { lat, lon };
+  updateTxMarker(lat, lon);
+
+  if (rayMode === "3d") {
+    try {
+      setStatus(`${prefix}${attemptText}: checking cached 3D ray profiles…`);
+      await ensureProfiles(lat, lon);
+    } catch (e) {
+      setStatus(`${prefix}${attemptText}: failed to build mesh profiles.\n\n${e}`);
+      return { ok: false, error: String(e), cacheCenter: { lat, lon } };
+    }
+  }
+
+  setStatus(`${prefix}${attemptText}: running RF planning…`);
+
+  const body = buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors);
 
   let resp;
   try {
@@ -1019,8 +1843,9 @@ async function runPlan() {
       body: JSON.stringify(body),
     });
   } catch (e) {
-    setStatus(`/api/plan request failed: ${e}`);
-    return;
+    const error = `/api/plan request failed: ${e}`;
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
   }
 
   const text = await resp.text();
@@ -1028,48 +1853,61 @@ async function runPlan() {
     try {
       const j = JSON.parse(text);
       if (resp.status === 409 && j && j.status === "missing_mesh_profiles") {
-        setStatus("3D: missing profiles (server). Retrying after generating…");
+        setStatus(`${prefix}${attemptText}: missing profiles on server. Retrying after generating…`);
         await ensureProfiles(lat, lon);
-        return await runPlan();
+        return await runPlanForTx(lat, lon, {
+          queueIndex,
+          total,
+          attempt: attempt + 1,
+          refreshStreetLabelsOnSuccess,
+        });
       }
     } catch {
       // ignore JSON parse error
     }
-    setStatus(`/api/plan failed (${resp.status}):\n${text}`);
-    return;
+    const error = `/api/plan failed (${resp.status}):\n${text}`;
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
   }
 
   let out;
   try {
     out = JSON.parse(text);
   } catch (e) {
-    setStatus(`Invalid JSON from /api/plan: ${e}`);
-    return;
+    const error = `Invalid JSON from /api/plan: ${e}`;
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
   }
 
   // Update TX marker to snapped point (backend always snaps today).
   if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
+    currentTxLocation = { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon };
     updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
     addPlannedTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
   } else {
+    currentTxLocation = { lat, lon };
     updateTxMarker(lat, lon);
     addPlannedTxMarker(lat, lon);
   }
 
   // Coverage rendering:
   // - 2D mode: point grid (legacy)
-  // - 3D mode: draped "fabric" surface over the Google mesh, using the same per-cell grid
-  //   (no forced circle, no interpolation), preserving missing cells.
+  // - 3D modes: backend-generated PNG ellipse drape for consistent visual rendering
+  //   across OSM-only and Google-mesh propagation.
   if (out.grid) {
     if (rayMode === "3d") {
-      try {
-        await renderDrapedSurfaceCoverage(out.grid);
-      } catch (e) {
-        // Fallback to point grid if draping fails (e.g., mesh clamp unavailable).
-        console.warn("Surface drape failed, falling back to point grid:", e);
-        renderGridCoverage(out.grid);
+      if (out.heatmap) {
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
+      } else {
+        try {
+          await renderDrapedSurfaceCoverage(out.grid);
+        } catch (e) {
+          // Fallback to point grid if draping fails or the PNG payload is unavailable.
+          console.warn("Surface drape failed, falling back to point grid:", e);
+          renderGridCoverage(out.grid);
+        }
       }
-    } else if (rayMode === "3d_osm") {
+    } else if (rayMode === "3d_osm" || rayMode === "3d_ray_trace") {
       if (out.heatmap) {
         await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
       } else {
@@ -1080,14 +1918,104 @@ async function runPlan() {
     }
   }
 
+  // Ray-trace overlay preview for the dedicated 3D OSM + ray-trace mode.
+  const radiusM = getNumber("max-range", 2000.0);
+  if (rayMode === "3d_ray_trace") {
+    try {
+      const preview = await fetchRayTracePreview(currentTxLocation.lat, currentTxLocation.lon, txHeightM, rxHeightM, radiusM);
+      renderRayTracePreview(preview);
+    } catch (e) {
+      console.warn("ray-trace preview render failed:", e);
+    }
+  }
+
   // Sector overlays: approximate radius from profile params (matches circular heatmap intent).
-  const radiusM = getNumber("max-range", 500.0);
   if (out.sectors && out.snapped_tx) {
     drawSectorOverlays(out.sectors, out.snapped_tx.lat, out.snapped_tx.lon, radiusM);
   }
 
   const key = out.mesh_profile_key ? `\nmesh_key=${out.mesh_profile_key}` : "";
-  setStatus(`Plan complete.${key}`);
+  if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
+  setStatus(`${prefix}${attemptText}: plan complete.${key}`);
+  const cacheCenter = (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon))
+    ? { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon }
+    : { lat, lon };
+  return { ok: true, out, cacheCenter };
+}
+
+async function runPlan() {
+  if (isPlanningQueue) return;
+  const queue = getQueuedTxPoints();
+  if (!queue || !queue.length) return;
+
+  flyToQueuedPoints(queue);
+
+  planResults = [];
+  isPlanningQueue = true;
+  setPlanButtonBusy(true);
+
+  const successes = [];
+  const failed = [];
+  const retryRadiusM = getNumber("max-range", 2000.0);
+
+  try {
+    for (let i = 0; i < queue.length; i++) {
+      const point = queue[i];
+      const result = await runPlanForTx(point.lat, point.lon, {
+        queueIndex: i + 1,
+        total: queue.length,
+        refreshStreetLabelsOnSuccess: false,
+      });
+      if (result?.ok) {
+        successes.push(result.cacheCenter);
+        planResults.push({ lat: point.lat, lon: point.lon, out: result.out, cacheCenter: result.cacheCenter });
+      } else {
+        failed.push(point);
+      }
+
+      if (i < queue.length - 1) {
+        setStatus(`TX ${i + 1}/${queue.length}: processed. Waiting ${Math.round(MULTI_TX_PULL_DELAY_MS / 1000)}s before next pull…`);
+        await sleep(MULTI_TX_PULL_DELAY_MS);
+      }
+    }
+
+    const retryable = failed.filter((point) =>
+      successes.some((success) => haversineDistanceM(point.lat, point.lon, success.lat, success.lon) <= retryRadiusM)
+    );
+
+    let retriedSuccesses = 0;
+    for (let i = 0; i < retryable.length; i++) {
+      const point = retryable[i];
+      setStatus(`Retrying ${i + 1}/${retryable.length} near a successful TX so cached OSM data can be reused…`);
+      await sleep(MULTI_TX_PULL_DELAY_MS);
+      const retryResult = await runPlanForTx(point.lat, point.lon, {
+        queueIndex: i + 1,
+        total: retryable.length,
+        attempt: 2,
+        refreshStreetLabelsOnSuccess: false,
+      });
+      if (retryResult?.ok) {
+        retriedSuccesses += 1;
+        successes.push(retryResult.cacheCenter);
+        planResults.push({ lat: point.lat, lon: point.lon, out: retryResult.out, cacheCenter: retryResult.cacheCenter });
+      }
+    }
+
+    if (successes.length) queueStreetLabelRefresh(true);
+
+    const totalSuccess = successes.length;
+    const totalFailed = Math.max(0, failed.length - retriedSuccesses);
+    if (totalSuccess && totalFailed) {
+      setStatus(`Batch complete: ${totalSuccess}/${queue.length} TX succeeded, ${totalFailed} failed.`);
+    } else if (totalSuccess) {
+      setStatus(`Batch complete: all ${totalSuccess} TX points succeeded.`);
+    } else {
+      setStatus("Batch failed: no TX points completed successfully.");
+    }
+  } finally {
+    isPlanningQueue = false;
+    setPlanButtonBusy(false);
+  }
 }
 
 async function init() {
@@ -1131,8 +2059,9 @@ async function init() {
 
   // Start zoomed-in to the default coordinate (matches 2D UX).
   try {
-    const lat0 = getNumber("lat-input", 37.7749);
-    const lon0 = getNumber("lon-input", -122.4194);
+    const initialTx = getLastQueuedTxPoint() || { lat: 37.7749, lon: -122.4194 };
+    const lat0 = initialTx.lat;
+    const lon0 = initialTx.lon;
     viewer.camera.setView({
       destination: Cesium.Cartesian3.fromDegrees(lon0, lat0, 1200.0),
       orientation: {
@@ -1142,6 +2071,10 @@ async function init() {
       },
     });
   } catch {}
+
+  viewer.camera.moveEnd.addEventListener(() => {
+    if (!currentTxLocation) queueStreetLabelRefresh(false);
+  });
 
   viewer.screenSpaceEventHandler.setInputAction((click) => {
     const cartesian = viewer.scene.pickPosition(click.position);
@@ -1157,10 +2090,10 @@ async function init() {
     }
 
     currentTxLocation = { lat, lon };
-    setInput("lat-input", lat.toFixed(6));
-    setInput("lon-input", lon.toFixed(6));
+    const queueCount = appendTxInputPoint(lat, lon);
     updateTxMarker(lat, lon);
-    setStatus(`TX set:\n  lat=${lat.toFixed(6)}\n  lon=${lon.toFixed(6)}\n\nClick Plan RF.`);
+    queueStreetLabelRefresh(true);
+    setStatus(`TX added (${queueCount} queued):\n  lat=${lat}\n  lon=${lon}\n\nClick Plan RF Queue.`);
   }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
   // Wire UI
@@ -1168,12 +2101,27 @@ async function init() {
     e.preventDefault();
     await runPlan();
   });
+  document.getElementById("tx-input")?.addEventListener("input", updateTxInputSummary);
 
   document.getElementById("add-sector-btn").addEventListener("click", () => addSectorUI());
+  document.getElementById("view-mode-select").addEventListener("change", (e) => {
+    applyViewMode(String(e.target.value || "perspective"));
+  });
+  document.getElementById("show-street-labels-toggle").addEventListener("change", (e) => {
+    if (e.target.checked) {
+      queueStreetLabelRefresh(true);
+    } else {
+      setStreetLabelsVisible(false);
+    }
+  });
   document.getElementById("show-sectors-toggle").addEventListener("change", (e) => toggleSectorVisibility(e.target.checked));
+  document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
   document.getElementById("clear-map-btn").addEventListener("click", () => clearMap());
 
-  setStatus("Click on the 3D mesh to set TX, then click Plan RF.");
+  await loadRfParamsDefaults();
+  updateTxInputSummary();
+  queueStreetLabelRefresh(true);
+  setStatus("Paste one or more TX coordinates, or click on the 3D mesh to append them, then click Plan RF Queue.");
 }
 
 init().catch((e) => setStatus(`Init failed:\n${e}`));
