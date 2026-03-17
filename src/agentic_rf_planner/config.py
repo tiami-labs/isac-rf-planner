@@ -14,12 +14,36 @@ def load_yaml(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _find_rf_config_path(rf_config_path: str) -> Optional[Path]:
+    """Resolve rf.params.yaml from cwd, package location, or parent dirs."""
+    path = Path(rf_config_path)
+    if path.is_absolute() and path.exists():
+        return path
+    # Try cwd
+    cand = Path.cwd() / path
+    if cand.exists():
+        return cand
+    # Try relative to package: walk up from agentic_rf_planner/ to find project root (has configs/)
+    try:
+        import agentic_rf_planner
+        current = Path(agentic_rf_planner.__file__).resolve().parent
+        for _ in range(5):
+            cand = current / path
+            if cand.exists():
+                return cand
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    except Exception:
+        pass
+    return None
+
+
 def load_rf_config(rf_config_path: str = "configs/rf.params.yaml") -> Dict[str, Any]:
     """Load RF params config only (for API etc. when full config not needed)."""
-    path = Path(rf_config_path)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    if not path.exists():
+    path = _find_rf_config_path(rf_config_path)
+    if path is None:
         return {}
     return load_yaml(path)
 
