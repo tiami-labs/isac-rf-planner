@@ -116,9 +116,71 @@ def build_coverage_grid(
     # Storing per-cell building lists is expensive and unnecessary for that mode.
     ray_mode_eff = str(getattr(rf_params, "ray_mode", "") or "").strip().lower()
 
+    # 3D multipath ray tracing mode (single-bounce reflections).
+    multipath_enabled = ray_mode_eff in ("3d_rt", "3d-rt", "rt3d", "3d_raytrace", "raytrace")
+    osm_provider_for_rt = None
+    if multipath_enabled and map_provider is not None:
+        try:
+            from .osm_map_provider import OSMMapProvider
+
+            if isinstance(map_provider, OSMMapProvider):
+                osm_provider_for_rt = map_provider
+            else:
+                osm_provider_for_rt = getattr(map_provider, "osm", None)
+        except Exception:
+            osm_provider_for_rt = getattr(map_provider, "osm", None)
+    if multipath_enabled and osm_provider_for_rt is None:
+        logger.warning("Multipath ray tracing requested but no OSM geometry provider available; disabling multipath")
+        multipath_enabled = False
+
+    if multipath_enabled:
+        # Imports only when needed.
+        from .spatial_index import BoundingBox
+        from ..rf.ray_tracing import compute_single_bounce_paths, extract_wall_segments
+
+        def _bbox_around_point_m(lat: float, lon: float, r_m: float) -> BoundingBox:
+            # Approx meters->degrees.
+            dlat = r_m / 111000.0
+            dlon = r_m / (111000.0 * max(math.cos(math.radians(lat)), 1e-6))
+            return BoundingBox(lat - dlat, lat + dlat, lon - dlon, lon + dlon)
+
+        # Cache handle(s) for faster reflection candidate gathering.
+        rt_qt = getattr(osm_provider_for_rt, "_building_quadtree", None)
+        rt_by_id = getattr(osm_provider_for_rt, "_building_by_id", None)
+        rt_cached_buildings = getattr(osm_provider_for_rt, "_cached_buildings", None) or []
+
+        def _nearby_buildings_for_reflection(p: LatLon, radius_m: float) -> list[dict]:
+            # Prefer quadtree for locality. Fallback to cached list.
+            if rt_qt is not None and rt_by_id is not None:
+                ids = rt_qt.query_bbox(_bbox_around_point_m(p.lat, p.lon, radius_m))
+                out = []
+                for bid in ids:
+                    b = rt_by_id.get(bid)
+                    if b is not None:
+                        out.append(b)
+                return out
+            # Worst-case fallback.
+            return list(rt_cached_buildings)
+
+        def _is_path_clear_osm(p0: LatLon, p1: LatLon, exclude_building_id: int | None) -> bool:
+            try:
+                hits = osm_provider_for_rt.get_buildings_along_ray(p0, p1)
+            except Exception:
+                return True
+            for b in hits:
+                bid = b.get("id")
+                try:
+                    bid_int = int(bid) if bid is not None else None
+                except Exception:
+                    bid_int = None
+                if exclude_building_id is not None and bid_int == exclude_building_id:
+                    continue
+                return False
+            return True
+
     # Adaptive dtheta for 3D OSM-only mode:
     # target arc-length ~= 4*dr (clamped) at max range.
-    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
+    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
         target_arc_m = max(12.0, min(30.0, 4.0 * dr))
         dtheta_target = math.degrees(target_arc_m / max(1.0, max_r))
         dtheta = max(0.25, min(dtheta_user, dtheta_target))
@@ -134,7 +196,7 @@ def build_coverage_grid(
     else:
         dtheta = dtheta_user
 
-    store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace")
+    store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
 
 # Generate cells for each sector
     # For each sector, iterate through angles covered by that sector
@@ -487,11 +549,88 @@ def build_coverage_grid(
                         + vertical_pattern_loss_db
                     )
 
+                    # UE gain (used in attenuation_grid). Include it here so termination is consistent.
+                    rx_combining_gain_db = float(getattr(rf_params, "ue_antenna_gain_dbi", 0.0) or 0.0)
+                    estimated_rsrp += rx_combining_gain_db
+
+                    estimated_rsrp_total = estimated_rsrp
+                    mp_is_reflect = False
+                    if multipath_enabled:
+                        # Compute single-bounce reflections from nearby building walls.
+                        rx_ll = LatLon(lat=lat, lon=lon)
+                        nearby_buildings = _nearby_buildings_for_reflection(
+                            rx_ll,
+                            radius_m=max(60.0, min(160.0, 12.0 * dr)),
+                        )
+                        wall_segments = extract_wall_segments(nearby_buildings, tx)
+
+                        def _rsrp_for_reflection(
+                            tx_ll: LatLon,
+                            bounce_ll: LatLon,
+                            rx_ll2: LatLon,
+                            total_distance_m: float,
+                            reflection_loss_db: float,
+                        ) -> float:
+                            # Bearing is from TX to bounce (departure angle).
+                            be, bn = _enu_from_tx(tx_ll, bounce_ll)
+                            brg = (math.degrees(math.atan2(be, bn)) + 360.0) % 360.0
+                            d2r = max(1.0, float(total_distance_m))
+                            d3r = math.sqrt(d2r * d2r + dz2)
+                            pl = _scenario_path_loss_db(
+                                distance_2d_m=d2r,
+                                distance_3d_m=d3r,
+                                freq_mhz=sector_freq_mhz,
+                                tx_height_m=float(getattr(rf_params, "tx_height_m", 0.0) or 0.0),
+                                rx_height_m=float(getattr(rf_params, "rx_height_m", 1.5) or 0.0),
+                                is_los=True,
+                                rf_params=rf_params,
+                            )
+                            vpat = _vertical_pattern_attenuation_db(
+                                distance_m=d2r,
+                                tx_height_m=float(getattr(rf_params, "tx_height_m", 0.0) or 0.0),
+                                rx_height_m=float(getattr(rf_params, "rx_height_m", 1.5) or 0.0),
+                                rf_params=rf_params,
+                                sector_params=sector_params,
+                            )
+                            hpat = _horizontal_pattern_attenuation_db(
+                                bearing_deg=brg,
+                                sector_params=sector_params,
+                                rf_params=rf_params,
+                            )
+                            return sector_rs_eirp_dbm - (pl + reflection_loss_db + hpat + vpat) + rx_combining_gain_db
+
+                        refl_paths = compute_single_bounce_paths(
+                            tx,
+                            rx_ll,
+                            wall_segments,
+                            max_candidates=int(getattr(rf_params, "rt_max_wall_candidates", 40) or 40),
+                            max_return=int(getattr(rf_params, "rt_max_reflections_per_sample", 2) or 2),
+                            rf_params=rf_params,
+                            is_path_clear_fn=_is_path_clear_osm,
+                            rsrp_for_path_fn=_rsrp_for_reflection,
+                        )
+
+                        # Combine direct + reflected contributions in linear power domain.
+                        def _dbm_to_mw(x_dbm: float) -> float:
+                            return 10.0 ** (x_dbm / 10.0)
+
+                        def _mw_to_dbm(x_mw: float) -> float:
+                            return 10.0 * math.log10(max(x_mw, 1e-15))
+
+                        total_mw = _dbm_to_mw(estimated_rsrp)
+                        for p in refl_paths:
+                            total_mw += _dbm_to_mw(p.rsrp_dbm)
+                        estimated_rsrp_total = _mw_to_dbm(total_mw)
+
+                        # If reflections dominate, expose it as propagation mode.
+                        if (not is_los) and refl_paths and estimated_rsrp_total > estimated_rsrp + 0.5:
+                            mp_is_reflect = True
+
                     # Stop ray if signal too weak
-                    if estimated_rsrp < min_rsrp_threshold:
+                    if estimated_rsrp_total < min_rsrp_threshold:
                         logger.debug(
                             f"Ray at bearing {theta:.1f}° (sector {sector.sector_id}) terminated at {r:.1f}m "
-                            f"(RSRP={estimated_rsrp:.1f}dBm < threshold {min_rsrp_threshold:.1f}dBm)"
+                            f"(RSRP={estimated_rsrp_total:.1f}dBm < threshold {min_rsrp_threshold:.1f}dBm)"
                         )
                         break
 
@@ -503,7 +642,7 @@ def build_coverage_grid(
                             bearing_deg=theta,
                             dominant_material=MaterialType.UNKNOWN,
                             obstacles_count=0,
-                            extra_loss_db=0.0,
+                            extra_loss_db=extra_loss_db,
                             sector_id=sector.sector_id,
                             sector_freq_mhz=sector_freq_mhz,
                             sector_tx_power_dbm=sector_tx_power_dbm,
@@ -524,7 +663,15 @@ def build_coverage_grid(
                             propagation_mode=(
                                 "los"
                                 if is_los
-                                else ("penetration" if penetration_loss_db > 0.0 else ("nlos_recovery" if canyon_recovery_db > 0.0 else "shadow"))
+                                else (
+                                    "reflect"
+                                    if mp_is_reflect
+                                    else (
+                                        "penetration"
+                                        if penetration_loss_db > 0.0
+                                        else ("nlos_recovery" if canyon_recovery_db > 0.0 else "shadow")
+                                    )
+                                )
                             ),
                             first_blocker_distance_m=first_blocker_distance_m,
                             diffraction_flag=(diffraction_loss_db > 0.0),
@@ -534,6 +681,8 @@ def build_coverage_grid(
                             canyon_recovery_db=canyon_recovery_db,
                             metal_blocked=metal_blocked,
                             buildings_along_path=(list(encountered_buildings) if encountered_buildings is not None else []),
+
+                            precomputed_rsrp_dbm=(estimated_rsrp_total if multipath_enabled else None),
                         )
                     )
 
