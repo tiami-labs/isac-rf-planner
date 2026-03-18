@@ -62,7 +62,7 @@ def run_rf_planning_for_point(
     # 2D mode: snap to street (keeps 2D behavior consistent with earlier implementation)
     # 3D mode: DO NOT snap (profiles + Google mesh are computed for the clicked TX)
     ray_mode_eff = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
-    if ray_mode_eff in ("3d", "mesh", "google_mesh", "google-mesh", "3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
+    if ray_mode_eff in ("3d", "mesh", "google_mesh", "google-mesh", "3d_rt", "3d-rt", "3d_osm", "3d-osm", "osm3d"):
         logger.info("STEP 1: 3D mode - skipping street snapping; using clicked point as TX")
         snapped = SnappedPoint(LatLon(lat=lat, lon=lon), 0.0)
         logger.info(f"✓ STEP 1 SUCCESS: TX (no-snap): ({snapped.latlon.lat:.6f}, {snapped.latlon.lon:.6f})")
@@ -105,7 +105,7 @@ def run_rf_planning_for_point(
         #   - 3D: GoogleMeshOSMMapProvider (persisted mesh ray profiles, OSM semantics)
         try:
             ray_mode_l = str(ray_mode).lower()
-            if ray_mode_l in ("3d", "mesh", "google_mesh", "google-mesh"):
+            if ray_mode_l in ("3d", "mesh", "google_mesh", "google-mesh", "3d_rt", "3d-rt"):
                 logger.info("  Creating GoogleMeshOSMMapProvider (3D)...")
                 from ..geo.google_mesh import GoogleMeshOSMMapProvider, MeshProfileStore, MissingMeshProfiles
 
@@ -137,14 +137,12 @@ def run_rf_planning_for_point(
                     logger.info("✓ Using Google-mesh MapProvider (3D ray propagation)")
             elif ray_mode_l in ("3d_osm", "3d-osm", "osm3d"):
                 # 3D (OSM-only) is a height-sliced variant of OSM polygons.
+                # We keep the same ray-march + material-loss logic, but filter
+                # building/foliage obstacles by an estimated OSM height vs the
+                # configured TX slice height.
                 logger.info("  Creating OSMMapProvider (3D OSM-only height slice)...")
                 map_provider = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
                 logger.info("✓ Using OSM MapProvider (3D OSM-only height slice)")
-            elif ray_mode_l in ("3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
-                logger.info("  Creating RayTraceOSMMapProvider (3D OSM + ray trace)...")
-                from ..geo.ray_trace import RayTraceOSMMapProvider
-                map_provider = RayTraceOSMMapProvider(cache_radius_m=1000.0, tx_height_m=tx_height_m, rx_height_m=rx_height_m)
-                logger.info("✓ Using RayTrace OSM MapProvider (3D OSM + ray trace)")
             else:
                 logger.info("  Creating OSMMapProvider...")
                 map_provider = OSMMapProvider(cache_radius_m=1000.0)
@@ -311,7 +309,7 @@ def run_rf_planning_for_point(
     # 6) heatmap / map overlay
     ray_mode_eff2 = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
 
-    if ray_mode_eff2 in ("3d", "mesh", "google_mesh", "google-mesh", "3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
+    if ray_mode_eff2 in ("3d", "mesh", "google_mesh", "google-mesh", "3d_osm", "3d-osm", "osm3d"):
         # Both 3D renderers now use the same pre-colored PNG ellipse drape so the
         # frontend drawing path is visually consistent across OSM-only and Google-mesh modes.
         # Choose texture resolution from range and step, but cap to keep transfers reasonable.
@@ -360,7 +358,7 @@ def run_rf_planning_for_point(
     
     # Reduce payload size for 3D OSM-only mode (front-end uses heatmap PNG, not per-point arrays).
     grid_payload = grid.model_dump()
-    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
+    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d"):
         try:
             grid_payload["num_points"] = len(grid.cell_lat)
         except Exception:
