@@ -30,8 +30,16 @@
           <option value="2d">2D (OSM geometry)</option>
                     <option value="3d_osm">3D (OSM only)</option>
           <option value="3d" selected>3D (Google mesh + OSM semantics)</option>
-          <option value="3d_ray_trace">3D (OSM + ray trace)</option>
+          <option value="3d_rt">3D RT (multipath reflections)</option>
         </select>
+      </div>
+
+      <div style="margin-top: 8px;">
+        <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" id="show-raytrace-toggle" style="cursor:pointer;" />
+          <span>Show multipath rays (debug)</span>
+        </label>
+        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">Draws direct + 1-bounce reflection paths (sampled).</div>
       </div>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -245,7 +253,7 @@
         </div>
       </div>
       <div style="margin-top: 8px; font-size: 10px; color: #aaa;">
-        Used to generate persisted Google-mesh ray profiles (only when ray_mode=3d and missing).
+        Used to generate persisted Google-mesh ray profiles (when ray_mode=3d or 3d_rt and missing).
       </div>
     </div>
 

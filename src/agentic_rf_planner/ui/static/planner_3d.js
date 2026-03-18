@@ -53,6 +53,105 @@ const STREET_LABEL_MINOR_ALPHA = new Cesium.NearFarScalar(400.0, 1.0, 14000.0, 0
 const MULTI_TX_PULL_DELAY_MS = 1500;
 let isPlanningQueue = false;
 
+// Debug overlay: multipath rays (direct + reflections)
+let raytraceEntities = [];
+
+function clearRaytraceOverlay() {
+  if (!viewer) return;
+  for (const e of raytraceEntities) {
+    try { viewer.entities.remove(e); } catch { /* ignore */ }
+  }
+  raytraceEntities = [];
+}
+
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+
+function rsrpToAlpha(rsrpDbm) {
+  // Map [-140, -70] -> [0.15, 0.9]
+  const t = clamp01((rsrpDbm + 140) / 70);
+  return 0.15 + 0.75 * t;
+}
+
+async function renderRaytraceOverlay(txLat, txLon) {
+  if (!viewer) return;
+  clearRaytraceOverlay();
+
+  const rayMode = getString("ray-mode", "3d").toLowerCase();
+  const toggle = document.getElementById("show-raytrace-toggle");
+  const enabled = !!(toggle && toggle.checked);
+  if (!enabled || rayMode !== "3d_rt") return;
+
+  const body = {
+    lat: txLat,
+    lon: txLon,
+    ray_mode: rayMode,
+    tx_height_m: getNumber("tx-height-m", 10.0),
+    rx_height_m: getNumber("rx-height-m", 1.5),
+    freq_mhz: getNumber("freq-mhz", 3500.0),
+    tx_power_dbm: getNumber("tx-power-dbm", 43.0),
+    max_range_m: Math.min(getNumber("max-range", 2000.0), 1200.0),
+    step_m: getNumber("dr-m", 5.0),
+    bearing_stride_deg: Math.max(20.0, getNumber("dtheta", 5.0) * 8.0),
+    termination_rsrp_dbm: getNumber("termination-rsrp-dbm", -140.0),
+    max_reflections_per_sample: 1,
+    max_wall_candidates: 60,
+    reflection_loss_db: 8.0,
+    sample_stride: 30,
+  };
+
+  let resp;
+  try {
+    resp = await fetch("/api/raytrace_debug", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    console.warn("/api/raytrace_debug failed:", e);
+    return;
+  }
+  if (!resp.ok) {
+    const t = await resp.text();
+    console.warn("/api/raytrace_debug error:", resp.status, t);
+    return;
+  }
+  const json = await resp.json();
+  const paths = Array.isArray(json?.paths) ? json.paths : [];
+
+  for (const p of paths) {
+    const pts = Array.isArray(p?.points) ? p.points : [];
+    if (pts.length < 2) continue;
+    const flat = [];
+    for (const q of pts) {
+      const lat = Number(q?.lat);
+      const lon = Number(q?.lon);
+      const h = Number.isFinite(q?.h) ? Number(q.h) : 0.0;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      flat.push(lon, lat, h);
+    }
+    if (flat.length < 6) continue;
+    const rsrp = Number(p?.rsrp_dbm);
+    const alpha = rsrpToAlpha(Number.isFinite(rsrp) ? rsrp : -140);
+    const kind = String(p?.kind || "direct");
+
+    const color = kind === "reflect"
+      ? Cesium.Color.YELLOW.withAlpha(alpha)
+      : Cesium.Color.CYAN.withAlpha(alpha);
+
+    const entity = viewer.entities.add({
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArrayHeights(flat),
+        width: kind === "reflect" ? 2.0 : 1.5,
+        material: color,
+        clampToGround: false,
+      },
+    });
+    raytraceEntities.push(entity);
+  }
+}
+
 // Polygon drawing mode (Cesium)
 let polygonDrawingMode = null; // { sectorId, points:[{lat,lon}], polylineEntity, polygonEntity }
 
@@ -114,57 +213,6 @@ async function loadRfParamsDefaults() {
     }
   } catch (_) { /* keep HTML defaults */ }
 }
-
-
-async function fetchRayTracePreview(lat, lon, txHeightM, rxHeightM, maxRangeM) {
-  const url = new URL('/api/ray-trace/preview', window.location.origin);
-  url.searchParams.set('tx_lat', String(lat));
-  url.searchParams.set('tx_lon', String(lon));
-  url.searchParams.set('tx_height_m', String(txHeightM));
-  url.searchParams.set('rx_height_m', String(rxHeightM));
-  url.searchParams.set('max_range_m', String(Math.min(maxRangeM, 1500.0)));
-  url.searchParams.set('num_bearings', '24');
-  url.searchParams.set('max_reflections', '1');
-  const resp = await fetch(url.toString());
-  if (!resp.ok) throw new Error(`ray-trace preview failed (${resp.status})`);
-  return await resp.json();
-}
-
-function renderRayTracePreview(preview) {
-  if (!viewer || !preview || !Array.isArray(preview.traces)) return;
-  for (const trace of preview.traces) {
-    const paths = Array.isArray(trace.paths) ? trace.paths : [];
-    for (const path of paths) {
-      const pts = Array.isArray(path.points) ? path.points : [];
-      if (pts.length < 2) continue;
-      const positions = [];
-      for (const p of pts) {
-        positions.push(Cesium.Cartesian3.fromDegrees(p.lon, p.lat, Number.isFinite(p.height_m) ? p.height_m : 0.0));
-      }
-      let material = Cesium.Color.LIME.withAlpha(0.85);
-      let width = 2.0;
-      if (path.path_type === 'reflection') {
-        material = Cesium.Color.CYAN.withAlpha(0.85);
-        width = 1.5;
-      }
-      if (path.blocked) {
-        material = Cesium.Color.RED.withAlpha(0.55);
-        width = 1.0;
-      }
-      const ent = viewer.entities.add({
-        polyline: {
-          positions,
-          width,
-          arcType: Cesium.ArcType.NONE,
-          clampToGround: false,
-          material,
-        }
-      });
-      rfEntities.push(ent);
-    }
-  }
-}
-
 
 function setInput(id, value) {
   const el = document.getElementById(id);
@@ -1635,6 +1683,7 @@ async function exportCurrentView() {
 
 function clearMap() {
   clearOverlay();
+  clearRaytraceOverlay();
   // Keep TX marker but clear heatmap + sector overlays
   setMeshStatus("");
   setStatus("Cleared overlays.");
@@ -1821,7 +1870,7 @@ async function runPlanForTx(lat, lon, {
   currentTxLocation = { lat, lon };
   updateTxMarker(lat, lon);
 
-  if (rayMode === "3d") {
+  if (rayMode === "3d" || rayMode === "3d_rt") {
     try {
       setStatus(`${prefix}${attemptText}: checking cached 3D ray profiles…`);
       await ensureProfiles(lat, lon);
@@ -1895,7 +1944,7 @@ async function runPlanForTx(lat, lon, {
   // - 3D modes: backend-generated PNG ellipse drape for consistent visual rendering
   //   across OSM-only and Google-mesh propagation.
   if (out.grid) {
-    if (rayMode === "3d") {
+      if (rayMode === "3d" || rayMode === "3d_rt") {
       if (out.heatmap) {
         await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
       } else {
@@ -1907,7 +1956,7 @@ async function runPlanForTx(lat, lon, {
           renderGridCoverage(out.grid);
         }
       }
-    } else if (rayMode === "3d_osm" || rayMode === "3d_ray_trace") {
+    } else if (rayMode === "3d_osm") {
       if (out.heatmap) {
         await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
       } else {
@@ -1918,20 +1967,19 @@ async function runPlanForTx(lat, lon, {
     }
   }
 
-  // Ray-trace overlay preview for the dedicated 3D OSM + ray-trace mode.
-  const radiusM = getNumber("max-range", 2000.0);
-  if (rayMode === "3d_ray_trace") {
-    try {
-      const preview = await fetchRayTracePreview(currentTxLocation.lat, currentTxLocation.lon, txHeightM, rxHeightM, radiusM);
-      renderRayTracePreview(preview);
-    } catch (e) {
-      console.warn("ray-trace preview render failed:", e);
-    }
-  }
-
   // Sector overlays: approximate radius from profile params (matches circular heatmap intent).
+  const radiusM = getNumber("max-range", 2000.0);
   if (out.sectors && out.snapped_tx) {
     drawSectorOverlays(out.sectors, out.snapped_tx.lat, out.snapped_tx.lon, radiusM);
+  }
+
+  // Optional debug overlay for multipath ray tracing mode.
+  if (currentTxLocation) {
+    try {
+      await renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon);
+    } catch (e) {
+      console.warn("Failed to render raytrace overlay:", e);
+    }
   }
 
   const key = out.mesh_profile_key ? `\nmesh_key=${out.mesh_profile_key}` : "";
@@ -2115,6 +2163,17 @@ async function init() {
     }
   });
   document.getElementById("show-sectors-toggle").addEventListener("change", (e) => toggleSectorVisibility(e.target.checked));
+  document.getElementById("show-raytrace-toggle")?.addEventListener("change", async () => {
+    if (!currentTxLocation) {
+      clearRaytraceOverlay();
+      return;
+    }
+    await renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon);
+  });
+  document.getElementById("ray-mode")?.addEventListener("change", () => {
+    // Only show overlay in 3d_rt mode.
+    clearRaytraceOverlay();
+  });
   document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
   document.getElementById("clear-map-btn").addEventListener("click", () => clearMap());
 
