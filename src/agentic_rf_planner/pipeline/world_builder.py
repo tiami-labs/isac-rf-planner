@@ -92,7 +92,7 @@ def build_world_model(
     # requires the propagation state already stamped into each cell by build_coverage_grid.
     # The geometry/VLM refinement below is expensive and redundant for this mode.
     ray_mode_eff = str(getattr(rf_params, "ray_mode", "") or "").strip().lower()
-    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d", "3d_ray_trace", "3d-ray-trace", "ray_trace", "ray-trace"):
+    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
         logger.info("3D OSM-only mode: skipping per-cell world refinement (using coverage-grid propagation state)")
         return WorldModel(tx=tx, rf_params=rf_params, cells=cells)
     

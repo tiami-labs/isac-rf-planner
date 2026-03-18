@@ -137,6 +137,15 @@ class RFParams(BaseModel):
     # Dict with "overall": {scale, reduction_db} and optional "materials": {concrete: {...}, ...}
     building_attenuation: Optional[Dict[str, Any]] = None
 
+    # --- 3D multipath ray tracing controls (ray_mode = "3d_rt") ---
+    # These settings are intentionally conservative defaults so the mode runs
+    # without additional configuration.
+    rt_max_bounces: int = 1  # currently only 1-bounce is implemented
+    rt_max_reflections_per_sample: int = 2  # top-N reflections to combine
+    rt_max_wall_candidates: int = 40  # nearest wall segments to consider per sample
+    rt_reflection_loss_db: float = 8.0  # base reflection loss (dB), material adds on top
+    rt_debug_sample_stride: int = 25  # debug rendering: take every N-th range sample
+
 
 class WorldCell(BaseModel):
     """
@@ -190,6 +199,11 @@ class WorldCell(BaseModel):
     canyon_recovery_db: float = 0.0
     metal_blocked: bool = False
     buildings_along_path: List[Dict[str, Any]] = []
+
+    # Optional precomputed RSRP for this sector candidate.
+    # Used by multipath ray tracing mode to avoid re-deriving RSRP from only
+    # "extra loss" scalars.
+    precomputed_rsrp_dbm: Optional[float] = None
 
 
 class WorldModel(BaseModel):
