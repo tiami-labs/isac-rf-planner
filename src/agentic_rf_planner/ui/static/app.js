@@ -500,7 +500,7 @@ async function runRFPlanning(lat, lng, source = "click") {
     
     // If 3D mode is selected, ensure a persisted mesh profile exists for this TX/config.
     // This avoids a slow fallback and makes behavior explicit.
-    if (rayMode.toLowerCase() === '3d') {
+    if (rayMode.toLowerCase() === '3d' || rayMode.toLowerCase() === '3d_rt') {
       const maxRangeM = 2000.0;
       const drM = 5.0;
       const dthetaDeg = 5.0;
