@@ -19,6 +19,230 @@ from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
 from ..geo.google_mesh.provider import MissingMeshProfiles
 from ..geo.road_labels import fetch_road_labels
 
+
+# FastAPI application must be created before route decorators are evaluated.
+app = FastAPI(title="Agentic RF Planner API")
+
+
+class RaytraceDebugRequest(BaseModel):
+    """Request model for debug ray/path rendering in the UI."""
+
+    lat: float
+    lon: float
+    ray_mode: str = "3d_rt"  # only used to gate behavior client-side
+    tx_height_m: float = 10.0
+    rx_height_m: float = 1.5
+    freq_mhz: float = 3500.0
+    tx_power_dbm: float = 43.0
+    max_range_m: float = 800.0
+    step_m: float = 10.0
+    bearing_stride_deg: float = 30.0
+    termination_rsrp_dbm: float = -140.0
+    max_reflections_per_sample: int = 1
+    max_wall_candidates: int = 40
+    reflection_loss_db: float = 8.0
+    sample_stride: int = 25
+
+
+@app.post("/api/raytrace_debug")
+async def api_raytrace_debug(req: RaytraceDebugRequest) -> Dict[str, Any]:
+    """Compute a small set of multipath rays for UI debugging/visualization."""
+    from ..geo.osm_map_provider import OSMMapProvider
+    from ..pipeline.schemas import LatLon
+    from ..rf.ray_tracing import compute_single_bounce_paths, extract_wall_segments
+    from ..geo.coverage_grid import _project_from_tx, _enu_from_tx  # type: ignore
+    from ..rf.attenuation_models import (
+        _horizontal_pattern_attenuation_db,
+        _reference_signal_eirp_dbm,
+        _resolve_sector_params,
+        _scenario_path_loss_db,
+        _vertical_pattern_attenuation_db,
+    )
+    import math
+
+    tx = LatLon(lat=req.lat, lon=req.lon)
+    # Build minimal RFParams for path-loss computations.
+    rf_params = RFParams(
+        freq_mhz=req.freq_mhz,
+        tx_power_dbm=req.tx_power_dbm,
+        max_range_m=req.max_range_m,
+        step_m=req.step_m,
+        dtheta_deg=req.bearing_stride_deg,
+        ray_mode="3d_rt",
+        tx_height_m=req.tx_height_m,
+        rx_height_m=req.rx_height_m,
+        termination_rsrp_dbm=req.termination_rsrp_dbm,
+        rt_max_reflections_per_sample=req.max_reflections_per_sample,
+        rt_max_wall_candidates=req.max_wall_candidates,
+        rt_reflection_loss_db=req.reflection_loss_db,
+        rt_debug_sample_stride=req.sample_stride,
+    )
+
+    osm = OSMMapProvider(cache_radius_m=1000.0)
+    osm.prefetch_all_data(tx, req.max_range_m + 50.0)
+
+    wall_segments_all = extract_wall_segments(getattr(osm, "_cached_buildings", []) or [], tx)
+
+    # Omnidirectional sector parameters.
+    sector_params = _resolve_sector_params(
+        type(
+            "RaytraceDebugSector",
+            (),
+            {
+                "sector_id": "omnidirectional",
+                "sector_freq_mhz": req.freq_mhz,
+                "sector_tx_power_dbm": req.tx_power_dbm,
+                "sector_channel_bandwidth_mhz": 20.0,
+                "sector_azimuth_deg": None,
+                "sector_beamwidth_h_deg": None,
+                "sector_beamwidth_v_deg": None,
+                "sector_electrical_tilt_deg": None,
+                "sector_mechanical_tilt_deg": None,
+                "sector_max_horizontal_attenuation_db": None,
+                "sector_front_to_back_attenuation_db": None,
+                "sector_max_vertical_attenuation_db": None,
+            },
+        )(),
+        rf_params,
+        {},
+    )
+    rs_eirp_dbm = _reference_signal_eirp_dbm(rf_params, tx_power_dbm_override=req.tx_power_dbm)
+    rx_gain_db = float(getattr(rf_params, "ue_antenna_gain_dbi", 0.0) or 0.0)
+    dz = float(req.tx_height_m) - float(req.rx_height_m)
+    dz2 = dz * dz
+
+    def is_path_clear(p0: LatLon, p1: LatLon, exclude_id: int | None) -> bool:
+        hits = osm.get_buildings_along_ray(p0, p1)
+        for b in hits:
+            bid = b.get("id")
+            try:
+                bid_int = int(bid) if bid is not None else None
+            except Exception:
+                bid_int = None
+            if exclude_id is not None and bid_int == exclude_id:
+                continue
+            return False
+        return True
+
+    out_paths: list[dict[str, Any]] = []
+
+    # Generate bearings.
+    bstride = float(req.bearing_stride_deg)
+    if bstride <= 0.0:
+        bstride = 30.0
+    bearings = []
+    th = 0.0
+    while th < 360.0 - 1e-6:
+        bearings.append(th)
+        th += bstride
+
+    # For each bearing, sample points along range.
+    dr = float(req.step_m)
+    stride = max(1, int(req.sample_stride))
+    for theta in bearings:
+        r = dr
+        while r <= float(req.max_range_m):
+            if int(round(r / dr)) % stride != 0:
+                r += dr
+                continue
+            lat, lon = _project_from_tx(tx.lat, tx.lon, r, theta)
+            rx = LatLon(lat=lat, lon=lon)
+
+            # Candidate walls near RX.
+            wall_segments = wall_segments_all
+
+            # Direct-path RSRP (free-space/scenario LOS as a baseline for visualization).
+            d2 = max(1.0, r)
+            d3 = math.sqrt(d2 * d2 + dz2)
+            pl = _scenario_path_loss_db(
+                distance_2d_m=d2,
+                distance_3d_m=d3,
+                freq_mhz=req.freq_mhz,
+                tx_height_m=req.tx_height_m,
+                rx_height_m=req.rx_height_m,
+                is_los=True,
+                rf_params=rf_params,
+            )
+            vpat = _vertical_pattern_attenuation_db(
+                distance_m=d2,
+                tx_height_m=req.tx_height_m,
+                rx_height_m=req.rx_height_m,
+                rf_params=rf_params,
+                sector_params=sector_params,
+            )
+            hpat = _horizontal_pattern_attenuation_db(
+                bearing_deg=theta,
+                sector_params=sector_params,
+                rf_params=rf_params,
+            )
+            direct_rsrp = rs_eirp_dbm - (pl + hpat + vpat) + rx_gain_db
+            out_paths.append(
+                {
+                    "kind": "direct",
+                    "bearing_deg": theta,
+                    "rsrp_dbm": direct_rsrp,
+                    "points": [
+                        {"lat": tx.lat, "lon": tx.lon, "h": req.tx_height_m},
+                        {"lat": rx.lat, "lon": rx.lon, "h": req.rx_height_m},
+                    ],
+                }
+            )
+
+            def rsrp_for_reflection(tx_ll: LatLon, bounce_ll: LatLon, rx_ll: LatLon, total_d: float, refl_loss: float) -> float:
+                be, bn = _enu_from_tx(tx_ll, bounce_ll)
+                brg = (math.degrees(math.atan2(be, bn)) + 360.0) % 360.0
+                d2r = max(1.0, float(total_d))
+                d3r = math.sqrt(d2r * d2r + dz2)
+                plr = _scenario_path_loss_db(
+                    distance_2d_m=d2r,
+                    distance_3d_m=d3r,
+                    freq_mhz=req.freq_mhz,
+                    tx_height_m=req.tx_height_m,
+                    rx_height_m=req.rx_height_m,
+                    is_los=True,
+                    rf_params=rf_params,
+                )
+                vpatr = _vertical_pattern_attenuation_db(
+                    distance_m=d2r,
+                    tx_height_m=req.tx_height_m,
+                    rx_height_m=req.rx_height_m,
+                    rf_params=rf_params,
+                    sector_params=sector_params,
+                )
+                hpatr = _horizontal_pattern_attenuation_db(
+                    bearing_deg=brg,
+                    sector_params=sector_params,
+                    rf_params=rf_params,
+                )
+                return rs_eirp_dbm - (plr + refl_loss + hpatr + vpatr) + rx_gain_db
+
+            refl_paths = compute_single_bounce_paths(
+                tx,
+                rx,
+                wall_segments,
+                max_candidates=req.max_wall_candidates,
+                max_return=req.max_reflections_per_sample,
+                rf_params=rf_params,
+                is_path_clear_fn=is_path_clear,
+                rsrp_for_path_fn=rsrp_for_reflection,
+            )
+            for p in refl_paths:
+                out_paths.append(
+                    {
+                        "kind": "reflect",
+                        "bearing_deg": theta,
+                        "rsrp_dbm": p.rsrp_dbm,
+                        "points": [
+                            {"lat": p.points[0].lat, "lon": p.points[0].lon, "h": req.tx_height_m},
+                            {"lat": p.points[1].lat, "lon": p.points[1].lon, "h": req.rx_height_m},
+                            {"lat": p.points[2].lat, "lon": p.points[2].lon, "h": req.rx_height_m},
+                        ],
+                    }
+                )
+            r += dr
+
+    return {"tx": {"lat": tx.lat, "lon": tx.lon}, "paths": out_paths}
+
 # Configure logging to show INFO and above, with detailed format
 logging.basicConfig(
     level=logging.INFO,
@@ -32,8 +256,6 @@ logging.getLogger("agentic_rf_planner").setLevel(logging.DEBUG)
 logging.getLogger("agentic_rf_planner.agents").setLevel(logging.DEBUG)
 logging.getLogger("agentic_rf_planner.geo").setLevel(logging.DEBUG)
 logging.getLogger("agentic_rf_planner.api").setLevel(logging.DEBUG)
-
-app = FastAPI(title="Agentic RF Planner API")
 
 # CORS – keep it permissive for local dev
 app.add_middleware(
@@ -100,6 +322,13 @@ class PlanRequest(BaseModel):
     canyon_recovery_slope_db_per_100m: Optional[float] = None
     termination_rsrp_dbm: Optional[float] = None
     building_attenuation: Optional[Dict[str, Any]] = None  # Override config; { materials: {...}, overall: {...} }
+
+    # 3D multipath ray tracing (ray_mode=3d_rt)
+    rt_max_bounces: Optional[int] = None
+    rt_max_reflections_per_sample: Optional[int] = None
+    rt_max_wall_candidates: Optional[int] = None
+    rt_reflection_loss_db: Optional[float] = None
+    rt_debug_sample_stride: Optional[int] = None
 
     # Coverage / grid resolution (optional overrides; defaults match RFParams)
     # In 3D mode these must match the mesh-profile cache key that the UI
@@ -191,6 +420,13 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             canyon_recovery_slope_db_per_100m=(req.canyon_recovery_slope_db_per_100m if req.canyon_recovery_slope_db_per_100m is not None else rf_cfg.get("canyon_recovery_slope_db_per_100m", RFParams.model_fields["canyon_recovery_slope_db_per_100m"].default)),
             termination_rsrp_dbm=(req.termination_rsrp_dbm if req.termination_rsrp_dbm is not None else rf_cfg.get("termination_rsrp_dbm", RFParams.model_fields["termination_rsrp_dbm"].default)),
             building_attenuation=(req.building_attenuation if req.building_attenuation is not None else rf_cfg.get("building_attenuation")),
+
+            # Multipath ray tracing knobs (optional overrides)
+            rt_max_bounces=(req.rt_max_bounces if req.rt_max_bounces is not None else RFParams.model_fields["rt_max_bounces"].default),
+            rt_max_reflections_per_sample=(req.rt_max_reflections_per_sample if req.rt_max_reflections_per_sample is not None else RFParams.model_fields["rt_max_reflections_per_sample"].default),
+            rt_max_wall_candidates=(req.rt_max_wall_candidates if req.rt_max_wall_candidates is not None else RFParams.model_fields["rt_max_wall_candidates"].default),
+            rt_reflection_loss_db=(req.rt_reflection_loss_db if req.rt_reflection_loss_db is not None else RFParams.model_fields["rt_reflection_loss_db"].default),
+            rt_debug_sample_stride=(req.rt_debug_sample_stride if req.rt_debug_sample_stride is not None else RFParams.model_fields["rt_debug_sample_stride"].default),
         )
         logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
         if req.sectors:
@@ -296,47 +532,6 @@ def api_road_labels(
             "radius_m": max(200.0, min(5000.0, float(radius_m))),
             "major_limit": max(0, int(major_limit)),
             "minor_limit": max(0, int(minor_limit)),
-        },
-    }
-
-
-@app.get("/api/ray-trace/preview")
-def api_ray_trace_preview(
-    tx_lat: float,
-    tx_lon: float,
-    tx_height_m: float = 10.0,
-    rx_height_m: float = 1.5,
-    max_range_m: float = 1200.0,
-    num_bearings: int = 24,
-    max_reflections: int = 1,
-) -> Dict[str, Any]:
-    """Return renderable ray-trace paths for the 3D OSM + ray-trace mode."""
-    from ..geo.ray_trace import RayTraceOSMMapProvider
-
-    tx = LatLon(lat=float(tx_lat), lon=float(tx_lon))
-    provider = RayTraceOSMMapProvider(
-        cache_radius_m=max(500.0, float(max_range_m) + 100.0),
-        tx_height_m=float(tx_height_m),
-        rx_height_m=float(rx_height_m),
-    )
-    provider.prefetch_all_data(tx, float(max_range_m) + 100.0)
-    traces = provider.radial_trace_preview(
-        tx,
-        max_range_m=float(max_range_m),
-        num_bearings=max(4, min(72, int(num_bearings))),
-        max_reflections=max(0, min(2, int(max_reflections))),
-    )
-    return {
-        "status": "ok",
-        "engine": "osm_single_bounce_v1",
-        "tx": tx.model_dump(),
-        "traces": [t.model_dump() for t in traces],
-        "query": {
-            "max_range_m": float(max_range_m),
-            "num_bearings": max(4, min(72, int(num_bearings))),
-            "max_reflections": max(0, min(2, int(max_reflections))),
-            "tx_height_m": float(tx_height_m),
-            "rx_height_m": float(rx_height_m),
         },
     }
 
