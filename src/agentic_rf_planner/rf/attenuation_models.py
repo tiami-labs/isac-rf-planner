@@ -108,14 +108,19 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
             0.0,
             penetration_loss_db + shadow_loss_db + diffraction_loss_db - canyon_recovery_db,
         )
-        rsrp_uncapped = (
-            rs_eirp_dbm
-            - scenario_path_loss_db
-            - extra_loss_db
-            - horizontal_pattern_loss_db
-            - vertical_pattern_loss_db
-            + rx_combining_gain_db
-        )
+        precomputed = getattr(cell, "precomputed_rsrp_dbm", None)
+        if precomputed is not None:
+            # Multipath ray-tracing mode may precompute per-candidate RSRP directly.
+            rsrp_uncapped = float(precomputed)
+        else:
+            rsrp_uncapped = (
+                rs_eirp_dbm
+                - scenario_path_loss_db
+                - extra_loss_db
+                - horizontal_pattern_loss_db
+                - vertical_pattern_loss_db
+                + rx_combining_gain_db
+            )
         rsrp = min(rsrp_uncapped, max_rsrp_dbm)
 
         key = (round(cell.lat, 8), round(cell.lon, 8))
