@@ -243,6 +243,379 @@ async def api_raytrace_debug(req: RaytraceDebugRequest) -> Dict[str, Any]:
 
     return {"tx": {"lat": tx.lat, "lon": tx.lon}, "paths": out_paths}
 
+
+
+class RaytracePathsRequest(BaseModel):
+    """Compute multipath rays between a TX and a specific RX (for 3D RT mode)."""
+
+    tx_lat: float
+    tx_lon: float
+    rx_lat: float
+    rx_lon: float
+    ray_mode: str = "3d_rt"
+
+    tx_height_m: float = 10.0
+    rx_height_m: float = 1.5
+    freq_mhz: float = 3500.0
+    tx_power_dbm: float = 43.0
+    noise_figure_db: float = 7.0
+    channel_bandwidth_mhz: float = 40.0
+    num_resource_blocks: int = 100
+    num_tx_antennas: int = 1
+    num_rx_antennas: int = 1
+    mimo_mode: str = "MIMO"
+
+    tx_antenna_gain_dbi: float = 17.0
+    tx_feeder_loss_db: float = 2.0
+    reference_signal_offset_db: float = -18.0
+    ue_antenna_gain_dbi: float = 0.0
+    electrical_tilt_deg: float = 0.0
+    mechanical_tilt_deg: float = 0.0
+    vertical_beamwidth_deg: float = 8.0
+    max_vertical_attenuation_db: float = 30.0
+    max_horizontal_attenuation_db: float = 30.0
+    front_to_back_attenuation_db: float = 25.0
+    path_loss_model: str = "3gpp_38901"
+    propagation_scenario: str = "umi_street_canyon"
+    termination_rsrp_dbm: float = -140.0
+
+    sectors: Optional[List[Dict[str, Any]]] = None
+
+    max_bounces: int = 20
+    max_wall_candidates: int = 80
+    max_paths: int = 24
+    reflection_loss_db: float = 8.0
+
+    profile_max_range_m: Optional[float] = None
+    profile_dr_m: Optional[float] = None
+    profile_dtheta_deg: Optional[float] = None
+
+
+@app.post("/api/raytrace_paths")
+async def api_raytrace_paths(req: RaytracePathsRequest) -> Dict[str, Any]:
+    """Return Google-mesh-aware/Osm-semantic candidate paths between TX and RX."""
+
+    import math
+
+    from ..geo.osm_map_provider import OSMMapProvider
+    from ..geo.google_mesh import MeshProfileStore, PROFILE_VERSION
+    from ..geo.google_mesh.provider import GoogleMeshOSMMapProvider, MissingMeshProfiles
+
+    from ..rf.ray_tracing import compute_multi_bounce_paths, extract_wall_segments, RayPath
+    from ..rf.attenuation_models import (
+        _horizontal_pattern_attenuation_db,
+        _reference_signal_eirp_dbm,
+        _scenario_path_loss_db,
+        _vertical_pattern_attenuation_db,
+    )
+
+    tx = LatLon(lat=req.tx_lat, lon=req.tx_lon)
+    rx = LatLon(lat=req.rx_lat, lon=req.rx_lon)
+
+    rf_params = RFParams(
+        freq_mhz=req.freq_mhz,
+        tx_power_dbm=req.tx_power_dbm,
+        noise_figure_db=req.noise_figure_db,
+        channel_bandwidth_mhz=req.channel_bandwidth_mhz,
+        num_resource_blocks=req.num_resource_blocks,
+        num_tx_antennas=req.num_tx_antennas,
+        num_rx_antennas=req.num_rx_antennas,
+        mimo_mode=req.mimo_mode,
+        ray_mode=str(req.ray_mode or "3d_rt"),
+        tx_height_m=req.tx_height_m,
+        rx_height_m=req.rx_height_m,
+        tx_antenna_gain_dbi=req.tx_antenna_gain_dbi,
+        tx_feeder_loss_db=req.tx_feeder_loss_db,
+        reference_signal_offset_db=req.reference_signal_offset_db,
+        ue_antenna_gain_dbi=req.ue_antenna_gain_dbi,
+        electrical_tilt_deg=req.electrical_tilt_deg,
+        mechanical_tilt_deg=req.mechanical_tilt_deg,
+        vertical_beamwidth_deg=req.vertical_beamwidth_deg,
+        max_vertical_attenuation_db=req.max_vertical_attenuation_db,
+        max_horizontal_attenuation_db=req.max_horizontal_attenuation_db,
+        front_to_back_attenuation_db=req.front_to_back_attenuation_db,
+        path_loss_model=req.path_loss_model,
+        propagation_scenario=req.propagation_scenario,
+        termination_rsrp_dbm=req.termination_rsrp_dbm,
+        rt_max_bounces=max(1, min(20, int(req.max_bounces))),
+        rt_max_reflections_per_sample=max(1, int(req.max_paths)),
+        rt_max_wall_candidates=max(4, int(req.max_wall_candidates)),
+        rt_reflection_loss_db=req.reflection_loss_db,
+        sectors=req.sectors,
+    )
+
+    def _hav(a: LatLon, b: LatLon) -> float:
+        R = 6371000.0
+        la1 = math.radians(a.lat)
+        la2 = math.radians(b.lat)
+        dlat = math.radians(b.lat - a.lat)
+        dlon = math.radians(b.lon - a.lon)
+        x = math.sin(dlat / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin(dlon / 2) ** 2
+        return 2 * R * math.atan2(math.sqrt(x), math.sqrt(max(1e-15, 1 - x)))
+
+    dist_m = _hav(tx, rx)
+    mid = LatLon(lat=(tx.lat + rx.lat) * 0.5, lon=(tx.lon + rx.lon) * 0.5)
+    radius_m = max(600.0, min(3000.0, dist_m + 400.0))
+
+    osm = OSMMapProvider(cache_radius_m=max(1000.0, radius_m))
+    osm.prefetch_all_data(mid, radius_m)
+
+    mesh_provider = None
+    profile_range_m = max(float(req.profile_max_range_m or radius_m), dist_m + 50.0)
+    profile_dr_m = float(req.profile_dr_m or 5.0)
+    profile_dtheta_deg = float(req.profile_dtheta_deg or 5.0)
+    mesh_profile_loaded = False
+    if str(req.ray_mode or "").strip().lower() in ("3d", "3d_rt"):
+        try:
+            mesh_provider = GoogleMeshOSMMapProvider(
+                profile_store=MeshProfileStore(),
+                osm_provider=osm,
+                tx_height_m=req.tx_height_m,
+                rx_height_m=req.rx_height_m,
+                max_range_m=profile_range_m,
+                dr_m=profile_dr_m,
+                dtheta_deg=profile_dtheta_deg,
+                version=PROFILE_VERSION,
+            )
+            mesh_provider.prefetch_all_data(tx, profile_range_m)
+            mesh_profile_loaded = True
+        except MissingMeshProfiles:
+            mesh_provider = None
+        except Exception:
+            mesh_provider = None
+
+    def _exclude_ids_set(exclude_ids: object) -> set[int]:
+        if exclude_ids is None:
+            return set()
+        if isinstance(exclude_ids, (set, list, tuple, frozenset)):
+            out = set()
+            for item in exclude_ids:
+                try:
+                    if item is not None:
+                        out.add(int(item))
+                except Exception:
+                    continue
+            return out
+        try:
+            return {int(exclude_ids)}
+        except Exception:
+            return set()
+
+    def is_path_clear_osm(p0: LatLon, p1: LatLon, exclude_ids: object) -> bool:
+        excluded = _exclude_ids_set(exclude_ids)
+        hits = osm.get_buildings_along_ray(p0, p1)
+        for b in hits:
+            bid = b.get("id") or b.get("osm_id")
+            try:
+                bid_int = int(bid) if bid is not None else None
+            except Exception:
+                bid_int = None
+            if bid_int is not None and bid_int in excluded:
+                continue
+            return False
+        return True
+
+    def is_path_clear_hybrid(p0: LatLon, p1: LatLon, exclude_ids: object) -> bool:
+        if not is_path_clear_osm(p0, p1, exclude_ids):
+            return False
+        if mesh_provider is None:
+            return True
+        # Persisted Google-mesh profiles are TX-anchored. Use them for the direct leg
+        # and for any first-hop reflection leg that originates at TX.
+        if _hav(tx, p0) > max(1.0, 0.5 * profile_dr_m):
+            return True
+        excluded = _exclude_ids_set(exclude_ids)
+        try:
+            hits = mesh_provider.get_buildings_along_ray(tx, p1)
+        except Exception:
+            return True
+        for b in hits:
+            bid = b.get("id") or b.get("osm_id")
+            try:
+                bid_int = int(bid) if bid is not None else None
+            except Exception:
+                bid_int = None
+            if bid_int is not None and bid_int in excluded:
+                continue
+            return False
+        return True
+
+    wall_segments = extract_wall_segments(getattr(osm, "_cached_buildings", []) or [], tx)
+
+    sector_cfgs = list(req.sectors or [])
+    if not sector_cfgs:
+        sector_cfgs = [{
+            "sector_id": "omnidirectional",
+            "freq_mhz": req.freq_mhz,
+            "tx_power_dbm": req.tx_power_dbm,
+            "channel_bandwidth_mhz": req.channel_bandwidth_mhz,
+            "azimuth_deg": 0.0,
+            "beamwidth_h_deg": 360.0,
+            "beamwidth_v_deg": req.vertical_beamwidth_deg,
+            "electrical_tilt_deg": req.electrical_tilt_deg,
+            "mechanical_tilt_deg": req.mechanical_tilt_deg,
+            "max_horizontal_attenuation_db": req.max_horizontal_attenuation_db,
+            "front_to_back_attenuation_db": req.front_to_back_attenuation_db,
+            "max_vertical_attenuation_db": req.max_vertical_attenuation_db,
+        }]
+
+    rx_gain_db = float(getattr(rf_params, "ue_antenna_gain_dbi", 0.0) or 0.0)
+    dz = float(req.tx_height_m) - float(req.rx_height_m)
+    dz2 = dz * dz
+
+    def _bearing_deg(a: LatLon, b: LatLon) -> float:
+        be = (b.lon - a.lon) * math.cos(math.radians(a.lat))
+        bn = (b.lat - a.lat)
+        return (math.degrees(math.atan2(be, bn)) + 360.0) % 360.0
+
+    def _sector_params(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "sector_id": str(cfg.get("sector_id") or "omnidirectional"),
+            "freq_mhz": float(cfg.get("freq_mhz", req.freq_mhz) or req.freq_mhz),
+            "tx_power_dbm": float(cfg.get("tx_power_dbm", req.tx_power_dbm) or req.tx_power_dbm),
+            "channel_bandwidth_mhz": float(cfg.get("channel_bandwidth_mhz", req.channel_bandwidth_mhz) or req.channel_bandwidth_mhz),
+            "azimuth_deg": float(cfg.get("azimuth_deg", 0.0) or 0.0),
+            "beamwidth_h_deg": float(cfg.get("beamwidth_h_deg", 360.0) or 360.0),
+            "beamwidth_v_deg": float(cfg.get("beamwidth_v_deg", req.vertical_beamwidth_deg) or req.vertical_beamwidth_deg),
+            "electrical_tilt_deg": float(cfg.get("electrical_tilt_deg", req.electrical_tilt_deg) or req.electrical_tilt_deg),
+            "mechanical_tilt_deg": float(cfg.get("mechanical_tilt_deg", req.mechanical_tilt_deg) or req.mechanical_tilt_deg),
+            "max_horizontal_attenuation_db": float(cfg.get("max_horizontal_attenuation_db", req.max_horizontal_attenuation_db) or req.max_horizontal_attenuation_db),
+            "front_to_back_attenuation_db": float(cfg.get("front_to_back_attenuation_db", req.front_to_back_attenuation_db) or req.front_to_back_attenuation_db),
+            "max_vertical_attenuation_db": float(cfg.get("max_vertical_attenuation_db", req.max_vertical_attenuation_db) or req.max_vertical_attenuation_db),
+        }
+
+    def _point_in_polygon(lat: float, lon: float, polygon_points: object) -> bool:
+        pts = []
+        for p in polygon_points or []:
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                try:
+                    pts.append((float(p[0]), float(p[1])))
+                except Exception:
+                    continue
+            elif isinstance(p, dict) and "lat" in p and "lon" in p:
+                try:
+                    pts.append((float(p["lat"]), float(p["lon"])))
+                except Exception:
+                    continue
+        if len(pts) < 3:
+            return True
+        inside = False
+        j = len(pts) - 1
+        for i in range(len(pts)):
+            yi, xi = pts[i]
+            yj, xj = pts[j]
+            intersects = ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / max(yj - yi, 1e-12) + xi)
+            if intersects:
+                inside = not inside
+            j = i
+        return inside
+
+    def evaluate_path(points_ll: List[LatLon], total_d: float, refl_loss: float, *, is_los: bool) -> tuple[float, str]:
+        departure = points_ll[1] if len(points_ll) > 1 else rx
+        brg = _bearing_deg(tx, departure)
+        d2 = max(1.0, float(total_d))
+        d3 = math.sqrt(d2 * d2 + dz2)
+        best_rsrp = -1e9
+        best_sector_id = "omnidirectional"
+        for cfg in sector_cfgs:
+            if str(cfg.get("sector_type") or "").lower() == "polygon" and not _point_in_polygon(rx.lat, rx.lon, cfg.get("polygon_points")):
+                continue
+            sector_params = _sector_params(cfg)
+            pl = _scenario_path_loss_db(
+                distance_2d_m=d2,
+                distance_3d_m=d3,
+                freq_mhz=float(sector_params["freq_mhz"]),
+                tx_height_m=req.tx_height_m,
+                rx_height_m=req.rx_height_m,
+                is_los=is_los,
+                rf_params=rf_params,
+            )
+            vpat = _vertical_pattern_attenuation_db(
+                distance_m=d2,
+                tx_height_m=req.tx_height_m,
+                rx_height_m=req.rx_height_m,
+                rf_params=rf_params,
+                sector_params=sector_params,
+            )
+            hpat = _horizontal_pattern_attenuation_db(
+                bearing_deg=brg,
+                sector_params=sector_params,
+                rf_params=rf_params,
+            )
+            rs_eirp_dbm = _reference_signal_eirp_dbm(
+                rf_params,
+                tx_power_dbm_override=float(sector_params["tx_power_dbm"]),
+            )
+            rsrp = rs_eirp_dbm - (pl + refl_loss + hpat + vpat) + rx_gain_db
+            if rsrp > best_rsrp:
+                best_rsrp = float(rsrp)
+                best_sector_id = str(sector_params["sector_id"])
+        return best_rsrp, best_sector_id
+
+    out_paths: List[Dict[str, Any]] = []
+    direct_is_los = is_path_clear_hybrid(tx, rx, None)
+    direct_rsrp, direct_sector_id = evaluate_path([tx, rx], dist_m, 0.0, is_los=direct_is_los)
+    if direct_is_los and direct_rsrp >= float(req.termination_rsrp_dbm):
+        out_paths.append(
+            {
+                "kind": "direct",
+                "rsrp_dbm": direct_rsrp,
+                "sector_id": direct_sector_id,
+                "points": [
+                    {"lat": tx.lat, "lon": tx.lon, "h": req.tx_height_m},
+                    {"lat": rx.lat, "lon": rx.lon, "h": req.rx_height_m},
+                ],
+            }
+        )
+
+    refl_paths: List[RayPath] = compute_multi_bounce_paths(
+        tx,
+        rx,
+        wall_segments,
+        max_bounces=max(1, min(20, int(req.max_bounces))),
+        max_candidates=max(4, int(req.max_wall_candidates)),
+        max_return=max(1, int(req.max_paths)),
+        rf_params=rf_params,
+        is_path_clear_fn=is_path_clear_hybrid,
+        rsrp_for_path_fn=lambda points_ll, total_d, refl_loss: evaluate_path(list(points_ll), total_d, refl_loss, is_los=True)[0],
+        termination_rsrp_dbm=float(req.termination_rsrp_dbm),
+    )
+    for p in refl_paths:
+        _, sector_id = evaluate_path(list(p.points), float(getattr(p, "total_distance_m", 0.0) or 0.0), float(getattr(p, "extra_loss_db", 0.0) or 0.0), is_los=True)
+        if p.rsrp_dbm < float(req.termination_rsrp_dbm):
+            continue
+        heights = [req.tx_height_m] + [req.rx_height_m] * (len(p.points) - 1)
+        out_paths.append(
+            {
+                "kind": p.kind,
+                "rsrp_dbm": p.rsrp_dbm,
+                "sector_id": sector_id,
+                "points": [
+                    {"lat": q.lat, "lon": q.lon, "h": heights[idx]}
+                    for idx, q in enumerate(p.points)
+                ],
+            }
+        )
+
+    out_paths.sort(key=lambda item: float(item.get("rsrp_dbm", -1e9)), reverse=True)
+    out_paths = out_paths[: max(1, int(req.max_paths) + (1 if out_paths else 0))]
+
+    return {
+        "tx": {"lat": tx.lat, "lon": tx.lon},
+        "rx": {"lat": rx.lat, "lon": rx.lon},
+        "paths": out_paths,
+        "los": bool(direct_is_los),
+        "mesh_profile_loaded": bool(mesh_profile_loaded),
+        "profile_resolution": {
+            "max_range_m": profile_range_m,
+            "dr_m": profile_dr_m,
+            "dtheta_deg": profile_dtheta_deg,
+        },
+        "termination_rsrp_dbm": float(req.termination_rsrp_dbm),
+        "blocked_direct_rsrp_dbm": None if direct_is_los else float(direct_rsrp),
+    }
+
+
 # Configure logging to show INFO and above, with detailed format
 logging.basicConfig(
     level=logging.INFO,
