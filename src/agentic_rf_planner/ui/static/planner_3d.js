@@ -10,6 +10,7 @@ import { buildAndUploadProfiles } from "/mesh_profiler_core.js";
 
 let viewer = null;
 let txEntity = null;
+let rxEntity = null;
 // Planned overlays persist until the user presses "Clear Map".
 // Keep the selection TX marker (txEntity) separate.
 let planEntities = []; // Cesium.Entity[] (heatmaps, planned TX markers, etc.)
@@ -35,6 +36,7 @@ let streetLabelCache = new Map(); // rounded center/radius -> { center, radiusM,
 let streetLabelRefreshTimer = null;
 let streetLabelRequestSeq = 0;
 let currentTxLocation = null; // {lat, lon}
+let currentRxLocation = null; // {lat, lon}
 let sectorCounter = 0;
 let osmHeatmapMeshCache = new Map(); // key -> { geometry }
 
@@ -74,52 +76,150 @@ function rsrpToAlpha(rsrpDbm) {
   return 0.15 + 0.75 * t;
 }
 
-async function renderRaytraceOverlay(txLat, txLon) {
-  if (!viewer) return;
+async function fetchRaytracePaths(txLat, txLon, rxLat, rxLon) {
+  const sectors = collectSectorConfigs();
+  const rtProfile = getRtProfileParams(txLat, txLon, rxLat, rxLon);
+  const body = {
+    tx_lat: txLat,
+    tx_lon: txLon,
+    rx_lat: rxLat,
+    rx_lon: rxLon,
+    ray_mode: "3d_rt",
+    tx_height_m: getNumber("tx-height-m", 10.0),
+    rx_height_m: getNumber("rx-height-m", 1.5),
+    freq_mhz: getNumber("freq-mhz", 3500.0),
+    tx_power_dbm: getNumber("tx-power-dbm", 43.0),
+    noise_figure_db: getNumber("noise-figure-db", 7.0),
+    channel_bandwidth_mhz: getNumber("bw-mhz", 40.0),
+    num_resource_blocks: Math.round(getNumber("num-rb", 100)),
+    mimo_mode: getString("mimo-mode", "MIMO"),
+    electrical_tilt_deg: getNumber("electrical-tilt-deg", 0.0),
+    mechanical_tilt_deg: getNumber("mechanical-tilt-deg", 0.0),
+    vertical_beamwidth_deg: getNumber("vertical-beamwidth-deg", 8.0),
+    max_vertical_attenuation_db: getNumber("max-vertical-atten-db", 30.0),
+    max_horizontal_attenuation_db: getNumber("max-horizontal-atten-db", 30.0),
+    front_to_back_attenuation_db: getNumber("front-to-back-atten-db", 25.0),
+    path_loss_model: getString("path-loss-model", "3gpp_38901"),
+    propagation_scenario: getString("propagation-scenario", "umi_street_canyon"),
+    termination_rsrp_dbm: getNumber("termination-rsrp-dbm", -140.0),
+    sectors: sectors.length ? sectors : null,
+    max_bounces: 20,
+    max_wall_candidates: 120,
+    max_paths: 24,
+    reflection_loss_db: 8.0,
+    profile_max_range_m: rtProfile.maxRangeM,
+    profile_dr_m: rtProfile.drM,
+    profile_dtheta_deg: rtProfile.dthetaDeg,
+  };
+
+  const resp = await fetch("/api/raytrace_paths", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(`/api/raytrace_paths failed (${resp.status}): ${t}`);
+  }
+  return await resp.json();
+}
+
+async function isSegmentBlockedByGoogleMesh(p0, p1, sampleStepM = 2.0, clearanceM = 0.6) {
+  if (!viewer || !viewer.scene) return false;
+
+  const totalDistM = haversineDistanceM(p0.lat, p0.lon, p1.lat, p1.lon);
+  if (!Number.isFinite(totalDistM) || totalDistM < 6.0) return false;
+
+  const steps = Math.max(2, Math.ceil(totalDistM / sampleStepM));
+  const probeHeightM = Math.max(Number(p0.h || 0.0), Number(p1.h || 0.0)) + 250.0;
+  const sampleCartesians = [];
+  const lineHeights = [];
+
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const distFromEnds = Math.min(t, 1.0 - t) * totalDistM;
+    if (distFromEnds < 2.5) continue;
+    const lat = p0.lat + (p1.lat - p0.lat) * t;
+    const lon = p0.lon + (p1.lon - p0.lon) * t;
+    const lineH = Number(p0.h || 0.0) + (Number(p1.h || 0.0) - Number(p0.h || 0.0)) * t;
+    sampleCartesians.push(Cesium.Cartesian3.fromDegrees(lon, lat, probeHeightM));
+    lineHeights.push(lineH);
+  }
+
+  if (!sampleCartesians.length) return false;
+
+  const clamped = await viewer.scene.clampToHeightMostDetailed(sampleCartesians);
+  for (let i = 0; i < clamped.length; i++) {
+    const c = clamped[i];
+    if (!c) continue;
+    const carto = Cesium.Cartographic.fromCartesian(c);
+    const meshH = carto.height;
+    if (Number.isFinite(meshH) && meshH > lineHeights[i] + clearanceM) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function filterRaytracePathsWithGoogleMesh(paths) {
+  const valid = [];
+  const rejected = [];
+
+  for (const path of Array.isArray(paths) ? paths : []) {
+    const pts = Array.isArray(path?.points) ? path.points : [];
+    if (pts.length < 2) continue;
+
+    let blocked = false;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i];
+      const p1 = pts[i + 1];
+      try {
+        if (await isSegmentBlockedByGoogleMesh(p0, p1)) {
+          blocked = true;
+          break;
+        }
+      } catch (e) {
+        console.warn("Google-mesh path validation failed on segment", i, e);
+      }
+    }
+
+    if (blocked) {
+      rejected.push(path);
+    } else {
+      valid.push(path);
+    }
+  }
+
+  return { valid, rejected };
+}
+
+async function renderRaytraceOverlay(txLat, txLon, rxLat, rxLon) {
+  if (!viewer) return { rawCount: 0, drawnCount: 0, filteredCount: 0, paths: [], json: null };
   clearRaytraceOverlay();
 
   const rayMode = getString("ray-mode", "3d").toLowerCase();
   const toggle = document.getElementById("show-raytrace-toggle");
   const enabled = !!(toggle && toggle.checked);
-  if (!enabled || rayMode !== "3d_rt") return;
+  if (!enabled || rayMode !== "3d_rt") return { rawCount: 0, drawnCount: 0, filteredCount: 0, paths: [], json: null };
+  if (!Number.isFinite(rxLat) || !Number.isFinite(rxLon)) return { rawCount: 0, drawnCount: 0, filteredCount: 0, paths: [], json: null };
 
-  const body = {
-    lat: txLat,
-    lon: txLon,
-    ray_mode: rayMode,
-    tx_height_m: getNumber("tx-height-m", 10.0),
-    rx_height_m: getNumber("rx-height-m", 1.5),
-    freq_mhz: getNumber("freq-mhz", 3500.0),
-    tx_power_dbm: getNumber("tx-power-dbm", 43.0),
-    max_range_m: Math.min(getNumber("max-range", 2000.0), 1200.0),
-    step_m: getNumber("dr-m", 5.0),
-    bearing_stride_deg: Math.max(20.0, getNumber("dtheta", 5.0) * 8.0),
-    termination_rsrp_dbm: getNumber("termination-rsrp-dbm", -140.0),
-    max_reflections_per_sample: 1,
-    max_wall_candidates: 60,
-    reflection_loss_db: 8.0,
-    sample_stride: 30,
-  };
-
-  let resp;
+  let json;
   try {
-    resp = await fetch("/api/raytrace_debug", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    json = await fetchRaytracePaths(txLat, txLon, rxLat, rxLon);
   } catch (e) {
-    console.warn("/api/raytrace_debug failed:", e);
-    return;
+    console.warn("/api/raytrace_paths failed:", e);
+    throw e;
   }
-  if (!resp.ok) {
-    const t = await resp.text();
-    console.warn("/api/raytrace_debug error:", resp.status, t);
-    return;
-  }
-  const json = await resp.json();
-  const paths = Array.isArray(json?.paths) ? json.paths : [];
 
+  const rawPaths = Array.isArray(json?.paths) ? json.paths : [];
+  let filtered = { valid: rawPaths, rejected: [] };
+  try {
+    filtered = await filterRaytracePathsWithGoogleMesh(rawPaths);
+  } catch (e) {
+    console.warn("Google mesh validation failed; falling back to unfiltered paths", e);
+  }
+
+  const paths = filtered.valid;
   for (const p of paths) {
     const pts = Array.isArray(p?.points) ? p.points : [];
     if (pts.length < 2) continue;
@@ -127,29 +227,38 @@ async function renderRaytraceOverlay(txLat, txLon) {
     for (const q of pts) {
       const lat = Number(q?.lat);
       const lon = Number(q?.lon);
-      const h = Number.isFinite(q?.h) ? Number(q.h) : 0.0;
+      const h = Number.isFinite(Number(q?.h)) ? Number(q.h) : 0.0;
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
       flat.push(lon, lat, h);
     }
     if (flat.length < 6) continue;
-    const rsrp = Number(p?.rsrp_dbm);
-    const alpha = rsrpToAlpha(Number.isFinite(rsrp) ? rsrp : -140);
-    const kind = String(p?.kind || "direct");
 
-    const color = kind === "reflect"
-      ? Cesium.Color.YELLOW.withAlpha(alpha)
-      : Cesium.Color.CYAN.withAlpha(alpha);
+    const rsrp = Number(p?.rsrp_dbm);
+    const alpha = rsrpToAlpha(Number.isFinite(rsrp) ? rsrp : -140.0);
+    const kind = String(p?.kind || "direct");
+    const color = kind === "direct"
+      ? Cesium.Color.CYAN.withAlpha(alpha)
+      : (kind === "reflect" ? Cesium.Color.YELLOW.withAlpha(alpha) : Cesium.Color.LIME.withAlpha(alpha));
 
     const entity = viewer.entities.add({
       polyline: {
         positions: Cesium.Cartesian3.fromDegreesArrayHeights(flat),
-        width: kind === "reflect" ? 2.0 : 1.5,
+        width: kind === "direct" ? 2.0 : 2.5,
         material: color,
         clampToGround: false,
       },
     });
     raytraceEntities.push(entity);
   }
+
+  const outJson = { ...(json || {}), paths };
+  return {
+    rawCount: rawPaths.length,
+    drawnCount: paths.length,
+    filteredCount: filtered.rejected.length,
+    paths,
+    json: outJson,
+  };
 }
 
 // Polygon drawing mode (Cesium)
@@ -442,6 +551,18 @@ function haversineDistanceM(lat1, lon1, lat2, lon2) {
   return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function getRtProfileParams(txLat, txLon, rxLat, rxLon) {
+  const distM = (Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(rxLat) && Number.isFinite(rxLon))
+    ? haversineDistanceM(txLat, txLon, rxLat, rxLon)
+    : getNumber("max-range", 2000.0);
+  const requestedRangeM = getNumber("max-range", 2000.0);
+  return {
+    maxRangeM: Math.max(600.0, Math.min(4000.0, Math.max(requestedRangeM, distM + 250.0))),
+    drM: Math.min(getNumber("dr-m", 5.0), 2.0),
+    dthetaDeg: Math.min(getNumber("dtheta", 5.0), 1.0),
+  };
+}
+
 function flyToQueuedPoints(queue) {
   if (!viewer || !queue || queue.length === 0) return;
   const FLY_TO_NEAR_THRESHOLD_M = 50000; // 50km - if points farther apart, center on first only
@@ -732,6 +853,34 @@ function updateTxMarker(lat, lon) {
     });
   } else {
     txEntity.position = pos;
+  }
+}
+
+function updateRxMarker(lat, lon) {
+  const pos = Cesium.Cartesian3.fromDegrees(lon, lat, 20.0);
+  if (!rxEntity) {
+    rxEntity = viewer.entities.add({
+      position: pos,
+      point: {
+        pixelSize: 10,
+        color: Cesium.Color.CYAN.withAlpha(0.95),
+        outlineColor: Cesium.Color.BLACK.withAlpha(0.8),
+        outlineWidth: 2,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      label: {
+        text: "RX",
+        font: "14px sans-serif",
+        fillColor: Cesium.Color.CYAN,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(0, -24),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    });
+  } else {
+    rxEntity.position = pos;
   }
 }
 
@@ -1684,6 +1833,11 @@ async function exportCurrentView() {
 function clearMap() {
   clearOverlay();
   clearRaytraceOverlay();
+  if (rxEntity) {
+    try { viewer.entities.remove(rxEntity); } catch {}
+    rxEntity = null;
+  }
+  currentRxLocation = null;
   // Keep TX marker but clear heatmap + sector overlays
   setMeshStatus("");
   setStatus("Cleared overlays.");
@@ -1760,12 +1914,12 @@ function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
   }
 }
 
-async function ensureProfiles(txLat, txLon) {
+async function ensureProfiles(txLat, txLon, overrides = {}) {
   const txHeightM = getNumber("tx-height-m", 10.0);
   const rxHeightM = getNumber("rx-height-m", 1.5);
-  const maxRangeM = getNumber("max-range", 2000.0);
-  const drM = getNumber("dr-m", 5.0);
-  const dthetaDeg = getNumber("dtheta", 5.0);
+  const maxRangeM = Number.isFinite(Number(overrides.maxRangeM)) ? Number(overrides.maxRangeM) : getNumber("max-range", 2000.0);
+  const drM = Number.isFinite(Number(overrides.drM)) ? Number(overrides.drM) : getNumber("dr-m", 5.0);
+  const dthetaDeg = Number.isFinite(Number(overrides.dthetaDeg)) ? Number(overrides.dthetaDeg) : getNumber("dtheta", 5.0);
 
   const hasUrl = `/api/mesh-profiles/has?tx_lat=${encodeURIComponent(txLat)}&tx_lon=${encodeURIComponent(txLon)}`
     + `&tx_height_m=${encodeURIComponent(txHeightM)}&rx_height_m=${encodeURIComponent(rxHeightM)}`
@@ -1775,11 +1929,13 @@ async function ensureProfiles(txLat, txLon) {
   if (!hasResp.ok) throw new Error(`GET ${hasUrl} failed (${hasResp.status})`);
   const hasJson = await hasResp.json();
   if (hasJson && hasJson.exists) {
-    setMeshStatus(`3D profiles cached.\nkey=${hasJson.key}`);
-    return { exists: true, key: hasJson.key };
+    setMeshStatus(`3D profiles cached.
+key=${hasJson.key}`);
+    return { exists: true, key: hasJson.key, maxRangeM, drM, dthetaDeg };
   }
 
-  setMeshStatus("3D profiles missing. Generating + uploading…");
+  setMeshStatus(`3D profiles missing. Generating + uploading…
+range=${Math.round(maxRangeM)}m dr=${drM}m dθ=${dthetaDeg}°`);
 
   await buildAndUploadProfiles({
     containerId: "cesiumProfilerHost",
@@ -1795,7 +1951,7 @@ async function ensureProfiles(txLat, txLon) {
   });
 
   setMeshStatus("3D profiles uploaded.");
-  return { exists: true, key: null };
+  return { exists: true, key: null, maxRangeM, drM, dthetaDeg };
 }
 
 function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) {
@@ -1854,6 +2010,73 @@ function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) 
   };
 }
 
+async function runRaytracePlanForTx(lat, lon, {
+  queueIndex = 1,
+  total = 1,
+  attempt = 1,
+  refreshStreetLabelsOnSuccess = true,
+} = {}) {
+  const prefix = total > 1 ? `TX ${queueIndex}/${total}` : "TX";
+  const attemptText = attempt > 1 ? ` (retry ${attempt - 1})` : "";
+
+  if (!currentRxLocation) {
+    const error = "3D RT mode requires an RX. Hold SHIFT and click the Google mesh to set RX first.";
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
+  }
+
+  currentTxLocation = { lat, lon };
+  updateTxMarker(lat, lon);
+  document.getElementById("show-raytrace-toggle").checked = true;
+
+  const rtProfile = getRtProfileParams(lat, lon, currentRxLocation.lat, currentRxLocation.lon);
+  try {
+    setStatus(`${prefix}${attemptText}: preparing 3D RT profiles…`);
+    await ensureProfiles(lat, lon, rtProfile);
+  } catch (e) {
+    const error = `failed to build RT mesh profiles: ${e}`;
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
+  }
+
+  clearOverlay();
+  clearRaytraceOverlay();
+  updateTxMarker(lat, lon);
+  updateRxMarker(currentRxLocation.lat, currentRxLocation.lon);
+
+  let summary;
+  try {
+    setStatus(`${prefix}${attemptText}: tracing rays…`);
+    summary = await renderRaytraceOverlay(lat, lon, currentRxLocation.lat, currentRxLocation.lon);
+  } catch (e) {
+    const error = `3D RT failed: ${e}`;
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
+  }
+
+  addPlannedTxMarker(lat, lon);
+  if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
+
+  const best = Array.isArray(summary.paths) && summary.paths.length ? summary.paths[0] : null;
+  const bestText = best
+    ? ` Best=${String(best.kind || "path")} ${Number(best.rsrp_dbm).toFixed(1)} dBm${best.sector_id ? ` via ${best.sector_id}` : ""}.`
+    : " No valid path survived Google-mesh validation.";
+  setStatus(`${prefix}${attemptText}: RT complete. ${summary.drawnCount}/${summary.rawCount} paths kept after Google-mesh validation; ${summary.filteredCount} rejected.${bestText}`);
+
+  return {
+    ok: true,
+    out: {
+      mode: "3d_rt",
+      raytrace: summary.json,
+      raw_path_count: summary.rawCount,
+      drawn_path_count: summary.drawnCount,
+      rejected_path_count: summary.filteredCount,
+      profile_resolution: rtProfile,
+    },
+    cacheCenter: { lat, lon },
+  };
+}
+
 async function runPlanForTx(lat, lon, {
   queueIndex = 1,
   total = 1,
@@ -1870,7 +2093,16 @@ async function runPlanForTx(lat, lon, {
   currentTxLocation = { lat, lon };
   updateTxMarker(lat, lon);
 
-  if (rayMode === "3d" || rayMode === "3d_rt") {
+  if (rayMode === "3d_rt") {
+    return await runRaytracePlanForTx(lat, lon, {
+      queueIndex,
+      total,
+      attempt,
+      refreshStreetLabelsOnSuccess,
+    });
+  }
+
+  if (rayMode === "3d") {
     try {
       setStatus(`${prefix}${attemptText}: checking cached 3D ray profiles…`);
       await ensureProfiles(lat, lon);
@@ -2141,8 +2373,41 @@ async function init() {
     const queueCount = appendTxInputPoint(lat, lon);
     updateTxMarker(lat, lon);
     queueStreetLabelRefresh(true);
-    setStatus(`TX added (${queueCount} queued):\n  lat=${lat}\n  lon=${lon}\n\nClick Plan RF Queue.`);
+    setStatus(`TX added (${queueCount} queued):
+  lat=${lat}
+  lon=${lon}
+
+Click Plan RF Queue.`);
+
+    const rtEnabled = document.getElementById("show-raytrace-toggle")?.checked ?? false;
+    if (rtEnabled && currentRxLocation) {
+      renderRaytraceOverlay(lat, lon, currentRxLocation.lat, currentRxLocation.lon).catch(() => {});
+    } else {
+      clearRaytraceOverlay();
+    }
   }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+  // SHIFT+click sets RX for multipath debugging (used by 3d_rt mode).
+  viewer.screenSpaceEventHandler.setInputAction((click) => {
+    const cartesian = viewer.scene.pickPosition(click.position);
+    if (!cartesian) return;
+
+    const carto = Cesium.Cartographic.fromCartesian(cartesian);
+    const lat = Cesium.Math.toDegrees(carto.latitude);
+    const lon = Cesium.Math.toDegrees(carto.longitude);
+
+    currentRxLocation = { lat, lon };
+    updateRxMarker(lat, lon);
+
+    const rtEnabled = document.getElementById("show-raytrace-toggle")?.checked ?? false;
+    if (rtEnabled && currentTxLocation) {
+      renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon, lat, lon).catch(() => {});
+      setStatus(`RX set (SHIFT+click).\n\nTX=(${currentTxLocation.lat.toFixed(6)}, ${currentTxLocation.lon.toFixed(6)})\nRX=(${lat.toFixed(6)}, ${lon.toFixed(6)})`);
+    } else {
+      setStatus(`RX set (SHIFT+click):\n  lat=${lat}\n  lon=${lon}`);
+    }
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK, Cesium.KeyboardEventModifier.SHIFT);
+
 
   // Wire UI
   document.getElementById("coord-form").addEventListener("submit", async (e) => {
@@ -2164,11 +2429,11 @@ async function init() {
   });
   document.getElementById("show-sectors-toggle").addEventListener("change", (e) => toggleSectorVisibility(e.target.checked));
   document.getElementById("show-raytrace-toggle")?.addEventListener("change", async () => {
-    if (!currentTxLocation) {
+    if (!currentTxLocation || !currentRxLocation) {
       clearRaytraceOverlay();
       return;
     }
-    await renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon);
+    await renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon, currentRxLocation.lat, currentRxLocation.lon);
   });
   document.getElementById("ray-mode")?.addEventListener("change", () => {
     // Only show overlay in 3d_rt mode.

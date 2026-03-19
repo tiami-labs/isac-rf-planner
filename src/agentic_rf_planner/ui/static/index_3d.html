@@ -37,9 +37,9 @@
       <div style="margin-top: 8px;">
         <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
           <input type="checkbox" id="show-raytrace-toggle" style="cursor:pointer;" />
-          <span>Show multipath rays (debug)</span>
+          <span>Show ray-traced paths (SHIFT+click to set RX)</span>
         </label>
-        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">Draws direct + 1-bounce reflection paths (sampled).</div>
+        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">In 3D RT mode, Plan RF / RT Queue launches the ray-tracing engine instead of coverage planning. Uses OSM walls for candidate reflections, validates against the Google mesh, traces up to 20 bounces, and stops when path RSRP drops below -140 dBm.</div>
       </div>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
