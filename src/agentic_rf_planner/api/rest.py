@@ -1,12 +1,19 @@
 """FastAPI REST API for RF planning."""
 
+import asyncio
+import json
 import logging
+import re
+import threading
 import sys
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,6 +29,113 @@ from ..geo.road_labels import fetch_road_labels
 
 # FastAPI application must be created before route decorators are evaluated.
 app = FastAPI(title="Agentic RF Planner API")
+
+# --- In-memory planner diagnostics (3D UI POSTs phases; GET exposes them for curl/watch scripts) ---
+PLANNER_DIAG_PROCESS_BOOT_UTC = datetime.now(timezone.utc).isoformat()
+_planner_diag_lock = threading.Lock()
+_planner_diag: Dict[str, Any] = {
+    "seq": 0,
+    "events": [],
+    "last": None,
+}
+_PLANNER_EVENTS_CAP = 40
+PLANNER_DIAG_FILE = Path.home() / ".rf_planning_cache" / "planner_phase_diag.json"
+
+# --- Remote "Plan RF" for an already-open /3d tab ---
+REMOTE_PLAN_QUEUE_BOOT_UTC = datetime.now(timezone.utc).isoformat()
+_ui_remote_plan_lock = threading.Lock()
+_ui_remote_plan: Dict[str, Any] = {
+    "seq": 0,
+    "status": "idle",
+    "plan": None,
+    "error": None,
+    "requested_utc": None,
+    "completed_utc": None,
+}
+
+
+def _evt_public(evt: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not evt:
+        return None
+    return {k: v for k, v in evt.items() if k != "monotonic_s"}
+
+
+def _persist_planner_diag_to_disk() -> None:
+    log = logging.getLogger(__name__)
+    try:
+        PLANNER_DIAG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        last = _planner_diag.get("last")
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "seq": int(_planner_diag.get("seq") or 0),
+            "last": _evt_public(last),
+            "events": [_evt_public(e) for e in (_planner_diag.get("events") or [])],
+            "persisted_utc": datetime.now(timezone.utc).isoformat(),
+            "process_boot_utc": PLANNER_DIAG_PROCESS_BOOT_UTC,
+        }
+        tmp = PLANNER_DIAG_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(PLANNER_DIAG_FILE)
+    except Exception as e:
+        log.warning("planner_phase_diag: persist failed: %s", e)
+
+
+def _load_planner_diag_from_disk() -> Optional[Dict[str, Any]]:
+    if not PLANNER_DIAG_FILE.is_file():
+        return None
+    try:
+        return json.loads(PLANNER_DIAG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _seconds_since_event(evt: Dict[str, Any], now_mono: float) -> float:
+    if "monotonic_s" in evt:
+        return max(0.0, now_mono - float(evt["monotonic_s"]))
+    try:
+        raw = str(evt.get("utc") or "")
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+    except Exception:
+        return 0.0
+
+
+def _parse_profiler_bearings(detail: str) -> Optional[Dict[str, int]]:
+    m = re.search(r"(\d+)\s*/\s*(\d+)\s*bearings", detail, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return {"current": int(m.group(1)), "total": int(m.group(2))}
+
+
+def _record_planner_phase(phase: str, detail: str, client_t_ms: Any) -> Dict[str, Any]:
+    utc = datetime.now(timezone.utc).isoformat()
+    mono = time.monotonic()
+    bearings = _parse_profiler_bearings(detail)
+    cli = None
+    if client_t_ms is not None:
+        try:
+            cli = int(client_t_ms)
+        except (TypeError, ValueError):
+            cli = None
+    evt: Dict[str, Any] = {
+        "utc": utc,
+        "monotonic_s": mono,
+        "phase": phase,
+        "detail": detail[:500],
+        "client_ms": cli,
+        "bearings": bearings,
+    }
+    with _planner_diag_lock:
+        _planner_diag["seq"] = int(_planner_diag["seq"]) + 1
+        evt["seq"] = int(_planner_diag["seq"])
+        _planner_diag["last"] = evt
+        evs = list(_planner_diag.get("events") or [])
+        evs.append(evt)
+        _planner_diag["events"] = evs[-_PLANNER_EVENTS_CAP:]
+        _persist_planner_diag_to_disk()
+    return evt
 
 
 class RaytraceDebugRequest(BaseModel):
@@ -246,14 +360,13 @@ async def api_raytrace_debug(req: RaytraceDebugRequest) -> Dict[str, Any]:
 
 
 class RaytracePathsRequest(BaseModel):
-    """Compute multipath rays between a TX and a specific RX (for 3D RT mode)."""
+    """Compute multipath rays between a TX and a specific RX (for Omniverse-style debugging)."""
 
     tx_lat: float
     tx_lon: float
     rx_lat: float
     rx_lon: float
-    ray_mode: str = "3d_rt"
-
+    ray_mode: str = "3d_rt"  # expects 3d_rt
     tx_height_m: float = 10.0
     rx_height_m: float = 1.5
     freq_mhz: float = 3500.0
@@ -264,7 +377,6 @@ class RaytracePathsRequest(BaseModel):
     num_tx_antennas: int = 1
     num_rx_antennas: int = 1
     mimo_mode: str = "MIMO"
-
     tx_antenna_gain_dbi: float = 17.0
     tx_feeder_loss_db: float = 2.0
     reference_signal_offset_db: float = -18.0
@@ -278,71 +390,77 @@ class RaytracePathsRequest(BaseModel):
     path_loss_model: str = "3gpp_38901"
     propagation_scenario: str = "umi_street_canyon"
     termination_rsrp_dbm: float = -140.0
-
     sectors: Optional[List[Dict[str, Any]]] = None
 
-    max_bounces: int = 20
+    max_bounces: int = 2
     max_wall_candidates: int = 80
-    max_paths: int = 24
+    max_paths: int = 12
     reflection_loss_db: float = 8.0
-
     profile_max_range_m: Optional[float] = None
     profile_dr_m: Optional[float] = None
     profile_dtheta_deg: Optional[float] = None
 
 
-@app.post("/api/raytrace_paths")
-async def api_raytrace_paths(req: RaytracePathsRequest) -> Dict[str, Any]:
-    """Return Google-mesh-aware/Osm-semantic candidate paths between TX and RX."""
+def _compute_raytrace_paths_response(req: RaytracePathsRequest, progress=None) -> Dict[str, Any]:
+    """Return direct + OSM reflection candidate paths between TX and RX.
 
+    OSM-only by design here: this keeps baseline behavior stable while the solver is
+    improved independently from any mesh integration.
+    """
     import math
 
-    from ..geo.osm_map_provider import OSMMapProvider
-    from ..geo.google_mesh import MeshProfileStore, PROFILE_VERSION
-    from ..geo.google_mesh.provider import GoogleMeshOSMMapProvider, MissingMeshProfiles
-
-    from ..rf.ray_tracing import compute_multi_bounce_paths, extract_wall_segments, RayPath
+    from ..geo.osm_map_provider import OSMMapProvider, _estimate_osm_height_m
+    from ..rf.ray_tracing import (
+        RayPath,
+        WallSegment,
+        _norm,
+        _segment_intersection_point,
+        compute_single_bounce_paths,
+        compute_two_bounce_paths,
+        enu_from_latlon,
+        extract_wall_segments,
+    )
     from ..rf.attenuation_models import (
         _horizontal_pattern_attenuation_db,
         _reference_signal_eirp_dbm,
+        _resolve_sector_params,
         _scenario_path_loss_db,
         _vertical_pattern_attenuation_db,
     )
 
+    log = logging.getLogger(__name__)
+    started = time.monotonic()
+
+    def emit(stage: str, detail: str = "", **extra: Any) -> None:
+        payload: Dict[str, Any] = {
+            "type": "heartbeat",
+            "stage": stage,
+            "detail": detail,
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+        if extra:
+            payload.update(extra)
+        if progress is not None:
+            progress(payload)
+
     tx = LatLon(lat=req.tx_lat, lon=req.tx_lon)
     rx = LatLon(lat=req.rx_lat, lon=req.rx_lon)
+    emit("request_enter", f"tx=({tx.lat:.6f},{tx.lon:.6f}) rx=({rx.lat:.6f},{rx.lon:.6f})")
 
     rf_params = RFParams(
         freq_mhz=req.freq_mhz,
         tx_power_dbm=req.tx_power_dbm,
-        noise_figure_db=req.noise_figure_db,
-        channel_bandwidth_mhz=req.channel_bandwidth_mhz,
-        num_resource_blocks=req.num_resource_blocks,
-        num_tx_antennas=req.num_tx_antennas,
-        num_rx_antennas=req.num_rx_antennas,
-        mimo_mode=req.mimo_mode,
-        ray_mode=str(req.ray_mode or "3d_rt"),
+        ray_mode="3d_rt",
         tx_height_m=req.tx_height_m,
         rx_height_m=req.rx_height_m,
-        tx_antenna_gain_dbi=req.tx_antenna_gain_dbi,
-        tx_feeder_loss_db=req.tx_feeder_loss_db,
-        reference_signal_offset_db=req.reference_signal_offset_db,
-        ue_antenna_gain_dbi=req.ue_antenna_gain_dbi,
-        electrical_tilt_deg=req.electrical_tilt_deg,
-        mechanical_tilt_deg=req.mechanical_tilt_deg,
-        vertical_beamwidth_deg=req.vertical_beamwidth_deg,
-        max_vertical_attenuation_db=req.max_vertical_attenuation_db,
-        max_horizontal_attenuation_db=req.max_horizontal_attenuation_db,
-        front_to_back_attenuation_db=req.front_to_back_attenuation_db,
-        path_loss_model=req.path_loss_model,
-        propagation_scenario=req.propagation_scenario,
         termination_rsrp_dbm=req.termination_rsrp_dbm,
-        rt_max_bounces=max(1, min(20, int(req.max_bounces))),
-        rt_max_reflections_per_sample=max(1, int(req.max_paths)),
-        rt_max_wall_candidates=max(4, int(req.max_wall_candidates)),
+        rt_max_bounces=req.max_bounces,
+        rt_max_reflections_per_sample=req.max_paths,
+        rt_max_wall_candidates=req.max_wall_candidates,
         rt_reflection_loss_db=req.reflection_loss_db,
-        sectors=req.sectors,
     )
+
+    mid = LatLon(lat=(tx.lat + rx.lat) * 0.5, lon=(tx.lon + rx.lon) * 0.5)
 
     def _hav(a: LatLon, b: LatLon) -> float:
         R = 6371000.0
@@ -354,55 +472,14 @@ async def api_raytrace_paths(req: RaytracePathsRequest) -> Dict[str, Any]:
         return 2 * R * math.atan2(math.sqrt(x), math.sqrt(max(1e-15, 1 - x)))
 
     dist_m = _hav(tx, rx)
-    mid = LatLon(lat=(tx.lat + rx.lat) * 0.5, lon=(tx.lon + rx.lon) * 0.5)
-    radius_m = max(600.0, min(3000.0, dist_m + 400.0))
-
+    radius_m = max(600.0, min(2500.0, dist_m + 350.0))
+    emit("osm_prefetch_start", f"radius_m={radius_m:.1f}")
     osm = OSMMapProvider(cache_radius_m=max(1000.0, radius_m))
     osm.prefetch_all_data(mid, radius_m)
+    buildings = list(getattr(osm, "_cached_buildings", []) or [])
+    emit("osm_prefetch_done", f"cached_buildings={len(buildings)}", cached_buildings=len(buildings))
 
-    mesh_provider = None
-    profile_range_m = max(float(req.profile_max_range_m or radius_m), dist_m + 50.0)
-    profile_dr_m = float(req.profile_dr_m or 5.0)
-    profile_dtheta_deg = float(req.profile_dtheta_deg or 5.0)
-    mesh_profile_loaded = False
-    if str(req.ray_mode or "").strip().lower() in ("3d", "3d_rt"):
-        try:
-            mesh_provider = GoogleMeshOSMMapProvider(
-                profile_store=MeshProfileStore(),
-                osm_provider=osm,
-                tx_height_m=req.tx_height_m,
-                rx_height_m=req.rx_height_m,
-                max_range_m=profile_range_m,
-                dr_m=profile_dr_m,
-                dtheta_deg=profile_dtheta_deg,
-                version=PROFILE_VERSION,
-            )
-            mesh_provider.prefetch_all_data(tx, profile_range_m)
-            mesh_profile_loaded = True
-        except MissingMeshProfiles:
-            mesh_provider = None
-        except Exception:
-            mesh_provider = None
-
-    def _exclude_ids_set(exclude_ids: object) -> set[int]:
-        if exclude_ids is None:
-            return set()
-        if isinstance(exclude_ids, (set, list, tuple, frozenset)):
-            out = set()
-            for item in exclude_ids:
-                try:
-                    if item is not None:
-                        out.add(int(item))
-                except Exception:
-                    continue
-            return out
-        try:
-            return {int(exclude_ids)}
-        except Exception:
-            return set()
-
-    def is_path_clear_osm(p0: LatLon, p1: LatLon, exclude_ids: object) -> bool:
-        excluded = _exclude_ids_set(exclude_ids)
+    def is_path_clear(p0: LatLon, p1: LatLon, exclude_id: int | None) -> bool:
         hits = osm.get_buildings_along_ray(p0, p1)
         for b in hits:
             bid = b.get("id") or b.get("osm_id")
@@ -410,212 +487,485 @@ async def api_raytrace_paths(req: RaytracePathsRequest) -> Dict[str, Any]:
                 bid_int = int(bid) if bid is not None else None
             except Exception:
                 bid_int = None
-            if bid_int is not None and bid_int in excluded:
+            if exclude_id is not None and bid_int == exclude_id:
                 continue
             return False
         return True
 
-    def is_path_clear_hybrid(p0: LatLon, p1: LatLon, exclude_ids: object) -> bool:
-        if not is_path_clear_osm(p0, p1, exclude_ids):
-            return False
-        if mesh_provider is None:
-            return True
-        # Persisted Google-mesh profiles are TX-anchored. Use them for the direct leg
-        # and for any first-hop reflection leg that originates at TX.
-        if _hav(tx, p0) > max(1.0, 0.5 * profile_dr_m):
-            return True
-        excluded = _exclude_ids_set(exclude_ids)
+    emit("wall_extract_start")
+    wall_segments = extract_wall_segments(buildings, tx)
+    emit("wall_extract_done", f"osm_walls={len(wall_segments)}", osm_walls=len(wall_segments))
+
+    building_height_by_id: Dict[int, float] = {}
+    building_by_id: Dict[int, Dict[str, Any]] = {}
+    for b in buildings:
+        bid = b.get("id") or b.get("osm_id")
         try:
-            hits = mesh_provider.get_buildings_along_ray(tx, p1)
+            bid_int = int(bid)
         except Exception:
-            return True
-        for b in hits:
-            bid = b.get("id") or b.get("osm_id")
-            try:
-                bid_int = int(bid) if bid is not None else None
-            except Exception:
-                bid_int = None
-            if bid_int is not None and bid_int in excluded:
+            continue
+        building_by_id[bid_int] = b
+        height = b.get("height_m") or b.get("height") or b.get("building_height_m")
+        try:
+            if height is None:
+                height = _estimate_osm_height_m(b.get("tags", {}))
+            if height is None:
+                height = 15.0
+            height_f = float(height)
+            b["height_m"] = height_f
+            building_height_by_id[bid_int] = height_f
+        except Exception:
+            continue
+
+    _building_edges_cache: Dict[int, List[tuple[tuple[float, float], tuple[float, float]]]] = {}
+
+    def _get_building_id(building: Dict[str, Any]) -> Optional[int]:
+        bid = building.get("id") or building.get("osm_id")
+        try:
+            return int(bid) if bid is not None else None
+        except Exception:
+            return None
+
+    def _building_edges_enu(building: Dict[str, Any]) -> List[tuple[tuple[float, float], tuple[float, float]]]:
+        bid = _get_building_id(building)
+        if bid is not None and bid in _building_edges_cache:
+            return _building_edges_cache[bid]
+        geom = building.get("geometry") or []
+        pts: List[tuple[float, float]] = []
+        for node in geom:
+            if not isinstance(node, dict) or "lat" not in node or "lon" not in node:
                 continue
+            pts.append(enu_from_latlon(tx, LatLon(lat=float(node["lat"]), lon=float(node["lon"]))))
+        edges: List[tuple[tuple[float, float], tuple[float, float]]] = []
+        if len(pts) >= 2:
+            if _norm(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) > 1.0:
+                pts.append(pts[0])
+            for i in range(len(pts) - 1):
+                a, b = pts[i], pts[i + 1]
+                if _norm(b[0] - a[0], b[1] - a[1]) >= 0.25:
+                    edges.append((a, b))
+        if bid is not None:
+            _building_edges_cache[bid] = edges
+        return edges
+
+    def _dist_point_to_seg_m(pt: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        px, py = pt
+        ax, ay = a
+        bx, by = b
+        vx, vy = bx - ax, by - ay
+        wx, wy = px - ax, py - ay
+        vv = vx * vx + vy * vy
+        if vv < 1e-9:
+            return _norm(px - ax, py - ay)
+        t = max(0.0, min(1.0, (wx * vx + wy * vy) / vv))
+        cx, cy = ax + t * vx, ay + t * vy
+        return _norm(px - cx, py - cy)
+
+    def _wall_segment_from_meta(meta: Dict[str, Any] | None) -> Optional[WallSegment]:
+        if not meta:
+            return None
+        try:
+            return WallSegment(
+                a_e=float(meta["a_e"]),
+                a_n=float(meta["a_n"]),
+                b_e=float(meta["b_e"]),
+                b_n=float(meta["b_n"]),
+                building_id=(int(meta["building_id"]) if meta.get("building_id") is not None else None),
+                material=str(meta.get("material", "unknown") or "unknown"),
+            )
+        except Exception:
+            return None
+
+    def _segment_hits(p0: LatLon, p1: LatLon) -> List[Dict[str, Any]]:
+        hits = osm.get_buildings_along_ray(p0, p1)
+        s = enu_from_latlon(tx, p0)
+        t = enu_from_latlon(tx, p1)
+        result: List[Dict[str, Any]] = []
+        seen: set[tuple[Optional[int], int, int]] = set()
+        for building in hits:
+            bid = _get_building_id(building)
+            for edge_a, edge_b in _building_edges_enu(building):
+                inter = _segment_intersection_point(s, t, edge_a, edge_b)
+                if inter is None:
+                    continue
+                dist = _norm(inter[0] - s[0], inter[1] - s[1])
+                key = (bid, int(round(dist * 100.0)), int(round(_dist_point_to_seg_m(inter, edge_a, edge_b) * 100.0)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append({
+                    "bid": bid,
+                    "point": inter,
+                    "dist": dist,
+                    "edge": (edge_a, edge_b),
+                })
+        result.sort(key=lambda item: item["dist"])
+        return result
+
+    def _hit_matches_wall(hit: Dict[str, Any], wall: Optional[WallSegment], expected_pt: tuple[float, float], tol_m: float = 2.0) -> bool:
+        if wall is None:
+            return False
+        if wall.building_id is not None and hit.get("bid") != wall.building_id:
+            return False
+        if _dist_point_to_seg_m(hit["point"], (wall.a_e, wall.a_n), (wall.b_e, wall.b_n)) > tol_m:
+            return False
+        if _norm(hit["point"][0] - expected_pt[0], hit["point"][1] - expected_pt[1]) > tol_m:
             return False
         return True
 
-    wall_segments = extract_wall_segments(getattr(osm, "_cached_buildings", []) or [], tx)
+    def _validate_leg(
+        p0: LatLon,
+        p1: LatLon,
+        *,
+        allow_start_wall: Optional[WallSegment] = None,
+        allow_end_wall: Optional[WallSegment] = None,
+    ) -> tuple[bool, str]:
+        hits = _segment_hits(p0, p1)
+        s = enu_from_latlon(tx, p0)
+        t = enu_from_latlon(tx, p1)
+        leg_len = _norm(t[0] - s[0], t[1] - s[1])
+        start_tol = 1.5
+        end_tol = 1.5
+        have_end = allow_end_wall is None
+        for hit in hits:
+            d = float(hit["dist"])
+            near_start = d <= start_tol
+            near_end = abs(leg_len - d) <= end_tol
+            if near_start and allow_start_wall is not None and _hit_matches_wall(hit, allow_start_wall, s):
+                continue
+            if near_end and allow_end_wall is not None and _hit_matches_wall(hit, allow_end_wall, t):
+                have_end = True
+                continue
+            if near_start and allow_start_wall is None:
+                return False, "blocked_at_start"
+            return False, "blocked_mid_leg"
+        if not have_end:
+            return False, "missing_reflector_hit"
+        return True, "ok"
 
-    sector_cfgs = list(req.sectors or [])
-    if not sector_cfgs:
-        sector_cfgs = [{
-            "sector_id": "omnidirectional",
-            "freq_mhz": req.freq_mhz,
-            "tx_power_dbm": req.tx_power_dbm,
-            "channel_bandwidth_mhz": req.channel_bandwidth_mhz,
-            "azimuth_deg": 0.0,
-            "beamwidth_h_deg": 360.0,
-            "beamwidth_v_deg": req.vertical_beamwidth_deg,
-            "electrical_tilt_deg": req.electrical_tilt_deg,
-            "mechanical_tilt_deg": req.mechanical_tilt_deg,
-            "max_horizontal_attenuation_db": req.max_horizontal_attenuation_db,
-            "front_to_back_attenuation_db": req.front_to_back_attenuation_db,
-            "max_vertical_attenuation_db": req.max_vertical_attenuation_db,
-        }]
+    def _interpolated_heights(path: RayPath) -> Optional[List[float]]:
+        distances = list(path.meta.get("distances_m") or [])
+        total = float(sum(float(x) for x in distances)) if distances else 0.0
+        if total <= 0.0:
+            return None
+        hs: List[float] = [float(req.tx_height_m)]
+        cumulative = 0.0
+        for idx, leg_d in enumerate(distances[:-1], start=1):
+            cumulative += float(leg_d)
+            z = float(req.tx_height_m) + (float(req.rx_height_m) - float(req.tx_height_m)) * (cumulative / total)
+            wall_meta = path.meta.get(f"wall{idx}")
+            wall = _wall_segment_from_meta(wall_meta)
+            bh = building_height_by_id.get(int(wall.building_id)) if wall and wall.building_id is not None else None
+            if bh is not None and z > bh + 0.25:
+                return None
+            if bh is not None:
+                z = min(z, max(1.0, bh - 0.25))
+            hs.append(max(0.0, z))
+        hs.append(float(req.rx_height_m))
+        return hs
 
+    def _validate_reflection_path(path: RayPath) -> tuple[bool, Optional[List[float]], str]:
+        points = path.points
+        if path.kind == "reflect" and len(points) == 3:
+            wall1 = _wall_segment_from_meta(path.meta.get("wall1"))
+            ok1, why1 = _validate_leg(points[0], points[1], allow_end_wall=wall1)
+            if not ok1:
+                return False, None, f"leg1_{why1}"
+            ok2, why2 = _validate_leg(points[1], points[2], allow_start_wall=wall1)
+            if not ok2:
+                return False, None, f"leg2_{why2}"
+            heights = _interpolated_heights(path)
+            if heights is None:
+                return False, None, "height_exceeds_building"
+            return True, heights, "ok"
+        if path.kind == "reflect2" and len(points) == 4:
+            wall1 = _wall_segment_from_meta(path.meta.get("wall1"))
+            wall2 = _wall_segment_from_meta(path.meta.get("wall2"))
+            ok1, why1 = _validate_leg(points[0], points[1], allow_end_wall=wall1)
+            if not ok1:
+                return False, None, f"leg1_{why1}"
+            ok2, why2 = _validate_leg(points[1], points[2], allow_start_wall=wall1, allow_end_wall=wall2)
+            if not ok2:
+                return False, None, f"leg2_{why2}"
+            ok3, why3 = _validate_leg(points[2], points[3], allow_start_wall=wall2)
+            if not ok3:
+                return False, None, f"leg3_{why3}"
+            heights = _interpolated_heights(path)
+            if heights is None:
+                return False, None, "height_exceeds_building"
+            return True, heights, "ok"
+        return False, None, "unsupported_path_kind"
+
+    sector_params = _resolve_sector_params(
+        type(
+            "RaytracePathsSector",
+            (),
+            {
+                "sector_id": "omnidirectional",
+                "sector_freq_mhz": req.freq_mhz,
+                "sector_tx_power_dbm": req.tx_power_dbm,
+                "sector_channel_bandwidth_mhz": 20.0,
+                "sector_azimuth_deg": None,
+                "sector_beamwidth_h_deg": None,
+                "sector_beamwidth_v_deg": None,
+                "sector_electrical_tilt_deg": None,
+                "sector_mechanical_tilt_deg": None,
+                "sector_max_horizontal_attenuation_db": None,
+                "sector_front_to_back_attenuation_db": None,
+                "sector_max_vertical_attenuation_db": None,
+            },
+        )(),
+        rf_params,
+        {},
+    )
+
+    rs_eirp_dbm = _reference_signal_eirp_dbm(rf_params, tx_power_dbm_override=req.tx_power_dbm)
     rx_gain_db = float(getattr(rf_params, "ue_antenna_gain_dbi", 0.0) or 0.0)
     dz = float(req.tx_height_m) - float(req.rx_height_m)
     dz2 = dz * dz
 
-    def _bearing_deg(a: LatLon, b: LatLon) -> float:
-        be = (b.lon - a.lon) * math.cos(math.radians(a.lat))
-        bn = (b.lat - a.lat)
-        return (math.degrees(math.atan2(be, bn)) + 360.0) % 360.0
+    def rsrp_for_reflection(tx_ll: LatLon, bounce_ll: LatLon, rx_ll: LatLon, total_d: float, refl_loss: float) -> float:
+        be = (bounce_ll.lon - tx_ll.lon) * math.cos(math.radians(tx_ll.lat))
+        bn = (bounce_ll.lat - tx_ll.lat)
+        brg = (math.degrees(math.atan2(be, bn)) + 360.0) % 360.0
+        d2r = max(1.0, float(total_d))
+        d3r = math.sqrt(d2r * d2r + dz2)
+        plr = _scenario_path_loss_db(
+            distance_2d_m=d2r,
+            distance_3d_m=d3r,
+            freq_mhz=req.freq_mhz,
+            tx_height_m=req.tx_height_m,
+            rx_height_m=req.rx_height_m,
+            is_los=True,
+            rf_params=rf_params,
+        )
+        vpatr = _vertical_pattern_attenuation_db(
+            distance_m=d2r,
+            tx_height_m=req.tx_height_m,
+            rx_height_m=req.rx_height_m,
+            rf_params=rf_params,
+            sector_params=sector_params,
+        )
+        hpatr = _horizontal_pattern_attenuation_db(
+            bearing_deg=brg,
+            sector_params=sector_params,
+            rf_params=rf_params,
+        )
+        return rs_eirp_dbm - (plr + refl_loss + hpatr + vpatr) + rx_gain_db
 
-    def _sector_params(cfg: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "sector_id": str(cfg.get("sector_id") or "omnidirectional"),
-            "freq_mhz": float(cfg.get("freq_mhz", req.freq_mhz) or req.freq_mhz),
-            "tx_power_dbm": float(cfg.get("tx_power_dbm", req.tx_power_dbm) or req.tx_power_dbm),
-            "channel_bandwidth_mhz": float(cfg.get("channel_bandwidth_mhz", req.channel_bandwidth_mhz) or req.channel_bandwidth_mhz),
-            "azimuth_deg": float(cfg.get("azimuth_deg", 0.0) or 0.0),
-            "beamwidth_h_deg": float(cfg.get("beamwidth_h_deg", 360.0) or 360.0),
-            "beamwidth_v_deg": float(cfg.get("beamwidth_v_deg", req.vertical_beamwidth_deg) or req.vertical_beamwidth_deg),
-            "electrical_tilt_deg": float(cfg.get("electrical_tilt_deg", req.electrical_tilt_deg) or req.electrical_tilt_deg),
-            "mechanical_tilt_deg": float(cfg.get("mechanical_tilt_deg", req.mechanical_tilt_deg) or req.mechanical_tilt_deg),
-            "max_horizontal_attenuation_db": float(cfg.get("max_horizontal_attenuation_db", req.max_horizontal_attenuation_db) or req.max_horizontal_attenuation_db),
-            "front_to_back_attenuation_db": float(cfg.get("front_to_back_attenuation_db", req.front_to_back_attenuation_db) or req.front_to_back_attenuation_db),
-            "max_vertical_attenuation_db": float(cfg.get("max_vertical_attenuation_db", req.max_vertical_attenuation_db) or req.max_vertical_attenuation_db),
-        }
+    def _bounce_height_for_path(path: RayPath) -> Optional[List[float]]:
+        if path.kind == "direct":
+            return [float(req.tx_height_m), float(req.rx_height_m)]
+        return _interpolated_heights(path)
 
-    def _point_in_polygon(lat: float, lon: float, polygon_points: object) -> bool:
-        pts = []
-        for p in polygon_points or []:
-            if isinstance(p, (list, tuple)) and len(p) >= 2:
-                try:
-                    pts.append((float(p[0]), float(p[1])))
-                except Exception:
-                    continue
-            elif isinstance(p, dict) and "lat" in p and "lon" in p:
-                try:
-                    pts.append((float(p["lat"]), float(p["lon"])))
-                except Exception:
-                    continue
-        if len(pts) < 3:
-            return True
-        inside = False
-        j = len(pts) - 1
-        for i in range(len(pts)):
-            yi, xi = pts[i]
-            yj, xj = pts[j]
-            intersects = ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / max(yj - yi, 1e-12) + xi)
-            if intersects:
-                inside = not inside
-            j = i
-        return inside
-
-    def evaluate_path(points_ll: List[LatLon], total_d: float, refl_loss: float, *, is_los: bool) -> tuple[float, str]:
-        departure = points_ll[1] if len(points_ll) > 1 else rx
-        brg = _bearing_deg(tx, departure)
-        d2 = max(1.0, float(total_d))
-        d3 = math.sqrt(d2 * d2 + dz2)
-        best_rsrp = -1e9
-        best_sector_id = "omnidirectional"
-        for cfg in sector_cfgs:
-            if str(cfg.get("sector_type") or "").lower() == "polygon" and not _point_in_polygon(rx.lat, rx.lon, cfg.get("polygon_points")):
-                continue
-            sector_params = _sector_params(cfg)
-            pl = _scenario_path_loss_db(
-                distance_2d_m=d2,
-                distance_3d_m=d3,
-                freq_mhz=float(sector_params["freq_mhz"]),
-                tx_height_m=req.tx_height_m,
-                rx_height_m=req.rx_height_m,
-                is_los=is_los,
-                rf_params=rf_params,
-            )
-            vpat = _vertical_pattern_attenuation_db(
-                distance_m=d2,
-                tx_height_m=req.tx_height_m,
-                rx_height_m=req.rx_height_m,
-                rf_params=rf_params,
-                sector_params=sector_params,
-            )
-            hpat = _horizontal_pattern_attenuation_db(
-                bearing_deg=brg,
-                sector_params=sector_params,
-                rf_params=rf_params,
-            )
-            rs_eirp_dbm = _reference_signal_eirp_dbm(
-                rf_params,
-                tx_power_dbm_override=float(sector_params["tx_power_dbm"]),
-            )
-            rsrp = rs_eirp_dbm - (pl + refl_loss + hpat + vpat) + rx_gain_db
-            if rsrp > best_rsrp:
-                best_rsrp = float(rsrp)
-                best_sector_id = str(sector_params["sector_id"])
-        return best_rsrp, best_sector_id
+    emit("direct_path_start")
+    is_los = is_path_clear(tx, rx, None)
+    d2 = max(1.0, dist_m)
+    d3 = math.sqrt(d2 * d2 + dz2)
+    pl = _scenario_path_loss_db(
+        distance_2d_m=d2,
+        distance_3d_m=d3,
+        freq_mhz=req.freq_mhz,
+        tx_height_m=req.tx_height_m,
+        rx_height_m=req.rx_height_m,
+        is_los=is_los,
+        rf_params=rf_params,
+    )
+    vpat = _vertical_pattern_attenuation_db(
+        distance_m=d2,
+        tx_height_m=req.tx_height_m,
+        rx_height_m=req.rx_height_m,
+        rf_params=rf_params,
+        sector_params=sector_params,
+    )
+    be = (rx.lon - tx.lon) * math.cos(math.radians(tx.lat))
+    bn = (rx.lat - tx.lat)
+    brg = (math.degrees(math.atan2(be, bn)) + 360.0) % 360.0
+    hpat = _horizontal_pattern_attenuation_db(
+        bearing_deg=brg,
+        sector_params=sector_params,
+        rf_params=rf_params,
+    )
+    direct_rsrp = rs_eirp_dbm - (pl + hpat + vpat) + rx_gain_db
+    emit("direct_path_done", f"los={is_los}", los=bool(is_los), direct_rsrp_dbm=round(direct_rsrp, 3))
 
     out_paths: List[Dict[str, Any]] = []
-    direct_is_los = is_path_clear_hybrid(tx, rx, None)
-    direct_rsrp, direct_sector_id = evaluate_path([tx, rx], dist_m, 0.0, is_los=direct_is_los)
-    if direct_is_los and direct_rsrp >= float(req.termination_rsrp_dbm):
+    if is_los:
         out_paths.append(
             {
                 "kind": "direct",
                 "rsrp_dbm": direct_rsrp,
-                "sector_id": direct_sector_id,
                 "points": [
-                    {"lat": tx.lat, "lon": tx.lon, "h": req.tx_height_m},
-                    {"lat": rx.lat, "lon": rx.lon, "h": req.rx_height_m},
+                    {"lat": tx.lat, "lon": tx.lon, "h": float(req.tx_height_m)},
+                    {"lat": rx.lat, "lon": rx.lon, "h": float(req.rx_height_m)},
                 ],
             }
         )
 
-    refl_paths: List[RayPath] = compute_multi_bounce_paths(
-        tx,
-        rx,
-        wall_segments,
-        max_bounces=max(1, min(20, int(req.max_bounces))),
-        max_candidates=max(4, int(req.max_wall_candidates)),
-        max_return=max(1, int(req.max_paths)),
-        rf_params=rf_params,
-        is_path_clear_fn=is_path_clear_hybrid,
-        rsrp_for_path_fn=lambda points_ll, total_d, refl_loss: evaluate_path(list(points_ll), total_d, refl_loss, is_los=True)[0],
-        termination_rsrp_dbm=float(req.termination_rsrp_dbm),
-    )
-    for p in refl_paths:
-        _, sector_id = evaluate_path(list(p.points), float(getattr(p, "total_distance_m", 0.0) or 0.0), float(getattr(p, "extra_loss_db", 0.0) or 0.0), is_los=True)
-        if p.rsrp_dbm < float(req.termination_rsrp_dbm):
-            continue
-        heights = [req.tx_height_m] + [req.rx_height_m] * (len(p.points) - 1)
-        out_paths.append(
-            {
+    term = float(req.termination_rsrp_dbm)
+    raw_paths = 0
+    accepted_reflections = 0
+    rejected_invalid_footprint = 0
+
+    if int(req.max_bounces) >= 1:
+        emit("single_bounce_start", f"max_candidates={int(req.max_wall_candidates)}")
+        p1 = compute_single_bounce_paths(
+            tx,
+            rx,
+            wall_segments,
+            max_candidates=int(req.max_wall_candidates),
+            max_return=max(1, int(req.max_paths)),
+            rf_params=rf_params,
+            is_path_clear_fn=is_path_clear,
+            rsrp_for_path_fn=rsrp_for_reflection,
+        )
+        emit("single_bounce_done", f"count={len(p1)}", count=len(p1))
+        for p in p1:
+            raw_paths += 1
+            if p.rsrp_dbm < term:
+                continue
+            ok, heights, reason = _validate_reflection_path(p)
+            if not ok or heights is None:
+                rejected_invalid_footprint += 1
+                continue
+            accepted_reflections += 1
+            out_paths.append({
                 "kind": p.kind,
                 "rsrp_dbm": p.rsrp_dbm,
-                "sector_id": sector_id,
                 "points": [
-                    {"lat": q.lat, "lon": q.lon, "h": heights[idx]}
-                    for idx, q in enumerate(p.points)
+                    {"lat": pt.lat, "lon": pt.lon, "h": heights[i] if i < len(heights) else float(req.rx_height_m)}
+                    for i, pt in enumerate(p.points)
                 ],
-            }
-        )
+            })
 
-    out_paths.sort(key=lambda item: float(item.get("rsrp_dbm", -1e9)), reverse=True)
-    out_paths = out_paths[: max(1, int(req.max_paths) + (1 if out_paths else 0))]
+    if int(req.max_bounces) >= 2:
+        emit("two_bounce_start", f"max_candidates={max(2, int(req.max_wall_candidates // 2))}")
+        p2 = compute_two_bounce_paths(
+            tx,
+            rx,
+            wall_segments,
+            max_candidates=max(2, int(req.max_wall_candidates // 2)),
+            max_return=max(1, int(req.max_paths)),
+            rf_params=rf_params,
+            is_path_clear_fn=is_path_clear,
+            rsrp_for_path_fn=rsrp_for_reflection,
+        )
+        emit("two_bounce_done", f"count={len(p2)}", count=len(p2))
+        for p in p2:
+            raw_paths += 1
+            if p.rsrp_dbm < term:
+                continue
+            ok, heights, reason = _validate_reflection_path(p)
+            if not ok or heights is None:
+                rejected_invalid_footprint += 1
+                continue
+            accepted_reflections += 1
+            out_paths.append({
+                "kind": p.kind,
+                "rsrp_dbm": p.rsrp_dbm,
+                "points": [
+                    {"lat": pt.lat, "lon": pt.lon, "h": heights[i] if i < len(heights) else float(req.rx_height_m)}
+                    for i, pt in enumerate(p.points)
+                ],
+            })
+
+    out_paths.sort(key=lambda p: float(p.get("rsrp_dbm", -9999.0)), reverse=True)
+    out_paths = out_paths[: max(1, int(req.max_paths) + (1 if is_los else 0))]
+
+    diagnostics: Dict[str, Any] = {
+        "osm_walls": len(wall_segments),
+        "raw_paths": raw_paths,
+        "accepted_reflections": accepted_reflections,
+        "rejected_invalid_footprint": rejected_invalid_footprint,
+        "returned": len(out_paths),
+        "los": bool(is_los),
+    }
+    message = (
+        f"3D RT (OSM strict): osm_walls={diagnostics['osm_walls']} raw_paths={diagnostics['raw_paths']} "
+        f"accepted={diagnostics['accepted_reflections']} rejected_invalid_footprint={diagnostics['rejected_invalid_footprint']} "
+        f"returned={diagnostics['returned']} los={diagnostics['los']}"
+    )
+    log.info(
+        "raytrace_paths tx=(%.6f, %.6f) rx=(%.6f, %.6f) %s",
+        tx.lat, tx.lon, rx.lat, rx.lon, message,
+    )
+    emit("finalize", message, **diagnostics)
 
     return {
         "tx": {"lat": tx.lat, "lon": tx.lon},
         "rx": {"lat": rx.lat, "lon": rx.lon},
         "paths": out_paths,
-        "los": bool(direct_is_los),
-        "mesh_profile_loaded": bool(mesh_profile_loaded),
-        "profile_resolution": {
-            "max_range_m": profile_range_m,
-            "dr_m": profile_dr_m,
-            "dtheta_deg": profile_dtheta_deg,
-        },
-        "termination_rsrp_dbm": float(req.termination_rsrp_dbm),
-        "blocked_direct_rsrp_dbm": None if direct_is_los else float(direct_rsrp),
+        "los": bool(is_los),
+        "diagnostics": diagnostics,
+        "message": message,
     }
 
 
+@app.post("/api/raytrace_paths")
+async def api_raytrace_paths(req: RaytracePathsRequest) -> Dict[str, Any]:
+    return await asyncio.to_thread(_compute_raytrace_paths_response, req, None)
+
+
+@app.post("/api/raytrace_paths/stream")
+async def api_raytrace_paths_stream(req: RaytracePathsRequest):
+    import queue
+
+    log = logging.getLogger(__name__)
+    started = time.monotonic()
+    log.info(
+        "raytrace_paths_stream start tx=(%.6f, %.6f) rx=(%.6f, %.6f)",
+        req.tx_lat, req.tx_lon, req.rx_lat, req.rx_lon,
+    )
+    q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    done = threading.Event()
+
+    def push(event: Dict[str, Any]) -> None:
+        q.put(event)
+
+    def run_compute() -> None:
+        try:
+            result = _compute_raytrace_paths_response(req, push)
+            q.put({
+                "type": "result",
+                "stage": "complete",
+                "elapsed_s": round(time.monotonic() - started, 3),
+                "payload": result,
+            })
+        except Exception as e:
+            log.exception("raytrace_paths_stream failed")
+            q.put({
+                "type": "error",
+                "stage": "exception",
+                "elapsed_s": round(time.monotonic() - started, 3),
+                "error": f"{type(e).__name__}: {e}",
+            })
+        finally:
+            done.set()
+
+    threading.Thread(target=run_compute, daemon=True).start()
+
+    def encode(obj: Dict[str, Any]) -> bytes:
+        return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
+
+    def gen():
+        while True:
+            try:
+                event = q.get(timeout=2.0)
+            except queue.Empty:
+                if done.is_set():
+                    break
+                yield encode({
+                    "type": "heartbeat",
+                    "stage": "processing",
+                    "detail": "still_processing",
+                    "elapsed_s": round(time.monotonic() - started, 3),
+                })
+                continue
+            yield encode(event)
+            if event.get("type") in {"result", "error"}:
+                break
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 # Configure logging to show INFO and above, with detailed format
 logging.basicConfig(
     level=logging.INFO,
@@ -709,6 +1059,144 @@ class PlanRequest(BaseModel):
     max_range_m: Optional[float] = None
     step_m: Optional[float] = None
     dtheta_deg: Optional[float] = None
+
+
+class PlanAndTrace3DRequest(PlanRequest):
+    """lat/lon = TX, rx_lat/rx_lon = RX; convenience wrapper for coverage + trace."""
+
+    rx_lat: float
+    rx_lon: float
+
+
+class RemotePlanRFRequest(PlanRequest):
+    """Same as PlanRequest; for ray_mode=3d_rt also provide rx_lat/rx_lon."""
+
+    rx_lat: Optional[float] = None
+    rx_lon: Optional[float] = None
+
+
+def _resolved_grid_for_mesh_profile_key(req: PlanRequest) -> tuple[float, float, float]:
+    try:
+        rf_cfg = load_rf_config("configs/rf.params.yaml") or {}
+    except Exception:
+        rf_cfg = {}
+    max_r = float(
+        req.max_range_m
+        if req.max_range_m is not None
+        else rf_cfg.get("max_range_m", RFParams.model_fields["max_range_m"].default)
+    )
+    step_m = float(
+        req.step_m if req.step_m is not None else RFParams.model_fields["step_m"].default
+    )
+    dth = float(
+        req.dtheta_deg
+        if req.dtheta_deg is not None
+        else (
+            RFParams.model_fields["dtheta_deg"].default
+            if "dtheta_deg" in RFParams.model_fields
+            else 5.0
+        )
+    )
+    return max_r, step_m, dth
+
+
+def _raytrace_request_from_plan_and_rx(plan_req: PlanRequest, rx_lat: float, rx_lon: float) -> RaytracePathsRequest:
+    max_r, step_m, dth = _resolved_grid_for_mesh_profile_key(plan_req)
+    return RaytracePathsRequest(
+        tx_lat=plan_req.lat,
+        tx_lon=plan_req.lon,
+        rx_lat=rx_lat,
+        rx_lon=rx_lon,
+        ray_mode="3d_rt",
+        tx_height_m=plan_req.tx_height_m,
+        rx_height_m=plan_req.rx_height_m,
+        freq_mhz=plan_req.freq_mhz,
+        tx_power_dbm=plan_req.tx_power_dbm,
+        noise_figure_db=plan_req.noise_figure_db,
+        channel_bandwidth_mhz=plan_req.channel_bandwidth_mhz,
+        num_resource_blocks=plan_req.num_resource_blocks,
+        num_tx_antennas=plan_req.num_tx_antennas,
+        num_rx_antennas=plan_req.num_rx_antennas,
+        mimo_mode=plan_req.mimo_mode,
+        tx_antenna_gain_dbi=(plan_req.tx_antenna_gain_dbi if plan_req.tx_antenna_gain_dbi is not None else 17.0),
+        tx_feeder_loss_db=(plan_req.tx_feeder_loss_db if plan_req.tx_feeder_loss_db is not None else 2.0),
+        reference_signal_offset_db=(plan_req.reference_signal_offset_db if plan_req.reference_signal_offset_db is not None else -18.0),
+        ue_antenna_gain_dbi=(plan_req.ue_antenna_gain_dbi if plan_req.ue_antenna_gain_dbi is not None else 0.0),
+        electrical_tilt_deg=(plan_req.electrical_tilt_deg if plan_req.electrical_tilt_deg is not None else 0.0),
+        mechanical_tilt_deg=(plan_req.mechanical_tilt_deg if plan_req.mechanical_tilt_deg is not None else 0.0),
+        vertical_beamwidth_deg=(plan_req.vertical_beamwidth_deg if plan_req.vertical_beamwidth_deg is not None else 8.0),
+        max_vertical_attenuation_db=(plan_req.max_vertical_attenuation_db if plan_req.max_vertical_attenuation_db is not None else 30.0),
+        max_horizontal_attenuation_db=(plan_req.max_horizontal_attenuation_db if plan_req.max_horizontal_attenuation_db is not None else 30.0),
+        front_to_back_attenuation_db=(plan_req.front_to_back_attenuation_db if plan_req.front_to_back_attenuation_db is not None else 25.0),
+        path_loss_model=(plan_req.path_loss_model or "3gpp_38901"),
+        propagation_scenario=(plan_req.propagation_scenario or "umi_street_canyon"),
+        termination_rsrp_dbm=(plan_req.termination_rsrp_dbm if plan_req.termination_rsrp_dbm is not None else -140.0),
+        sectors=plan_req.sectors,
+        max_bounces=(plan_req.rt_max_bounces if plan_req.rt_max_bounces is not None else 2),
+        max_wall_candidates=(plan_req.rt_max_wall_candidates if plan_req.rt_max_wall_candidates is not None else 80),
+        max_paths=(plan_req.rt_max_reflections_per_sample if plan_req.rt_max_reflections_per_sample is not None else 12),
+        reflection_loss_db=(plan_req.rt_reflection_loss_db if plan_req.rt_reflection_loss_db is not None else 8.0),
+        profile_max_range_m=max_r,
+        profile_dr_m=step_m,
+        profile_dtheta_deg=dth,
+    )
+
+
+def _require_mesh_profiles_or_409(plan_req: PlanRequest) -> str:
+    max_r, step_m, dth = _resolved_grid_for_mesh_profile_key(plan_req)
+    tx_ll = LatLon(lat=plan_req.lat, lon=plan_req.lon)
+    store = MeshProfileStore()
+    exists, pkey = store.has(
+        tx_ll,
+        plan_req.tx_height_m,
+        plan_req.rx_height_m,
+        max_r,
+        step_m,
+        dth,
+        PROFILE_VERSION,
+    )
+    if not exists:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "missing_mesh_profiles",
+                "cache_key_hash": pkey,
+                "message": (
+                    "Mesh profiles missing for this TX and grid resolution. Use the 3D mesh profiler in the "
+                    "browser (samples Google Photorealistic 3D Tiles), then POST /api/mesh-profiles/put."
+                ),
+            },
+        )
+    return str(pkey)
+
+
+def _browser_draw_recipe(*, plan_result: Dict[str, Any], ray_result: Dict[str, Any], profile_cache_key: str) -> Dict[str, Any]:
+    heatmap = plan_result.get("heatmap") or {}
+    snapped = plan_result.get("snapped_tx") or {}
+    return {
+        "heatmap": {
+            "where_in_response": "plan.heatmap",
+            "format": heatmap.get("format") or "png_base64",
+            "width": heatmap.get("width"),
+            "height": heatmap.get("height"),
+        },
+        "snapped_tx_marker": {
+            "where_in_response": "plan.snapped_tx",
+            "lat": snapped.get("lat"),
+            "lon": snapped.get("lon"),
+        },
+        "rx_marker": {
+            "where_in_response": "request body rx_lat/rx_lon",
+        },
+        "ray_multipath_polylines": {
+            "where_in_response": "raytrace.paths[].points",
+            "crs": "WGS84",
+        },
+        "provenance": {
+            "mesh_profiles": f"Photorealistic mesh profiles loaded from cache key {profile_cache_key} (version {PROFILE_VERSION}).",
+            "osm": "Building footprints / reflections use cached OpenStreetMap geometry on the server.",
+        },
+    }
 
 
 @app.post("/api/plan")
@@ -849,6 +1337,189 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.post("/api/ui/remote-plan-rf")
+async def api_ui_remote_plan_rf(req: RemotePlanRFRequest) -> Dict[str, Any]:
+    logger = logging.getLogger(__name__)
+    utc_req = datetime.now(timezone.utc).isoformat()
+    with _ui_remote_plan_lock:
+        _ui_remote_plan["status"] = "computing"
+        _ui_remote_plan["requested_utc"] = utc_req
+
+    plan_only = PlanRequest(**req.model_dump(exclude={"rx_lat", "rx_lon"}))
+    ray_mode_eff = (plan_only.ray_mode or "2d").strip().lower()
+
+    try:
+        if ray_mode_eff in ("3d_rt", "3d-rt", "rt3d"):
+            if req.rx_lat is None or req.rx_lon is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "ray_mode=3d_rt requires rx_lat and rx_lon in the JSON body "
+                        "(receiver location; same as SHIFT+click RX in the 3D UI)."
+                    ),
+                )
+            _require_mesh_profiles_or_409(plan_only)
+            rt_req = _raytrace_request_from_plan_and_rx(plan_only, float(req.rx_lat), float(req.rx_lon))
+            ray_result = await api_raytrace_paths(rt_req)
+            result: Dict[str, Any] = {
+                "mode": "3d_rt",
+                "ray_mode": "3d_rt",
+                "original_point": {"lat": plan_only.lat, "lon": plan_only.lon},
+                "snapped_tx": {"lat": plan_only.lat, "lon": plan_only.lon},
+                "rx_point": {"lat": float(req.rx_lat), "lon": float(req.rx_lon)},
+                "raytrace": ray_result,
+            }
+        else:
+            result = await api_plan(plan_only)
+    except HTTPException as e:
+        utc_done = datetime.now(timezone.utc).isoformat()
+        detail = e.detail
+        if not isinstance(detail, (dict, list, str, int, float, bool, type(None))):
+            detail = str(detail)
+        with _ui_remote_plan_lock:
+            _ui_remote_plan["seq"] = int(_ui_remote_plan.get("seq") or 0) + 1
+            _ui_remote_plan["status"] = "error"
+            _ui_remote_plan["plan"] = None
+            _ui_remote_plan["error"] = {"status_code": int(e.status_code), "detail": detail}
+            _ui_remote_plan["completed_utc"] = utc_done
+        raise
+    except Exception as e:
+        utc_done = datetime.now(timezone.utc).isoformat()
+        logger.exception("api_ui_remote_plan_rf: %s", e)
+        with _ui_remote_plan_lock:
+            _ui_remote_plan["seq"] = int(_ui_remote_plan.get("seq") or 0) + 1
+            _ui_remote_plan["status"] = "error"
+            _ui_remote_plan["plan"] = None
+            _ui_remote_plan["error"] = {"status_code": 500, "detail": str(e)}
+            _ui_remote_plan["completed_utc"] = utc_done
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    utc_done = datetime.now(timezone.utc).isoformat()
+    with _ui_remote_plan_lock:
+        _ui_remote_plan["seq"] = int(_ui_remote_plan.get("seq") or 0) + 1
+        new_seq = int(_ui_remote_plan["seq"])
+        _ui_remote_plan["status"] = "ready"
+        _ui_remote_plan["plan"] = result
+        _ui_remote_plan["error"] = None
+        _ui_remote_plan["completed_utc"] = utc_done
+    logger.info("Remote plan RF published for UI poll: seq=%s", new_seq)
+    return {
+        "ok": True,
+        "seq": new_seq,
+        "message": "Plan published. Open /3d tabs will pick this up via poll and draw on Cesium.",
+    }
+
+
+@app.get("/api/ui/remote-plan-rf/poll")
+async def api_ui_remote_plan_rf_poll(since_seq: int = 0) -> Dict[str, Any]:
+    with _ui_remote_plan_lock:
+        seq = int(_ui_remote_plan.get("seq") or 0)
+        st = str(_ui_remote_plan.get("status") or "idle")
+        req_utc = _ui_remote_plan.get("requested_utc")
+        done_utc = _ui_remote_plan.get("completed_utc")
+        plan = _ui_remote_plan.get("plan")
+        err = _ui_remote_plan.get("error")
+    is_new = seq > int(since_seq)
+    out: Dict[str, Any] = {
+        "seq": seq,
+        "new": bool(is_new),
+        "status": st,
+        "requested_utc": req_utc,
+        "completed_utc": done_utc,
+        "server_boot_utc": REMOTE_PLAN_QUEUE_BOOT_UTC,
+    }
+    if is_new:
+        if st == "ready" and plan is not None:
+            out["plan"] = plan
+        elif st == "error" and err is not None:
+            out["error"] = err
+    return out
+
+
+@app.post("/api/3d/plan-and-trace")
+async def api_3d_plan_and_trace(req: PlanAndTrace3DRequest) -> Dict[str, Any]:
+    stages: List[Dict[str, Any]] = []
+    plan_payload = req.model_dump(exclude={"rx_lat", "rx_lon"})
+    plan_payload["ray_mode"] = "3d_rt"
+    plan_req = PlanRequest(**plan_payload)
+
+    max_r, step_m, dth = _resolved_grid_for_mesh_profile_key(plan_req)
+    tx_ll = LatLon(lat=plan_req.lat, lon=plan_req.lon)
+    store = MeshProfileStore()
+    exists, pkey = store.has(
+        tx_ll,
+        plan_req.tx_height_m,
+        plan_req.rx_height_m,
+        max_r,
+        step_m,
+        dth,
+        PROFILE_VERSION,
+    )
+    stages.append({
+        "id": "mesh_profiles",
+        "status": "complete" if exists else "missing",
+        "cache_key_hash": pkey,
+        "profile_version": PROFILE_VERSION,
+        "resolution": {"max_range_m": max_r, "step_m": step_m, "dtheta_deg": dth},
+    })
+    if not exists:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "stages": stages,
+                "message": (
+                    "Mesh profiles missing for this TX and grid resolution. Use the 3D mesh profiler in the "
+                    "browser (samples Google Photorealistic 3D Tiles), then POST /api/mesh-profiles/put."
+                ),
+            },
+        )
+
+    stages.append({"id": "coverage_plan", "status": "started"})
+    try:
+        plan_result = await api_plan(plan_req)
+    except HTTPException as e:
+        err_detail: Any = e.detail
+        if isinstance(err_detail, dict):
+            err_detail = {**err_detail, "stages": stages + [{"id": "coverage_plan", "status": "error"}]}
+        else:
+            err_detail = {"message": str(err_detail), "stages": stages}
+        raise HTTPException(status_code=e.status_code, detail=err_detail) from e
+
+    stages[-1] = {
+        "id": "coverage_plan",
+        "status": "complete",
+        "mesh_profile_key": plan_result.get("mesh_profile_key"),
+        "effective_ray_mode": plan_result.get("ray_mode"),
+    }
+
+    stages.append({"id": "tx_rx_raytrace", "status": "started"})
+    rt_req = _raytrace_request_from_plan_and_rx(plan_req, req.rx_lat, req.rx_lon)
+    ray_result = await api_raytrace_paths(rt_req)
+    stages[-1] = {
+        "id": "tx_rx_raytrace",
+        "status": "complete",
+        "paths": len(ray_result.get("paths") or []),
+        "mesh_profile_loaded": ray_result.get("mesh_profile_loaded"),
+        "los": ray_result.get("los"),
+    }
+
+    browser_draw = _browser_draw_recipe(
+        plan_result=plan_result,
+        ray_result=ray_result,
+        profile_cache_key=str(pkey),
+    )
+
+    return {
+        "status": "ok",
+        "stages": stages,
+        "plan": plan_result,
+        "raytrace": ray_result,
+        "browser_draw": browser_draw,
+        "tx": {"lat": plan_req.lat, "lon": plan_req.lon},
+        "rx": {"lat": req.rx_lat, "lon": req.rx_lon},
+    }
+
+
 @app.get("/api/health")
 def health() -> Dict[str, str]:
     """Health check endpoint."""
@@ -907,6 +1578,102 @@ def api_road_labels(
             "minor_limit": max(0, int(minor_limit)),
         },
     }
+
+
+@app.get("/api/ping")
+def api_ping() -> Dict[str, Any]:
+    return {"status": "ok", "utc": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/api/debug/planner-state")
+def debug_planner_state() -> Dict[str, Any]:
+    now_mono = time.monotonic()
+    disk = _load_planner_diag_from_disk()
+    disk_seq = int((disk or {}).get("seq") or 0)
+
+    with _planner_diag_lock:
+        mem_last = _planner_diag.get("last")
+        mem_events: List[Dict[str, Any]] = list(_planner_diag.get("events") or [])
+        mem_seq = int(_planner_diag.get("seq") or 0)
+
+    if mem_seq > disk_seq and mem_last is not None:
+        last = mem_last
+        events = mem_events
+        seq_top = mem_seq
+        source = "memory"
+    elif disk_seq > mem_seq and disk and disk.get("last"):
+        last = disk["last"]
+        events = list(disk.get("events") or [])
+        seq_top = disk_seq
+        source = "disk"
+    elif mem_last is not None:
+        last = mem_last
+        events = mem_events
+        seq_top = mem_seq
+        source = "memory"
+    elif disk and disk.get("last"):
+        last = disk["last"]
+        events = list(disk.get("events") or [])
+        seq_top = disk_seq
+        source = "disk"
+    else:
+        last = None
+        events = []
+        seq_top = max(mem_seq, disk_seq)
+        source = "none"
+
+    out: Dict[str, Any] = {
+        "status": "ok",
+        "seq": seq_top,
+        "source": source,
+        "process_boot_utc": PLANNER_DIAG_PROCESS_BOOT_UTC,
+        "persist_file": str(PLANNER_DIAG_FILE),
+        "persisted_utc_from_file": (disk or {}).get("persisted_utc"),
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "last": None,
+        "seconds_since_last_event": None,
+        "recent": [],
+        "hints": [],
+    }
+
+    if last is None:
+        out["hints"].append("No planner events recorded yet.")
+        return out
+
+    last_age = round(_seconds_since_event(last, now_mono), 3)
+    out["last"] = {
+        "seq": last.get("seq"),
+        "utc": last.get("utc"),
+        "phase": last.get("phase"),
+        "detail": last.get("detail"),
+        "bearings": last.get("bearings"),
+        "client_ms": last.get("client_ms"),
+        "age_s": last_age,
+    }
+    out["seconds_since_last_event"] = last_age
+
+    for e in events[-15:]:
+        age_e = round(_seconds_since_event(e, now_mono), 3)
+        out["recent"].append({
+            "seq": e.get("seq"),
+            "age_s": age_e,
+            "phase": e.get("phase"),
+            "detail": str(e.get("detail") or "")[:160],
+            "bearings": e.get("bearings"),
+        })
+    return out
+
+
+@app.post("/api/debug/planner-phase")
+async def debug_planner_phase(payload: Dict[str, Any]) -> Dict[str, Any]:
+    phase = str(payload.get("phase") or "").strip() or "unknown"
+    detail = str(payload.get("detail") or "").replace("\n", " ")[:500]
+    logging.getLogger(__name__).info("planner_phase_client: phase=%s detail=%s", phase, detail[:240])
+    evt = _record_planner_phase(phase, detail, payload.get("t"))
+    resp: Dict[str, Any] = {"status": "ok", "seq": evt.get("seq")}
+    if evt.get("bearings"):
+        resp["bearings"] = evt["bearings"]
+    return resp
 
 
 @app.post("/api/mesh-profiles/put")
