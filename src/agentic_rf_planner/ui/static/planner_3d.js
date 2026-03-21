@@ -8,6 +8,9 @@
 import * as Cesium from "/Cesium/index.js";
 import { buildAndUploadProfiles } from "/mesh_profiler_core.js";
 
+window.__RFP_3D_BUILD = "rt-heartbeat-osm-1";
+window.__RF_RT_TRACE = [];
+
 let viewer = null;
 let txEntity = null;
 let rxEntity = null;
@@ -53,6 +56,9 @@ const STREET_LABEL_MINOR_SCALE = new Cesium.NearFarScalar(400.0, 0.95, 12000.0, 
 const STREET_LABEL_MAJOR_ALPHA = new Cesium.NearFarScalar(800.0, 1.0, 26000.0, 0.35);
 const STREET_LABEL_MINOR_ALPHA = new Cesium.NearFarScalar(400.0, 1.0, 14000.0, 0.25);
 const MULTI_TX_PULL_DELAY_MS = 1500;
+const REMOTE_PLAN_POLL_MS = 1500;
+const REMOTE_PLAN_SEQ_STORAGE_KEY = "rfplanner3d_remote_plan_seq";
+const REMOTE_PLAN_BOOT_STORAGE_KEY = "rfplanner3d_remote_plan_boot_utc";
 let isPlanningQueue = false;
 
 // Debug overlay: multipath rays (direct + reflections)
@@ -76,150 +82,98 @@ function rsrpToAlpha(rsrpDbm) {
   return 0.15 + 0.75 * t;
 }
 
-async function fetchRaytracePaths(txLat, txLon, rxLat, rxLon) {
-  const sectors = collectSectorConfigs();
-  const rtProfile = getRtProfileParams(txLat, txLon, rxLat, rxLon);
-  const body = {
-    tx_lat: txLat,
-    tx_lon: txLon,
-    rx_lat: rxLat,
-    rx_lon: rxLon,
-    ray_mode: "3d_rt",
-    tx_height_m: getNumber("tx-height-m", 10.0),
-    rx_height_m: getNumber("rx-height-m", 1.5),
-    freq_mhz: getNumber("freq-mhz", 3500.0),
-    tx_power_dbm: getNumber("tx-power-dbm", 43.0),
-    noise_figure_db: getNumber("noise-figure-db", 7.0),
-    channel_bandwidth_mhz: getNumber("bw-mhz", 40.0),
-    num_resource_blocks: Math.round(getNumber("num-rb", 100)),
-    mimo_mode: getString("mimo-mode", "MIMO"),
-    electrical_tilt_deg: getNumber("electrical-tilt-deg", 0.0),
-    mechanical_tilt_deg: getNumber("mechanical-tilt-deg", 0.0),
-    vertical_beamwidth_deg: getNumber("vertical-beamwidth-deg", 8.0),
-    max_vertical_attenuation_db: getNumber("max-vertical-atten-db", 30.0),
-    max_horizontal_attenuation_db: getNumber("max-horizontal-atten-db", 30.0),
-    front_to_back_attenuation_db: getNumber("front-to-back-atten-db", 25.0),
-    path_loss_model: getString("path-loss-model", "3gpp_38901"),
-    propagation_scenario: getString("propagation-scenario", "umi_street_canyon"),
-    termination_rsrp_dbm: getNumber("termination-rsrp-dbm", -140.0),
-    sectors: sectors.length ? sectors : null,
-    max_bounces: 20,
-    max_wall_candidates: 120,
-    max_paths: 24,
-    reflection_loss_db: 8.0,
-    profile_max_range_m: rtProfile.maxRangeM,
-    profile_dr_m: rtProfile.drM,
-    profile_dtheta_deg: rtProfile.dthetaDeg,
+function rfRtTrace(stage, extra = {}) {
+  const entry = { t: new Date().toISOString(), stage, extra };
+  window.__RF_RT_TRACE.push(entry);
+  if (window.__RF_RT_TRACE.length > 200) {
+    window.__RF_RT_TRACE.splice(0, window.__RF_RT_TRACE.length - 200);
+  }
+  console.info("[RF RT]", stage, extra);
+  return entry;
+}
+
+function formatRtHeartbeat(evt) {
+  const elapsed = Number.isFinite(Number(evt?.elapsed_s)) ? `${Number(evt.elapsed_s).toFixed(1)}s` : "?s";
+  const stage = String(evt?.stage || "processing");
+  const detail = String(evt?.detail || "working");
+  return `Launching 3D RT... heartbeat (${elapsed}): ${stage}${detail ? ` — ${detail}` : ""}`;
+}
+
+async function fetchRaytracePathsWithHeartbeat(body) {
+  const controller = new AbortController();
+  let idleTimer = null;
+  const idleTimeoutMs = 20000;
+  const resetIdleTimer = () => {
+    if (idleTimer) window.clearTimeout(idleTimer);
+    idleTimer = window.setTimeout(() => controller.abort("rt-heartbeat-timeout"), idleTimeoutMs);
   };
-
-  const resp = await fetch("/api/raytrace_paths", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`/api/raytrace_paths failed (${resp.status}): ${t}`);
-  }
-  return await resp.json();
-}
-
-async function isSegmentBlockedByGoogleMesh(p0, p1, sampleStepM = 2.0, clearanceM = 0.6) {
-  if (!viewer || !viewer.scene) return false;
-
-  const totalDistM = haversineDistanceM(p0.lat, p0.lon, p1.lat, p1.lon);
-  if (!Number.isFinite(totalDistM) || totalDistM < 6.0) return false;
-
-  const steps = Math.max(2, Math.ceil(totalDistM / sampleStepM));
-  const probeHeightM = Math.max(Number(p0.h || 0.0), Number(p1.h || 0.0)) + 250.0;
-  const sampleCartesians = [];
-  const lineHeights = [];
-
-  for (let i = 1; i < steps; i++) {
-    const t = i / steps;
-    const distFromEnds = Math.min(t, 1.0 - t) * totalDistM;
-    if (distFromEnds < 2.5) continue;
-    const lat = p0.lat + (p1.lat - p0.lat) * t;
-    const lon = p0.lon + (p1.lon - p0.lon) * t;
-    const lineH = Number(p0.h || 0.0) + (Number(p1.h || 0.0) - Number(p0.h || 0.0)) * t;
-    sampleCartesians.push(Cesium.Cartesian3.fromDegrees(lon, lat, probeHeightM));
-    lineHeights.push(lineH);
-  }
-
-  if (!sampleCartesians.length) return false;
-
-  const clamped = await viewer.scene.clampToHeightMostDetailed(sampleCartesians);
-  for (let i = 0; i < clamped.length; i++) {
-    const c = clamped[i];
-    if (!c) continue;
-    const carto = Cesium.Cartographic.fromCartesian(c);
-    const meshH = carto.height;
-    if (Number.isFinite(meshH) && meshH > lineHeights[i] + clearanceM) {
-      return true;
+  try {
+    resetIdleTimer();
+    rfRtTrace("fetch_start", { endpoint: "/api/raytrace_paths/stream" });
+    const resp = await fetch("/api/raytrace_paths/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`/api/raytrace_paths/stream ${resp.status}: ${t}`);
     }
-  }
-  return false;
-}
-
-async function filterRaytracePathsWithGoogleMesh(paths) {
-  const valid = [];
-  const rejected = [];
-
-  for (const path of Array.isArray(paths) ? paths : []) {
-    const pts = Array.isArray(path?.points) ? path.points : [];
-    if (pts.length < 2) continue;
-
-    let blocked = false;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = pts[i];
-      const p1 = pts[i + 1];
-      try {
-        if (await isSegmentBlockedByGoogleMesh(p0, p1)) {
-          blocked = true;
-          break;
+    if (!resp.body || !resp.body.getReader) {
+      resetIdleTimer();
+      const fallback = await resp.json();
+      return fallback;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalPayload = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      resetIdleTimer();
+      buffer += decoder.decode(value, { stream: true });
+      let nl = buffer.indexOf("\n");
+      while (nl >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        nl = buffer.indexOf("\n");
+        if (!line) continue;
+        let evt;
+        try {
+          evt = JSON.parse(line);
+        } catch (e) {
+          rfRtTrace("stream_parse_error", { line, error: String(e) });
+          continue;
         }
-      } catch (e) {
-        console.warn("Google-mesh path validation failed on segment", i, e);
+        rfRtTrace("stream_event", evt);
+        if (evt.type === "heartbeat") {
+          setStatus(formatRtHeartbeat(evt));
+        } else if (evt.type === "result") {
+          finalPayload = evt.payload || null;
+        } else if (evt.type === "error") {
+          throw new Error(String(evt.error || "3D RT stream failed."));
+        }
       }
     }
-
-    if (blocked) {
-      rejected.push(path);
-    } else {
-      valid.push(path);
-    }
-  }
-
-  return { valid, rejected };
-}
-
-async function renderRaytraceOverlay(txLat, txLon, rxLat, rxLon) {
-  if (!viewer) return { rawCount: 0, drawnCount: 0, filteredCount: 0, paths: [], json: null };
-  clearRaytraceOverlay();
-
-  const rayMode = getString("ray-mode", "3d").toLowerCase();
-  const toggle = document.getElementById("show-raytrace-toggle");
-  const enabled = !!(toggle && toggle.checked);
-  if (!enabled || rayMode !== "3d_rt") return { rawCount: 0, drawnCount: 0, filteredCount: 0, paths: [], json: null };
-  if (!Number.isFinite(rxLat) || !Number.isFinite(rxLon)) return { rawCount: 0, drawnCount: 0, filteredCount: 0, paths: [], json: null };
-
-  let json;
-  try {
-    json = await fetchRaytracePaths(txLat, txLon, rxLat, rxLon);
+    if (idleTimer) window.clearTimeout(idleTimer);
+    if (!finalPayload) throw new Error("3D RT stream ended without a final result.");
+    return finalPayload;
   } catch (e) {
-    console.warn("/api/raytrace_paths failed:", e);
+    if (idleTimer) window.clearTimeout(idleTimer);
+    if (String(e) === "rt-heartbeat-timeout" || e?.name === "AbortError") {
+      throw new Error("3D RT request timed out after backend heartbeats stopped.");
+    }
     throw e;
   }
+}
 
-  const rawPaths = Array.isArray(json?.paths) ? json.paths : [];
-  let filtered = { valid: rawPaths, rejected: [] };
-  try {
-    filtered = await filterRaytracePathsWithGoogleMesh(rawPaths);
-  } catch (e) {
-    console.warn("Google mesh validation failed; falling back to unfiltered paths", e);
-  }
-
-  const paths = filtered.valid;
+function drawRaytracePathsFromPayload(json, { clearExisting = true } = {}) {
+  if (!viewer) return { json, rawCount: 0, drawnCount: 0, paths: [] };
+  if (clearExisting) clearRaytraceOverlay();
+  const paths = Array.isArray(json?.paths) ? json.paths : [];
+  let drawnCount = 0;
   for (const p of paths) {
     const pts = Array.isArray(p?.points) ? p.points : [];
     if (pts.length < 2) continue;
@@ -227,19 +181,17 @@ async function renderRaytraceOverlay(txLat, txLon, rxLat, rxLon) {
     for (const q of pts) {
       const lat = Number(q?.lat);
       const lon = Number(q?.lon);
-      const h = Number.isFinite(Number(q?.h)) ? Number(q.h) : 0.0;
+      const h = Number.isFinite(q?.h) ? Number(q.h) : 0.0;
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
       flat.push(lon, lat, h);
     }
     if (flat.length < 6) continue;
-
     const rsrp = Number(p?.rsrp_dbm);
-    const alpha = rsrpToAlpha(Number.isFinite(rsrp) ? rsrp : -140.0);
+    const alpha = rsrpToAlpha(Number.isFinite(rsrp) ? rsrp : -140);
     const kind = String(p?.kind || "direct");
     const color = kind === "direct"
       ? Cesium.Color.CYAN.withAlpha(alpha)
-      : (kind === "reflect" ? Cesium.Color.YELLOW.withAlpha(alpha) : Cesium.Color.LIME.withAlpha(alpha));
-
+      : (kind === "reflect2" ? Cesium.Color.LIME.withAlpha(alpha) : Cesium.Color.YELLOW.withAlpha(alpha));
     const entity = viewer.entities.add({
       polyline: {
         positions: Cesium.Cartesian3.fromDegreesArrayHeights(flat),
@@ -249,16 +201,57 @@ async function renderRaytraceOverlay(txLat, txLon, rxLat, rxLon) {
       },
     });
     raytraceEntities.push(entity);
+    drawnCount += 1;
   }
+  return { json, rawCount: paths.length, drawnCount, paths };
+}
 
-  const outJson = { ...(json || {}), paths };
-  return {
-    rawCount: rawPaths.length,
-    drawnCount: paths.length,
-    filteredCount: filtered.rejected.length,
-    paths,
-    json: outJson,
+async function renderRaytraceOverlay(txLat, txLon, rxLat, rxLon) {
+  if (!viewer) return;
+  clearRaytraceOverlay();
+
+  const rayMode = getString("ray-mode", "3d").toLowerCase();
+  const toggle = document.getElementById("show-raytrace-toggle");
+  const enabled = !!(toggle && toggle.checked);
+  if (!enabled || rayMode !== "3d_rt") return;
+  if (!Number.isFinite(rxLat) || !Number.isFinite(rxLon)) return;
+
+  const body = {
+    tx_lat: txLat,
+    tx_lon: txLon,
+    rx_lat: rxLat,
+    rx_lon: rxLon,
+    ray_mode: rayMode,
+    tx_height_m: getNumber("tx-height-m", 10.0),
+    rx_height_m: getNumber("rx-height-m", 1.5),
+    freq_mhz: getNumber("freq-mhz", 3500.0),
+    tx_power_dbm: getNumber("tx-power-dbm", 43.0),
+    termination_rsrp_dbm: getNumber("termination-rsrp-dbm", -140.0),
+    max_bounces: 2,
+    max_wall_candidates: 80,
+    max_paths: 12,
+    reflection_loss_db: 8.0,
   };
+
+  setStatus(`Launching 3D RT...
+
+TX=(${txLat.toFixed(6)}, ${txLon.toFixed(6)})
+RX=(${rxLat.toFixed(6)}, ${rxLon.toFixed(6)})`);
+  rfRtTrace("calling_raytrace", body);
+  try {
+    const json = await fetchRaytracePathsWithHeartbeat(body);
+    const drawn = drawRaytracePathsFromPayload(json);
+    const summary = String(json?.message || `3D RT complete: raw=${drawn.rawCount} drawn=${drawn.drawnCount}`);
+    setStatus(summary);
+    rfRtTrace("raytrace_complete", { raw: drawn.rawCount, drawn: drawn.drawnCount, message: json?.message || null });
+    return drawn;
+  } catch (e) {
+    const msg = `3D RT request failed before completion: ${String(e)}`;
+    setStatus(msg + " Open DevTools console and inspect window.__RF_RT_TRACE.");
+    rfRtTrace("raytrace_request_failed", { error: String(e) });
+    console.warn(msg, e);
+    return null;
+  }
 }
 
 // Polygon drawing mode (Cesium)
@@ -432,6 +425,28 @@ function getQueuedTxPoints() {
   return null;
 }
 
+function syncRxManualFields(lat, lon) {
+  const la = document.getElementById("rx-lat-manual");
+  const lo = document.getElementById("rx-lon-manual");
+  if (!la || !lo) return;
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    la.value = String(lat);
+    lo.value = String(lon);
+  }
+}
+
+function applyManualRxFromInputsIfNeeded() {
+  const la = document.getElementById("rx-lat-manual");
+  const lo = document.getElementById("rx-lon-manual");
+  if (!la || !lo) return false;
+  const rlat = Number.parseFloat(String(la.value || "").trim());
+  const rlon = Number.parseFloat(String(lo.value || "").trim());
+  if (!Number.isFinite(rlat) || !Number.isFinite(rlon)) return false;
+  currentRxLocation = { lat: rlat, lon: rlon };
+  if (viewer) updateRxMarker(rlat, rlon);
+  return true;
+}
+
 function getLastQueuedTxPoint() {
   const parsed = parseTxInput();
   return parsed.points.length ? parsed.points[parsed.points.length - 1] : null;
@@ -549,18 +564,6 @@ function haversineDistanceM(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat / 2) ** 2
     + Math.cos(p1) * Math.cos(p2) * Math.sin(dLon / 2) ** 2;
   return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function getRtProfileParams(txLat, txLon, rxLat, rxLon) {
-  const distM = (Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(rxLat) && Number.isFinite(rxLon))
-    ? haversineDistanceM(txLat, txLon, rxLat, rxLon)
-    : getNumber("max-range", 2000.0);
-  const requestedRangeM = getNumber("max-range", 2000.0);
-  return {
-    maxRangeM: Math.max(600.0, Math.min(4000.0, Math.max(requestedRangeM, distM + 250.0))),
-    drM: Math.min(getNumber("dr-m", 5.0), 2.0),
-    dthetaDeg: Math.min(getNumber("dtheta", 5.0), 1.0),
-  };
 }
 
 function flyToQueuedPoints(queue) {
@@ -1914,12 +1917,12 @@ function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
   }
 }
 
-async function ensureProfiles(txLat, txLon, overrides = {}) {
+async function ensureProfiles(txLat, txLon) {
   const txHeightM = getNumber("tx-height-m", 10.0);
   const rxHeightM = getNumber("rx-height-m", 1.5);
-  const maxRangeM = Number.isFinite(Number(overrides.maxRangeM)) ? Number(overrides.maxRangeM) : getNumber("max-range", 2000.0);
-  const drM = Number.isFinite(Number(overrides.drM)) ? Number(overrides.drM) : getNumber("dr-m", 5.0);
-  const dthetaDeg = Number.isFinite(Number(overrides.dthetaDeg)) ? Number(overrides.dthetaDeg) : getNumber("dtheta", 5.0);
+  const maxRangeM = getNumber("max-range", 2000.0);
+  const drM = getNumber("dr-m", 5.0);
+  const dthetaDeg = getNumber("dtheta", 5.0);
 
   const hasUrl = `/api/mesh-profiles/has?tx_lat=${encodeURIComponent(txLat)}&tx_lon=${encodeURIComponent(txLon)}`
     + `&tx_height_m=${encodeURIComponent(txHeightM)}&rx_height_m=${encodeURIComponent(rxHeightM)}`
@@ -1929,13 +1932,11 @@ async function ensureProfiles(txLat, txLon, overrides = {}) {
   if (!hasResp.ok) throw new Error(`GET ${hasUrl} failed (${hasResp.status})`);
   const hasJson = await hasResp.json();
   if (hasJson && hasJson.exists) {
-    setMeshStatus(`3D profiles cached.
-key=${hasJson.key}`);
-    return { exists: true, key: hasJson.key, maxRangeM, drM, dthetaDeg };
+    setMeshStatus(`3D profiles cached.\nkey=${hasJson.key}`);
+    return { exists: true, key: hasJson.key };
   }
 
-  setMeshStatus(`3D profiles missing. Generating + uploading…
-range=${Math.round(maxRangeM)}m dr=${drM}m dθ=${dthetaDeg}°`);
+  setMeshStatus("3D profiles missing. Generating + uploading…");
 
   await buildAndUploadProfiles({
     containerId: "cesiumProfilerHost",
@@ -1951,7 +1952,7 @@ range=${Math.round(maxRangeM)}m dr=${drM}m dθ=${dthetaDeg}°`);
   });
 
   setMeshStatus("3D profiles uploaded.");
-  return { exists: true, key: null, maxRangeM, drM, dthetaDeg };
+  return { exists: true, key: null };
 }
 
 function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) {
@@ -2010,71 +2011,162 @@ function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) 
   };
 }
 
-async function runRaytracePlanForTx(lat, lon, {
-  queueIndex = 1,
-  total = 1,
-  attempt = 1,
+async function applyPlanResponseToViewer(out, {
+  requestLat,
+  requestLon,
+  rayMode: rayModeOpt,
   refreshStreetLabelsOnSuccess = true,
+  statusPrefix = "",
+  attemptText = "",
 } = {}) {
-  const prefix = total > 1 ? `TX ${queueIndex}/${total}` : "TX";
-  const attemptText = attempt > 1 ? ` (retry ${attempt - 1})` : "";
+  if (!out || typeof out !== "object") throw new Error("applyPlanResponseToViewer: invalid plan payload");
 
-  if (!currentRxLocation) {
-    const error = "3D RT mode requires an RX. Hold SHIFT and click the Google mesh to set RX first.";
-    setStatus(`${prefix}${attemptText}: ${error}`);
-    return { ok: false, error, cacheCenter: { lat, lon } };
+  if (out.mode === "3d_rt" && out.raytrace && typeof out.raytrace === "object") {
+    const txLat = out.snapped_tx?.lat ?? out.original_point?.lat ?? requestLat;
+    const txLon = out.snapped_tx?.lon ?? out.original_point?.lon ?? requestLon;
+    const rx = out.rx_point;
+    if (!Number.isFinite(txLat) || !Number.isFinite(txLon)) throw new Error("applyPlanResponseToViewer: 3d_rt payload missing TX coordinates");
+    if (!rx || !Number.isFinite(rx.lat) || !Number.isFinite(rx.lon)) throw new Error("applyPlanResponseToViewer: 3d_rt payload missing rx_point");
+    const rmEl = document.getElementById("ray-mode");
+    if (rmEl) rmEl.value = "3d_rt";
+    currentTxLocation = { lat: txLat, lon: txLon };
+    currentRxLocation = { lat: rx.lat, lon: rx.lon };
+    clearOverlay();
+    clearRaytraceOverlay();
+    updateTxMarker(txLat, txLon);
+    updateRxMarker(rx.lat, rx.lon);
+    addPlannedTxMarker(txLat, txLon);
+    syncRxManualFields(rx.lat, rx.lon);
+    const summary = drawRaytracePathsFromPayload(out.raytrace);
+    if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
+    setStatus(`${statusPrefix}${attemptText}: 3D RT applied. Multipath polylines drawn: ${summary.drawnCount} (API paths: ${summary.rawCount}).`);
+    console.info("RFPlanner3D apply 3d_rt", { rawCount: summary.rawCount, drawnCount: summary.drawnCount, payload: out });
+    return { lat: txLat, lon: txLon };
   }
 
-  currentTxLocation = { lat, lon };
-  updateTxMarker(lat, lon);
-  document.getElementById("show-raytrace-toggle").checked = true;
+  let lat = requestLat;
+  let lon = requestLon;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    if (out.original_point && Number.isFinite(out.original_point.lat) && Number.isFinite(out.original_point.lon)) {
+      lat = out.original_point.lat;
+      lon = out.original_point.lon;
+    } else if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
+      lat = out.snapped_tx.lat;
+      lon = out.snapped_tx.lon;
+    }
+  }
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) throw new Error("applyPlanResponseToViewer: need lat/lon in payload");
 
-  const rtProfile = getRtProfileParams(lat, lon, currentRxLocation.lat, currentRxLocation.lon);
-  try {
-    setStatus(`${prefix}${attemptText}: preparing 3D RT profiles…`);
-    await ensureProfiles(lat, lon, rtProfile);
-  } catch (e) {
-    const error = `failed to build RT mesh profiles: ${e}`;
-    setStatus(`${prefix}${attemptText}: ${error}`);
-    return { ok: false, error, cacheCenter: { lat, lon } };
+  const rayMode = String(rayModeOpt || out.ray_mode || getString("ray-mode", "3d")).toLowerCase();
+
+  if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
+    currentTxLocation = { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon };
+    updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
+    addPlannedTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
+  } else {
+    currentTxLocation = { lat, lon };
+    updateTxMarker(lat, lon);
+    addPlannedTxMarker(lat, lon);
   }
 
-  clearOverlay();
-  clearRaytraceOverlay();
-  updateTxMarker(lat, lon);
-  updateRxMarker(currentRxLocation.lat, currentRxLocation.lon);
-
-  let summary;
-  try {
-    setStatus(`${prefix}${attemptText}: tracing rays…`);
-    summary = await renderRaytraceOverlay(lat, lon, currentRxLocation.lat, currentRxLocation.lon);
-  } catch (e) {
-    const error = `3D RT failed: ${e}`;
-    setStatus(`${prefix}${attemptText}: ${error}`);
-    return { ok: false, error, cacheCenter: { lat, lon } };
+  if (out.grid) {
+    if (rayMode === "3d" || rayMode === "3d_rt") {
+      if (out.heatmap) {
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
+      } else {
+        try {
+          await renderDrapedSurfaceCoverage(out.grid);
+        } catch (e) {
+          console.warn("Surface drape failed, falling back to point grid:", e);
+          renderGridCoverage(out.grid);
+        }
+      }
+    } else if (rayMode === "3d_osm") {
+      if (out.heatmap) {
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
+      } else {
+        renderGridCoverage(out.grid);
+      }
+    } else {
+      renderGridCoverage(out.grid);
+    }
   }
 
-  addPlannedTxMarker(lat, lon);
+  const radiusM = getNumber("max-range", 2000.0);
+  if (out.sectors && out.snapped_tx) {
+    drawSectorOverlays(out.sectors, out.snapped_tx.lat, out.snapped_tx.lon, radiusM);
+  }
+
+  if (currentTxLocation && currentRxLocation && rayMode === "3d_rt") {
+    try {
+      await renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon, currentRxLocation.lat, currentRxLocation.lon);
+    } catch (e) {
+      console.warn("Failed to render raytrace overlay:", e);
+    }
+  }
+
+  const key = out.mesh_profile_key ? `\nmesh_key=${out.mesh_profile_key}` : "";
   if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
+  setStatus(`${statusPrefix}${attemptText}: plan complete.${key}`);
+  console.info("RFPlanner3D apply plan", { rayMode, payload: out });
 
-  const best = Array.isArray(summary.paths) && summary.paths.length ? summary.paths[0] : null;
-  const bestText = best
-    ? ` Best=${String(best.kind || "path")} ${Number(best.rsrp_dbm).toFixed(1)} dBm${best.sector_id ? ` via ${best.sector_id}` : ""}.`
-    : " No valid path survived Google-mesh validation.";
-  setStatus(`${prefix}${attemptText}: RT complete. ${summary.drawnCount}/${summary.rawCount} paths kept after Google-mesh validation; ${summary.filteredCount} rejected.${bestText}`);
+  return (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon))
+    ? { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon }
+    : { lat, lon };
+}
 
-  return {
-    ok: true,
-    out: {
-      mode: "3d_rt",
-      raytrace: summary.json,
-      raw_path_count: summary.rawCount,
-      drawn_path_count: summary.drawnCount,
-      rejected_path_count: summary.filteredCount,
-      profile_resolution: rtProfile,
-    },
-    cacheCenter: { lat, lon },
+function startRemotePlanRfPolling() {
+  let lastSeq = 0;
+  try {
+    const raw = sessionStorage.getItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
+    if (raw) lastSeq = Math.max(0, Number(raw) || 0);
+  } catch { /* ignore */ }
+
+  const tick = async () => {
+    try {
+      const r = await fetch(`/api/ui/remote-plan-rf/poll?since_seq=${encodeURIComponent(String(lastSeq))}`);
+      if (!r.ok) return;
+      const j = await r.json();
+      let storedBoot = "";
+      const boot = String(j.server_boot_utc || "");
+      try {
+        storedBoot = sessionStorage.getItem(REMOTE_PLAN_BOOT_STORAGE_KEY) || "";
+      } catch { /* ignore */ }
+      if (storedBoot && boot && storedBoot !== boot) {
+        try {
+          sessionStorage.setItem(REMOTE_PLAN_BOOT_STORAGE_KEY, boot);
+          lastSeq = 0;
+          sessionStorage.removeItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
+        } catch { /* ignore */ }
+        return;
+      }
+      if (boot && !storedBoot) {
+        try {
+          sessionStorage.setItem(REMOTE_PLAN_BOOT_STORAGE_KEY, boot);
+          lastSeq = 0;
+          sessionStorage.removeItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
+        } catch { /* ignore */ }
+        return;
+      }
+      const seq = Number(j.seq) || 0;
+      if (!j.new || seq <= lastSeq) return;
+      lastSeq = seq;
+      try {
+        sessionStorage.setItem(REMOTE_PLAN_SEQ_STORAGE_KEY, String(lastSeq));
+      } catch { /* ignore */ }
+      if (j.status === "ready" && j.plan && typeof j.plan === "object") {
+        console.info("RFPlanner3D remote poll apply", { seq, plan: j.plan });
+        await applyPlanResponseToViewer(j.plan, { refreshStreetLabelsOnSuccess: true, statusPrefix: "Remote" });
+      } else if (j.status === "error" && j.error) {
+        const er = j.error;
+        const detail = er.detail != null ? (typeof er.detail === "object" ? JSON.stringify(er.detail) : String(er.detail)) : JSON.stringify(er);
+        setStatus(`Remote Plan RF failed (HTTP ${er.status_code ?? "?"}): ${detail}`);
+      }
+    } catch { /* transient */ }
   };
+
+  setInterval(tick, REMOTE_PLAN_POLL_MS);
+  tick();
 }
 
 async function runPlanForTx(lat, lon, {
@@ -2093,16 +2185,7 @@ async function runPlanForTx(lat, lon, {
   currentTxLocation = { lat, lon };
   updateTxMarker(lat, lon);
 
-  if (rayMode === "3d_rt") {
-    return await runRaytracePlanForTx(lat, lon, {
-      queueIndex,
-      total,
-      attempt,
-      refreshStreetLabelsOnSuccess,
-    });
-  }
-
-  if (rayMode === "3d") {
+  if (rayMode === "3d" || rayMode === "3d_rt") {
     try {
       setStatus(`${prefix}${attemptText}: checking cached 3D ray profiles…`);
       await ensureProfiles(lat, lon);
@@ -2160,66 +2243,15 @@ async function runPlanForTx(lat, lon, {
     return { ok: false, error, cacheCenter: { lat, lon } };
   }
 
-  // Update TX marker to snapped point (backend always snaps today).
-  if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
-    currentTxLocation = { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon };
-    updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
-    addPlannedTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
-  } else {
-    currentTxLocation = { lat, lon };
-    updateTxMarker(lat, lon);
-    addPlannedTxMarker(lat, lon);
-  }
-
-  // Coverage rendering:
-  // - 2D mode: point grid (legacy)
-  // - 3D modes: backend-generated PNG ellipse drape for consistent visual rendering
-  //   across OSM-only and Google-mesh propagation.
-  if (out.grid) {
-      if (rayMode === "3d" || rayMode === "3d_rt") {
-      if (out.heatmap) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
-      } else {
-        try {
-          await renderDrapedSurfaceCoverage(out.grid);
-        } catch (e) {
-          // Fallback to point grid if draping fails or the PNG payload is unavailable.
-          console.warn("Surface drape failed, falling back to point grid:", e);
-          renderGridCoverage(out.grid);
-        }
-      }
-    } else if (rayMode === "3d_osm") {
-      if (out.heatmap) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
-      } else {
-        renderGridCoverage(out.grid);
-      }
-    } else {
-      renderGridCoverage(out.grid);
-    }
-  }
-
-  // Sector overlays: approximate radius from profile params (matches circular heatmap intent).
-  const radiusM = getNumber("max-range", 2000.0);
-  if (out.sectors && out.snapped_tx) {
-    drawSectorOverlays(out.sectors, out.snapped_tx.lat, out.snapped_tx.lon, radiusM);
-  }
-
-  // Optional debug overlay for multipath ray tracing mode.
-  if (currentTxLocation) {
-    try {
-      await renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon);
-    } catch (e) {
-      console.warn("Failed to render raytrace overlay:", e);
-    }
-  }
-
-  const key = out.mesh_profile_key ? `\nmesh_key=${out.mesh_profile_key}` : "";
-  if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
-  setStatus(`${prefix}${attemptText}: plan complete.${key}`);
-  const cacheCenter = (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon))
-    ? { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon }
-    : { lat, lon };
+  if (rayMode === "3d_rt") applyManualRxFromInputsIfNeeded();
+  const cacheCenter = await applyPlanResponseToViewer(out, {
+    requestLat: lat,
+    requestLon: lon,
+    rayMode,
+    refreshStreetLabelsOnSuccess,
+    statusPrefix: prefix,
+    attemptText,
+  });
   return { ok: true, out, cacheCenter };
 }
 
@@ -2398,6 +2430,7 @@ Click Plan RF Queue.`);
 
     currentRxLocation = { lat, lon };
     updateRxMarker(lat, lon);
+    syncRxManualFields(lat, lon);
 
     const rtEnabled = document.getElementById("show-raytrace-toggle")?.checked ?? false;
     if (rtEnabled && currentTxLocation) {
@@ -2413,6 +2446,40 @@ Click Plan RF Queue.`);
   document.getElementById("coord-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     await runPlan();
+  });
+  document.getElementById("plan-json-file")?.addEventListener("change", async (ev) => {
+    const f = ev.target.files?.[0];
+    if (!f) return;
+    try {
+      const raw = await f.text();
+      const ta = document.getElementById("plan-json-import");
+      if (ta) ta.value = raw;
+      setStatus(`Loaded ${f.name} into plan JSON box — click Apply plan JSON to map.`);
+    } catch (err) {
+      setStatus(`Failed to read file: ${err}`);
+    }
+    ev.target.value = "";
+  });
+  document.getElementById("plan-json-apply-btn")?.addEventListener("click", async () => {
+    const raw = document.getElementById("plan-json-import")?.value?.trim();
+    if (!raw) {
+      setStatus("Paste plan JSON or choose a .json file first.");
+      return;
+    }
+    let j;
+    try {
+      j = JSON.parse(raw);
+    } catch (err) {
+      setStatus(`Invalid JSON: ${err}`);
+      return;
+    }
+    if (j && typeof j === "object" && j.plan && !j.grid) j = j.plan;
+    try {
+      setStatus("Applying plan JSON to viewer…");
+      await applyPlanResponseToViewer(j, { refreshStreetLabelsOnSuccess: true });
+    } catch (err) {
+      setStatus(`Apply failed: ${err}`);
+    }
   });
   document.getElementById("tx-input")?.addEventListener("input", updateTxInputSummary);
 
@@ -2441,11 +2508,14 @@ Click Plan RF Queue.`);
   });
   document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
   document.getElementById("clear-map-btn").addEventListener("click", () => clearMap());
-
   await loadRfParamsDefaults();
   updateTxInputSummary();
   queueStreetLabelRefresh(true);
+  startRemotePlanRfPolling();
   setStatus("Paste one or more TX coordinates, or click on the 3D mesh to append them, then click Plan RF Queue.");
 }
 
-init().catch((e) => setStatus(`Init failed:\n${e}`));
+window.RFPlanner3DApplyPlan = applyPlanResponseToViewer;
+
+init().catch((e) => setStatus(`Init failed:
+${e}`));

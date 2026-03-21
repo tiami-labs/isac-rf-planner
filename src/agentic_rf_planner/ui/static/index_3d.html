@@ -37,9 +37,9 @@
       <div style="margin-top: 8px;">
         <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
           <input type="checkbox" id="show-raytrace-toggle" style="cursor:pointer;" />
-          <span>Show ray-traced paths (SHIFT+click to set RX)</span>
+          <span>Show multipath rays (SHIFT+click to set RX)</span>
         </label>
-        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">In 3D RT mode, Plan RF / RT Queue launches the ray-tracing engine instead of coverage planning. Uses OSM walls for candidate reflections, validates against the Google mesh, traces up to 20 bounces, and stops when path RSRP drops below -140 dBm.</div>
+        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">Remote plans from <code>/api/ui/remote-plan-rf</code> and pasted <code>/api/plan</code>/<code>/api/3d/plan-and-trace</code> JSON draw through the same Cesium viewer path.</div>
       </div>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -51,6 +51,22 @@
         <div>
           <label for="rx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">RX height (m)</label>
           <input type="number" id="rx-height-m" step="0.5" value="1.5"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+      </div>
+
+      <div style="margin-top: 10px; font-size: 10px; color: #9ad;">
+        <strong>RX (optional manual entry):</strong> SHIFT+click the mesh, or enter RX here for remote/pasted 3D RT payloads.
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px;">
+        <div>
+          <label for="rx-lat-manual" style="display: block; font-size: 11px; margin-bottom: 3px;">RX lat</label>
+          <input type="text" id="rx-lat-manual" inputmode="decimal" placeholder="37.7749"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rx-lon-manual" style="display: block; font-size: 11px; margin-bottom: 3px;">RX lon</label>
+          <input type="text" id="rx-lon-manual" inputmode="decimal" placeholder="-122.41894"
             style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
         </div>
       </div>
@@ -77,6 +93,22 @@
           Plan RF Queue
         </button>
       </form>
+
+      <details style="margin-top: 10px;">
+        <summary style="font-size: 12px; color: #ccc;">Apply JSON to map (curl replay)</summary>
+        <p style="font-size: 10px; color: #aaa; margin: 8px 0;">
+          Paste the response body from <code>/api/plan</code>, <code>/api/3d/plan-and-trace</code>, or the published plan payload from <code>/api/ui/remote-plan-rf/poll</code>.
+        </p>
+        <input type="file" id="plan-json-file" accept=".json,application/json"
+          style="width: 100%; font-size: 11px; margin-bottom: 6px; color: #ccc;" />
+        <textarea id="plan-json-import" rows="5" spellcheck="false"
+          placeholder='{"grid":...,"heatmap":...}'
+          style="width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #444; background: #222; color: #eee; resize: vertical; font-family: monospace; font-size: 10px;"></textarea>
+        <button type="button" id="plan-json-apply-btn"
+          style="width: 100%; margin-top: 6px; padding: 6px; background: #2a5238; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 11px; font-weight: bold;">
+          Apply plan JSON to map
+        </button>
+      </details>
 
       <details open style="margin-top: 10px;">
         <summary style="font-size: 12px; color: #ccc;">Advanced RF params</summary>
@@ -333,7 +365,7 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="/export_utils.js"></script>
-  <script type="module" src="/planner_3d.js?v=2"></script>
+  <script type="module" src="/planner_3d.js?v=rt-heartbeat-osm-1"></script>
   <script>
     window.addEventListener("load", function() {
       if (!window.RFPLANNER_DEBUG) {
