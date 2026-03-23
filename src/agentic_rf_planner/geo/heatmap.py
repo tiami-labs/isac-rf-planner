@@ -85,11 +85,12 @@ def attenuation_grid_to_png_ellipse(
     alpha: float = 0.70,
 ) -> Dict[str, Any]:
     """
-    Create a pre-colored PNG (base64 data URL) suitable for Cesium ellipse draping.
+    Create a pre-colored PNG (base64 data URL) for map-aligned draping.
 
     Mapping:
-      - The ellipse is centered at TX with semiMajor/semiMinor = max_range_m.
-      - Texture coordinates map linearly to local East/North meters in [-R, R].
+      - Square in local East/North meters with edge length 2*max_range_m (texture [-R,R]²).
+      - Cesium should use a geographic rectangle with the same ENU corners as 2D Leaflet;
+ a geodesic circle (ellipse) warps this texture and misaligns vs OSM.
 
     Returns dict:
       {
@@ -171,10 +172,9 @@ def attenuation_grid_to_png_ellipse(
     rmax = np.zeros((n_bins,), dtype=np.float32)
     np.maximum.at(rmax, bi_s, r_s.astype(np.float32))
 
-    # Smooth rmax a bit across neighboring bins to avoid tiny gaps from numeric jitter.
-    for k in (1, 2):
-        rmax = np.maximum(rmax, np.roll(rmax, k))
-        rmax = np.maximum(rmax, np.roll(rmax, -k))
+    # Do not smooth rmax across bearings: that inflates reach in adjacent bins and fills the
+    # texture out to max_range in directions where rays actually terminated early (buildings),
+    # which makes far-field coverage ignore blockers in /3d and misalign vs 2D Leaflet.
 
     # Per-pixel bearing bins
     theta_pix = (np.degrees(np.arctan2(x_m, y_m)) + 360.0) % 360.0

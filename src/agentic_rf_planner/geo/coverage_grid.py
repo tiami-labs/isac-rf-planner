@@ -1,8 +1,10 @@
 """Build coverage grid around transmitter."""
 
+from __future__ import annotations
+
 import math
 import logging
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from ..pipeline.schemas import LatLon, RFParams, WorldCell, MaterialType
 from .physical_spanning import MapProvider
@@ -178,9 +180,10 @@ def build_coverage_grid(
                 return False
             return True
 
-    # Adaptive dtheta for 3D OSM-only mode:
-    # target arc-length ~= 4*dr (clamped) at max range.
-    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
+    # Adaptive dtheta for OSM polygon modes (2d + 3d_osm):
+    # target arc-length ~= 4*dr (clamped) at max range — avoids sparse spokes at city range
+    # and keeps PNG fill/masking aligned with the simulation.
+    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d", "2d"):
         target_arc_m = max(12.0, min(30.0, 4.0 * dr))
         dtheta_target = math.degrees(target_arc_m / max(1.0, max_r))
         dtheta = max(0.25, min(dtheta_user, dtheta_target))
@@ -190,8 +193,8 @@ def build_coverage_grid(
         except Exception:
             pass
         logger.info(
-            f"3D OSM-only: using adaptive dtheta={dtheta:.3f}° "
-            f"(user={dtheta_user:.3f}°, target_arc≈{target_arc_m:.1f}m at R={max_r:.0f}m)"
+            f"OSM polar grid: adaptive dtheta={dtheta:.3f}° "
+            f"(user={dtheta_user:.3f}°, target_arc≈{target_arc_m:.1f}m at R={max_r:.0f}m, mode={ray_mode_eff})"
         )
     else:
         dtheta = dtheta_user
@@ -608,6 +611,7 @@ def build_coverage_grid(
                             rf_params=rf_params,
                             is_path_clear_fn=_is_path_clear_osm,
                             rsrp_for_path_fn=_rsrp_for_reflection,
+                            footprint_buildings=rt_cached_buildings,
                         )
 
                         # Combine direct + reflected contributions in linear power domain.
@@ -697,7 +701,7 @@ def build_coverage_grid(
 
 
 
-def _enu_from_tx(tx: LatLon, p: LatLon) -> tuple[float, float]:
+def _enu_from_tx(tx: LatLon, p: LatLon) -> Tuple[float, float]:
     """Local equirectangular ENU approximation (east, north) in meters."""
     R = 6371000.0
     lat0 = math.radians(tx.lat)
@@ -762,13 +766,13 @@ def _segment_intersection_t(
     return None
 
 
-def _intersection_interval_m(start: LatLon, end: LatLon, polygon: List[dict]) -> Optional[tuple[float, float]]:
+def _intersection_interval_m(start: LatLon, end: LatLon, polygon: List[dict]) -> Optional[Tuple[float, float]]:
     """Return the [entry, exit] distances where the ray overlaps a polygon."""
     if not polygon or len(polygon) < 3:
         return None
 
     # Build polygon points in ENU (east, north) relative to start.
-    pts: List[tuple[float, float]] = []
+    pts: List[Tuple[float, float]] = []
     for node in polygon:
         lat = node.get("lat")
         lon = node.get("lon")
@@ -783,7 +787,7 @@ def _intersection_interval_m(start: LatLon, end: LatLon, polygon: List[dict]) ->
     if len(pts) < 3:
         return None
 
-    def _point_in_poly(x: float, y: float, poly: List[tuple[float, float]]) -> bool:
+    def _point_in_poly(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
         # Ray-casting (even/odd) test.
         inside = False
         n = len(poly)
@@ -909,7 +913,7 @@ def _forest_intervals_m(map_provider: object, start: LatLon, end: LatLon) -> lis
     intervals.sort(key=lambda item: item["start_m"])
     return intervals
 
-def _project_from_tx(lat: float, lon: float, distance_m: float, bearing_deg: float) -> tuple[float, float]:
+def _project_from_tx(lat: float, lon: float, distance_m: float, bearing_deg: float) -> Tuple[float, float]:
     """
     Simple local ENU approximation.
     For more accuracy, use a proper geodesic library later.

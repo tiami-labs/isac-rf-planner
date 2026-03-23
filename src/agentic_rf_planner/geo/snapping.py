@@ -1,5 +1,7 @@
 """Snap user point to nearest street using OpenStreetMap."""
 
+from __future__ import annotations
+
 import logging
 import math
 from typing import Optional

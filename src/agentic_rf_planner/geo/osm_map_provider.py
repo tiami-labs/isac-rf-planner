@@ -605,6 +605,75 @@ class OSMMapProvider(MapProvider):
             total += _polygon_area_sqm(geom, center.lat)
         return total
 
+    def find_buildings_within_radius(
+        self,
+        center: LatLon,
+        radius_m: float = 50.0,
+        max_count: Optional[int] = None,
+    ) -> List[dict]:
+        """Return OSM buildings whose footprint contains or lies within radius_m of center."""
+        search_radius_m = max(1.0, float(radius_m))
+
+        try:
+            self.prefetch_all_data(center, search_radius_m + 15.0)
+            buildings = self._cached_buildings or []
+        except Exception:
+            buildings = self._get_buildings_near_point(center, search_radius_m + 15.0)
+
+        matches: List[dict] = []
+        for building in buildings:
+            geom = building.get("geometry", [])
+            if len(geom) < 3:
+                continue
+
+            contains = _polygon_contains_point(geom, center)
+            dist_m = 0.0 if contains else _distance_point_to_polygon_m(center, geom)
+            if (not contains) and dist_m > search_radius_m:
+                continue
+
+            centroid = _polygon_centroid(geom)
+            area_sqm = _polygon_area_sqm(geom, center.lat)
+            material = building.get("material") or _extract_building_material(building)
+            height_m = building.get("height_m")
+            if height_m is None:
+                height_m = _estimate_osm_height_m(building.get("tags", {}))
+
+            matches.append({
+                "id": building.get("id"),
+                "tags": building.get("tags", {}),
+                "geometry": geom,
+                "material": material,
+                "height_m": height_m,
+                "centroid": centroid.model_dump() if centroid is not None else None,
+                "area_sqm": area_sqm,
+                "distance_to_point_m": float(dist_m),
+                "match_type": "contains" if contains else "nearby",
+            })
+
+        matches.sort(key=lambda b: (
+            0 if b.get("match_type") == "contains" else 1,
+            float(b.get("distance_to_point_m") or 0.0),
+            -float(b.get("area_sqm") or 0.0),
+            int(b.get("id") or 0),
+        ))
+        if max_count is not None:
+            try:
+                limit = max(1, int(max_count))
+                matches = matches[:limit]
+            except Exception:
+                pass
+        return matches
+
+    def find_building_at_point(self, center: LatLon, radius_m: float = 50.0) -> Optional[dict]:
+        """Return the best matching building for a selected point."""
+        matches = self.find_buildings_within_radius(center, radius_m=radius_m, max_count=1)
+        if not matches:
+            return None
+        match = dict(matches[0])
+        if match.get("match_type") != "contains":
+            match["match_type"] = "nearest"
+        return match
+
     def _get_buildings_near_point(self, center: LatLon, radius_m: float) -> List[dict]:
         """Fetch building polygons near a point."""
         # Check cache - if prefetched, use it if point is within prefetch radius
@@ -836,6 +905,81 @@ def _polygon_centroid(geometry: List[dict]) -> Optional[LatLon]:
     if not lats or not lons:
         return None
     return LatLon(lat=sum(lats) / len(lats), lon=sum(lons) / len(lons))
+
+
+def _polygon_contains_point(geometry: List[dict], point: LatLon) -> bool:
+    """Return True when a point lies inside the polygon footprint."""
+    pts = []
+    for node in geometry:
+        if "lat" in node and "lon" in node:
+            pts.append((float(node["lat"]), float(node["lon"])))
+    if len(pts) < 3:
+        return False
+
+    inside = False
+    x = float(point.lon)
+    y = float(point.lat)
+    j = len(pts) - 1
+    for i in range(len(pts)):
+        yi, xi = pts[i][0], pts[i][1]
+        yj, xj = pts[j][0], pts[j][1]
+        intersects = (yi > y) != (yj > y)
+        if intersects:
+            denom = (yj - yi) if abs(yj - yi) > 1e-12 else 1e-12
+            x_cross = (xj - xi) * (y - yi) / denom + xi
+            if x < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _project_local_xy(ref: LatLon, node: dict) -> Optional[Tuple[float, float]]:
+    if "lat" not in node or "lon" not in node:
+        return None
+    lat = float(node["lat"])
+    lon = float(node["lon"])
+    lat0 = math.radians(ref.lat)
+    north = math.radians(lat - ref.lat) * 6371000.0
+    east = math.radians(lon - ref.lon) * 6371000.0 * math.cos(lat0)
+    return east, north
+
+
+def _distance_point_to_polygon_m(point: LatLon, geometry: List[dict]) -> float:
+    """Minimum horizontal distance from a point to a polygon boundary."""
+    if _polygon_contains_point(geometry, point):
+        return 0.0
+
+    pts = []
+    for node in geometry:
+        xy = _project_local_xy(point, node)
+        if xy is not None:
+            pts.append(xy)
+    if len(pts) < 2:
+        return float("inf")
+
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+
+    best = float("inf")
+    for i in range(len(pts) - 1):
+        d = _distance_point_to_segment_xy(0.0, 0.0, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
+        if d < best:
+            best = d
+    return best
+
+
+def _distance_point_to_segment_xy(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    vx = bx - ax
+    vy = by - ay
+    wx = px - ax
+    wy = py - ay
+    vv = vx * vx + vy * vy
+    if vv < 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / vv))
+    cx = ax + t * vx
+    cy = ay + t * vy
+    return math.hypot(px - cx, py - cy)
 
 
 def _ray_intersects_polygon(start: LatLon, end: LatLon, polygon: List[dict]) -> bool:
