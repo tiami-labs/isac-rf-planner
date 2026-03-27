@@ -339,6 +339,7 @@ async def api_raytrace_debug(req: RaytraceDebugRequest) -> Dict[str, Any]:
                 rf_params=rf_params,
                 is_path_clear_fn=is_path_clear,
                 rsrp_for_path_fn=rsrp_for_reflection,
+                footprint_buildings=getattr(osm, "_cached_buildings", []) or [],
             )
             for p in refl_paths:
                 out_paths.append(
@@ -818,6 +819,7 @@ def _compute_raytrace_paths_response(req: RaytracePathsRequest, progress=None) -
             rf_params=rf_params,
             is_path_clear_fn=is_path_clear,
             rsrp_for_path_fn=rsrp_for_reflection,
+            footprint_buildings=buildings,
         )
         emit("single_bounce_done", f"count={len(p1)}", count=len(p1))
         for p in p1:
@@ -849,6 +851,7 @@ def _compute_raytrace_paths_response(req: RaytracePathsRequest, progress=None) -
             rf_params=rf_params,
             is_path_clear_fn=is_path_clear,
             rsrp_for_path_fn=rsrp_for_reflection,
+            footprint_buildings=buildings,
         )
         emit("two_bounce_done", f"count={len(p2)}", count=len(p2))
         for p in p2:
@@ -1162,8 +1165,8 @@ def _require_mesh_profiles_or_409(plan_req: PlanRequest) -> str:
                 "status": "missing_mesh_profiles",
                 "cache_key_hash": pkey,
                 "message": (
-                    "Mesh profiles missing for this TX and grid resolution. Use the 3D mesh profiler in the "
-                    "browser (samples Google Photorealistic 3D Tiles), then POST /api/mesh-profiles/put."
+                    "Mesh profiles missing for this TX and grid resolution. Generate them from the /3d or / "
+                    "planner UI with Ray Mode 3D or 3d_rt (in-browser sampling), or POST /api/mesh-profiles/put."
                 ),
             },
         )
@@ -1468,8 +1471,8 @@ async def api_3d_plan_and_trace(req: PlanAndTrace3DRequest) -> Dict[str, Any]:
             detail={
                 "stages": stages,
                 "message": (
-                    "Mesh profiles missing for this TX and grid resolution. Use the 3D mesh profiler in the "
-                    "browser (samples Google Photorealistic 3D Tiles), then POST /api/mesh-profiles/put."
+                    "Mesh profiles missing for this TX and grid resolution. Generate them from the /3d or / "
+                    "planner UI with Ray Mode 3D or 3d_rt (in-browser sampling), or POST /api/mesh-profiles/put."
                 ),
             },
         )
@@ -1676,6 +1679,41 @@ async def debug_planner_phase(payload: Dict[str, Any]) -> Dict[str, Any]:
     return resp
 
 
+@app.get("/api/osm/building-at-point")
+def osm_building_at_point(lat: float, lon: float, radius_m: float = 50.0) -> Dict[str, Any]:
+    """Return the nearest/containing OSM building near a selected point."""
+    from ..geo.osm_map_provider import OSMMapProvider
+
+    center = LatLon(lat=float(lat), lon=float(lon))
+    provider = OSMMapProvider(cache_radius_m=max(100.0, float(radius_m) + 25.0))
+    building = provider.find_building_at_point(center, radius_m=float(radius_m))
+    return {
+        "status": "ok",
+        "center": center.model_dump(),
+        "radius_m": float(radius_m),
+        "found": building is not None,
+        "building": building,
+    }
+
+
+@app.get("/api/osm/buildings-near-point")
+def osm_buildings_near_point(lat: float, lon: float, radius_m: float = 50.0, max_count: Optional[int] = None) -> Dict[str, Any]:
+    """Return OSM buildings within radius of a selected point."""
+    from ..geo.osm_map_provider import OSMMapProvider
+
+    center = LatLon(lat=float(lat), lon=float(lon))
+    provider = OSMMapProvider(cache_radius_m=max(100.0, float(radius_m) + 25.0))
+    buildings = provider.find_buildings_within_radius(center, radius_m=float(radius_m), max_count=max_count)
+    return {
+        "status": "ok",
+        "center": center.model_dump(),
+        "radius_m": float(radius_m),
+        "found": bool(buildings),
+        "count": len(buildings),
+        "buildings": buildings,
+    }
+
+
 @app.post("/api/mesh-profiles/put")
 async def mesh_profiles_put(profile_set: RayProfileSet, enrich_osm: bool = True) -> Dict[str, Any]:
     """Persist a full set of mesh ray profiles for a TX/config.
@@ -1828,9 +1866,7 @@ static_dir = Path(__file__).parent.parent / "ui" / "static"
 if static_dir.exists():
     from fastapi.responses import FileResponse
 
-    # Serve Cesium assets (repo root /Cesium) for the mesh-profiler utility.
-    # This keeps Google mesh sampling out of the core planner and avoids adding
-    # a server-side tiles dependency.
+    # Serve Cesium assets (repo root /Cesium) for /3d and for client-side Google mesh profile sampling.
     repo_root = Path(__file__).resolve().parents[3]
     cesium_dir = repo_root / "Cesium"
     if cesium_dir.exists():
@@ -1864,6 +1900,12 @@ if static_dir.exists():
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
+    @app.get("/2d/planner")
+    async def redirect_2d_planner():
+        """Legacy bookmark: 2D planner is the default UI at /."""
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/", status_code=307)
+
     @app.get("/3d")
     async def serve_index_3d():
         """Serve the 3D Cesium UI explicitly."""
@@ -1885,6 +1927,14 @@ if static_dir.exists():
     @app.get("/app.js")
     async def serve_app_js():
         file_path = static_dir / "app.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/integrated_2d_raytrace.js")
+    async def serve_integrated_2d_raytrace_js():
+        file_path = static_dir / "integrated_2d_raytrace.js"
         if file_path.exists():
             return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
@@ -1913,24 +1963,6 @@ if static_dir.exists():
             return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
-
-    # Optional mesh profiler UI (Cesium + Google Photorealistic mesh sampling)
-    @app.get("/mesh-profiler")
-    async def serve_mesh_profiler():
-        file_path = static_dir / "mesh_profiler.html"
-        if file_path.exists():
-            return FileResponse(str(file_path))
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404)
-
-    @app.get("/mesh_profiler.js")
-    async def serve_mesh_profiler_js():
-        file_path = static_dir / "mesh_profiler.js"
-        if file_path.exists():
-            return FileResponse(str(file_path))
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404)
-
 
     @app.get("/mesh_profiler_core.js")
     async def serve_mesh_profiler_core_js():
