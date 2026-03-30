@@ -3,7 +3,7 @@
 import base64
 import io
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, cast
 
 import numpy as np
 from PIL import Image
@@ -19,9 +19,38 @@ from ..vision.materials_extraction import return_static_material
 from ..vision.models.base_vlm import BaseVLM
 from ..pipeline.world_builder import build_world_model
 from ..rf.attenuation_models import compute_attenuation_grid
-from ..geo.heatmap import attenuation_grid_to_raster, attenuation_grid_to_png_ellipse
+from ..geo.heatmap import attenuation_grid_to_png_ellipse
 
 logger = logging.getLogger(__name__)
+
+
+def _osm_buildings_for_client_from_map_provider(map_provider: Any) -> Optional[Dict[str, Any]]:
+    """Same OSM footprints the planner already prefetched; lets the 2D ray tracer skip a duplicate HTTP fetch."""
+    if map_provider is None:
+        return None
+    osm = map_provider
+    inner = getattr(map_provider, "osm", None)
+    if inner is not None:
+        osm = inner
+    if not isinstance(osm, OSMMapProvider):
+        return None
+    buildings = list(getattr(osm, "_cached_buildings", None) or [])
+    if not buildings:
+        return None
+    cc = getattr(osm, "_cache_center", None)
+    if cc is None:
+        return None
+    try:
+        r = float(getattr(osm, "_prefetch_radius_m", 0.0) or 0.0)
+    except Exception:
+        r = 0.0
+    if r <= 0.0:
+        return None
+    if hasattr(cc, "model_dump"):
+        center = cast(Any, cc).model_dump()
+    else:
+        center = {"lat": float(getattr(cc, "lat")), "lon": float(getattr(cc, "lon"))}
+    return {"center": center, "radius_m": r, "buildings": buildings}
 
 
 def run_rf_planning_for_point(
@@ -109,7 +138,7 @@ def run_rf_planning_for_point(
                 logger.info("  Creating GoogleMeshOSMMapProvider (3D)...")
                 from ..geo.google_mesh import GoogleMeshOSMMapProvider, MeshProfileStore, MissingMeshProfiles
 
-                osm = OSMMapProvider(cache_radius_m=1000.0)
+                osm = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
                 store = MeshProfileStore()
                 map_provider = GoogleMeshOSMMapProvider(
                     profile_store=store,
@@ -145,7 +174,7 @@ def run_rf_planning_for_point(
                 logger.info("✓ Using OSM MapProvider (3D OSM-only height slice)")
             else:
                 logger.info("  Creating OSMMapProvider...")
-                map_provider = OSMMapProvider(cache_radius_m=1000.0)
+                map_provider = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
                 logger.info("✓ Using OSM MapProvider for geometry-based world model")
         except ValueError:
             # Preserve user-actionable errors (e.g., missing mesh profiles in 3D mode).
@@ -163,7 +192,7 @@ def run_rf_planning_for_point(
                 logger.warning(f"  3D mesh profiles missing (key={e.key}), falling back to 2D OSM mode")
                 logger.info("  Using OSM MapProvider (2D) as fallback...")
                 try:
-                    map_provider = OSMMapProvider(cache_radius_m=1000.0)
+                    map_provider = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
                     rf_params.ray_mode = "2d"  # Update ray_mode to 2d
                     logger.info("✓ Using OSM MapProvider (2D fallback from missing 3D profiles)")
                 except Exception as e2:
@@ -173,7 +202,7 @@ def run_rf_planning_for_point(
                 logger.warning(f"  Failed to initialize map provider ({ray_mode}): {e}, falling back to 2D OSM mode")
                 # Fall back to OSM provider instead of stub
                 try:
-                    map_provider = OSMMapProvider(cache_radius_m=1000.0)
+                    map_provider = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
                     rf_params.ray_mode = "2d"  # Update ray_mode to 2d
                     logger.info("✓ Using OSM MapProvider (2D fallback)")
                 except Exception as e2:
@@ -309,28 +338,17 @@ def run_rf_planning_for_point(
     # 6) heatmap / map overlay
     ray_mode_eff2 = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
 
-    if ray_mode_eff2 in ("3d", "mesh", "google_mesh", "google-mesh", "3d_osm", "3d-osm", "osm3d"):
-        # Both 3D renderers now use the same pre-colored PNG ellipse drape so the
-        # frontend drawing path is visually consistent across OSM-only and Google-mesh modes.
-        # Choose texture resolution from range and step, but cap to keep transfers reasonable.
-        try:
-            step_m = float(getattr(rf_params, "step_m", 5.0) or 5.0)
-        except Exception:
-            step_m = 5.0
-        base = (2.0 * float(rf_params.max_range_m)) / max(5.0, step_m)
-        tex_size = int(min(1024, max(512, round(base))))
-        logger.debug(f"Generating heatmap PNG texture (size={tex_size})...")
-        heatmap_payload = attenuation_grid_to_png_ellipse(grid, size=tex_size, vmin=-140.0, vmax=-60.0)
-        logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
-    else:
-        logger.debug("Generating heatmap raster...")
-        lats_2d, lons_2d, rsrp_2d = attenuation_grid_to_raster(grid, width=256, height=256)
-        logger.info(f"Generated heatmap raster: {rsrp_2d.shape}")
-        heatmap_payload = {
-            "lats": lats_2d.tolist(),
-            "lons": lons_2d.tolist(),
-            "rsrp": rsrp_2d.tolist(),
-        }
+    try:
+        step_m = float(getattr(rf_params, "step_m", 5.0) or 5.0)
+    except Exception:
+        step_m = 5.0
+    base = (2.0 * float(rf_params.max_range_m)) / max(5.0, step_m)
+    tex_size = int(min(1024, max(512, round(base))))
+    # 2D OSM and 3D modes share the same pre-colored ellipse PNG (local ENU → texture),
+    # so Leaflet and Cesium both get a continuous drape instead of radial spoke circles.
+    logger.debug(f"Generating ellipse heatmap PNG (size={tex_size}, ray_mode={ray_mode_eff2})...")
+    heatmap_payload = attenuation_grid_to_png_ellipse(grid, size=tex_size, vmin=-140.0, vmax=-60.0)
+    logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
 
 
     # Prepare sector information for visualization
@@ -446,5 +464,10 @@ def run_rf_planning_for_point(
             "num_cells": len(world.cells),
             "materials_detected": len(views),
         }
+
+    if str(effective_ray_mode).strip().lower() == "2d":
+        ob = _osm_buildings_for_client_from_map_provider(map_provider)
+        if ob is not None:
+            result["osm_buildings_for_client"] = ob
 
     return result
