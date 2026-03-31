@@ -167,8 +167,13 @@ def build_world_model(
             if not buildings_along_path:
                 buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
             num_buildings = len(buildings_along_path)
-            if not hasattr(cell, 'first_blocker_distance_m') or cell.first_blocker_distance_m is None:
-                is_los = (num_buildings == 0)
+            # Polar ray-march (build_coverage_grid) stamps first_blocker_distance_m and is_los.
+            # Do not overwrite NLOS with is_los=True — that underestimates path loss in
+            # compute_attenuation_grid vs 3d_osm (which skips this refinement block).
+            if getattr(cell, "first_blocker_distance_m", None) is not None:
+                is_los = bool(getattr(cell, "is_los", True))
+            else:
+                is_los = num_buildings == 0
             
             # Count trees separately
             if map_provider.is_forest_between(tx, cell_latlon):
