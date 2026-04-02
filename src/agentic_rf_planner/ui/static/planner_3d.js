@@ -24,6 +24,14 @@ let planCounter = 0;
 
 let sectorEntities = []; // visualization overlays (entities)
 let planResults = []; // { lat, lon, out, cacheCenter } per successful plan (for export)
+let googleTileset = null;
+const googleTileInspectState = {
+  enabled: false,
+  limit: 25,
+  entries: [],
+  seenKeys: new Set(),
+  last: null,
+};
 
 // Expose for F12 console debugging
 window.RFPLANNER_DEBUG = {
@@ -32,6 +40,15 @@ window.RFPLANNER_DEBUG = {
   get sectorEntities() { return sectorEntities; },
   get planPrimitives() { return planPrimitives; },
   get rfPrimitives() { return rfPrimitives; },
+  get googleTileset() { return googleTileset; },
+  get googleTileInspectState() {
+    return {
+      enabled: googleTileInspectState.enabled,
+      limit: googleTileInspectState.limit,
+      entryCount: googleTileInspectState.entries.length,
+      last: googleTileInspectState.last,
+    };
+  },
 };
 
 let streetLabelEntities = []; // street-name labels
@@ -59,7 +76,159 @@ const MULTI_TX_PULL_DELAY_MS = 1500;
 const REMOTE_PLAN_POLL_MS = 1500;
 const REMOTE_PLAN_SEQ_STORAGE_KEY = "rfplanner3d_remote_plan_seq";
 const REMOTE_PLAN_BOOT_STORAGE_KEY = "rfplanner3d_remote_plan_boot_utc";
+const LOCAL_MESH_EXPORT_RADIUS_M = 50.0;
+const LOCAL_MESH_EXPORT_BATCH_SIZE = 256;
+const LOCAL_MESH_EXPORT_MAX_BUILDINGS = 64;
+const LOCAL_MESH_EXPORT_GROUND_MARGIN_M = 2.5;
+const LOCAL_MESH_EXPORT_MIN_HEIGHT_M = 3.0;
+const LOCAL_MESH_EXPORT_DEFAULT_HEIGHT_M = 10.0;
 let isPlanningQueue = false;
+
+function resetGoogleTileInspectionState() {
+  googleTileInspectState.entries = [];
+  googleTileInspectState.seenKeys.clear();
+  googleTileInspectState.last = null;
+}
+
+function summarizeObjectKeys(obj, limit = 20) {
+  if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return [];
+  try {
+    return Object.keys(obj).slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+function googleTileResourceUrl(resource) {
+  if (!resource) return null;
+  try {
+    if (typeof resource.getUrlComponent === 'function') return resource.getUrlComponent(true);
+  } catch {}
+  if (typeof resource.url === 'string') return resource.url;
+  if (typeof resource._url === 'string') return resource._url;
+  return null;
+}
+
+function getGoogleTileDebugKey(tile) {
+  return String(
+    tile?.content?.uri
+    || tile?.content?.url
+    || googleTileResourceUrl(tile?._contentResource)
+    || tile?._header?.content?.uri
+    || tile?._header?.content?.url
+    || `tile_${googleTileInspectState.entries.length + 1}`
+  );
+}
+
+function summarizeGoogleTileModel(model) {
+  const loader = model?._loader;
+  const gltf = loader?._gltfJsonLoader?.gltf || loader?._gltfJsonLoader?._gltf || null;
+  const sceneGraph = model?._sceneGraph;
+  return {
+    ready: model?.ready ?? null,
+    type: model?.type ?? null,
+    hasLoader: !!loader,
+    loaderKeys: summarizeObjectKeys(loader),
+    hasSceneGraph: !!sceneGraph,
+    sceneGraphKeys: summarizeObjectKeys(sceneGraph),
+    runtimeNodeCount: Array.isArray(sceneGraph?._runtimeNodes) ? sceneGraph._runtimeNodes.length : null,
+    runtimePrimitiveCount: Array.isArray(sceneGraph?._runtimePrimitives) ? sceneGraph._runtimePrimitives.length : null,
+    componentKeys: summarizeObjectKeys(sceneGraph?.components),
+    imageCount: Array.isArray(gltf?.images) ? gltf.images.length : null,
+    textureCount: Array.isArray(gltf?.textures) ? gltf.textures.length : null,
+    materialCount: Array.isArray(gltf?.materials) ? gltf.materials.length : null,
+    meshCount: Array.isArray(gltf?.meshes) ? gltf.meshes.length : null,
+    textureLoaderCount: Array.isArray(loader?._textureLoaders) ? loader._textureLoaders.length : null,
+    bufferViewLoaderCount: Array.isArray(loader?._bufferViewLoaders) ? loader._bufferViewLoaders.length : null,
+  };
+}
+
+function summarizeGoogleTileContent(content) {
+  const model = content?._model || null;
+  return {
+    constructorName: content?.constructor?.name || null,
+    keys: summarizeObjectKeys(content),
+    url: googleTileResourceUrl(content?._resource) || content?.url || content?.uri || null,
+    hasModel: !!model,
+    hasInnerContents: Array.isArray(content?.innerContents) && content.innerContents.length > 0,
+    innerContentsLength: Array.isArray(content?.innerContents) ? content.innerContents.length : null,
+    texturesByteLength: content?.texturesByteLength ?? null,
+    geometryByteLength: content?.geometryByteLength ?? null,
+    model: summarizeGoogleTileModel(model),
+  };
+}
+
+function captureGoogleTileInspection(tile) {
+  if (!googleTileInspectState.enabled || !tile) return;
+  const key = getGoogleTileDebugKey(tile);
+  if (googleTileInspectState.seenKeys.has(key)) return;
+  googleTileInspectState.seenKeys.add(key);
+
+  const content = tile.content || null;
+  const model = content?._model || null;
+  const entry = {
+    capturedAtIso: new Date().toISOString(),
+    key,
+    tile,
+    content,
+    model,
+    summary: {
+      key,
+      content: summarizeGoogleTileContent(content),
+      tileKeys: summarizeObjectKeys(tile),
+      headerKeys: summarizeObjectKeys(tile?._header),
+      boundingVolumeKeys: summarizeObjectKeys(tile?._boundingVolume),
+    },
+  };
+  googleTileInspectState.entries.push(entry);
+  if (googleTileInspectState.entries.length > googleTileInspectState.limit) {
+    googleTileInspectState.entries.shift();
+  }
+  googleTileInspectState.last = entry;
+  console.info('[RF DEBUG] Captured Google tile', entry.summary);
+}
+
+function attachGoogleTileInspectionHook(tileset) {
+  if (!tileset || tileset.__rfTileInspectionHookInstalled) return;
+  tileset.__rfTileInspectionHookInstalled = true;
+  if (tileset.tileVisible && typeof tileset.tileVisible.addEventListener === 'function') {
+    tileset.tileVisible.addEventListener((tile) => captureGoogleTileInspection(tile));
+  }
+}
+
+window.RFPLANNER_DEBUG.enableGoogleTileInspection = function enableGoogleTileInspection(options = {}) {
+  const limit = Math.max(1, Number(options?.limit) || 25);
+  googleTileInspectState.enabled = true;
+  googleTileInspectState.limit = limit;
+  resetGoogleTileInspectionState();
+  console.info(`[RF DEBUG] Google tile inspection enabled (limit=${limit}).`);
+  return window.RFPLANNER_DEBUG.googleTileInspectState;
+};
+
+window.RFPLANNER_DEBUG.disableGoogleTileInspection = function disableGoogleTileInspection() {
+  googleTileInspectState.enabled = false;
+  console.info('[RF DEBUG] Google tile inspection disabled.');
+  return window.RFPLANNER_DEBUG.googleTileInspectState;
+};
+
+window.RFPLANNER_DEBUG.getGoogleTileInspectionEntries = function getGoogleTileInspectionEntries() {
+  return googleTileInspectState.entries.slice();
+};
+
+window.RFPLANNER_DEBUG.inspectLastGoogleTile = function inspectLastGoogleTile() {
+  return googleTileInspectState.last;
+};
+
+window.RFPLANNER_DEBUG.logLastGoogleTile = function logLastGoogleTile() {
+  const last = googleTileInspectState.last;
+  if (!last) {
+    console.warn('[RF DEBUG] No Google tile captured yet.');
+    return null;
+  }
+  console.log('[RF DEBUG] Last Google tile summary', last.summary);
+  console.dir(last);
+  return last;
+};
 
 // Debug overlay: multipath rays (direct + reflections)
 let raytraceEntities = [];
@@ -1833,6 +2002,507 @@ async function exportCurrentView() {
   }
 }
 
+function getLocalMeshExportCenter() {
+  if (currentTxLocation && Number.isFinite(currentTxLocation.lat) && Number.isFinite(currentTxLocation.lon)) {
+    return { lat: currentTxLocation.lat, lon: currentTxLocation.lon };
+  }
+  const queued = getLastQueuedTxPoint();
+  if (queued && Number.isFinite(queued.lat) && Number.isFinite(queued.lon)) {
+    return { lat: queued.lat, lon: queued.lon };
+  }
+  return null;
+}
+
+function offsetLatLonMeters(originLatDeg, originLonDeg, eastM, northM) {
+  const R = 6371000.0;
+  const lat0 = Cesium.Math.toRadians(originLatDeg);
+  const dLat = northM / R;
+  const dLon = eastM / (R * Math.max(Math.cos(lat0), 1e-9));
+  return {
+    lat: originLatDeg + Cesium.Math.toDegrees(dLat),
+    lon: originLonDeg + Cesium.Math.toDegrees(dLon),
+  };
+}
+
+function localEnuFromOrigin(originLatDeg, originLonDeg, latDeg, lonDeg) {
+  const R = 6371000.0;
+  const lat0 = Cesium.Math.toRadians(originLatDeg);
+  const dLat = Cesium.Math.toRadians(latDeg - originLatDeg);
+  const dLon = Cesium.Math.toRadians(lonDeg - originLonDeg);
+  return {
+    east_m: dLon * R * Math.cos(lat0),
+    north_m: dLat * R,
+  };
+}
+
+async function fetchOsmBuildingsNearPoint(lat, lon, radiusM, maxCount = LOCAL_MESH_EXPORT_MAX_BUILDINGS) {
+  const url = `/api/osm/buildings-near-point?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&radius_m=${encodeURIComponent(radiusM)}&max_count=${encodeURIComponent(maxCount)}`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`GET ${url} failed (${resp.status}): ${txt}`);
+  }
+  return await resp.json();
+}
+
+function normalizeBuildingRing(geometry) {
+  if (!Array.isArray(geometry)) return [];
+  const ring = [];
+  for (const p of geometry) {
+    const lat = Number(p?.lat);
+    const lon = Number(p?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const prev = ring[ring.length - 1];
+    if (prev && Math.abs(prev.lat - lat) < 1e-12 && Math.abs(prev.lon - lon) < 1e-12) continue;
+    ring.push({ lat, lon });
+  }
+  if (ring.length >= 2) {
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    if (Math.abs(first.lat - last.lat) < 1e-12 && Math.abs(first.lon - last.lon) < 1e-12) {
+      ring.pop();
+    }
+  }
+  return ring.length >= 3 ? ring : [];
+}
+
+function centroidFromRing(ring) {
+  if (!Array.isArray(ring) || ring.length < 3) return null;
+  let sumLat = 0.0;
+  let sumLon = 0.0;
+  for (const p of ring) {
+    sumLat += p.lat;
+    sumLon += p.lon;
+  }
+  return { lat: sumLat / ring.length, lon: sumLon / ring.length };
+}
+
+function median(values) {
+  const nums = values.filter((v) => Number.isFinite(Number(v))).map((v) => Number(v)).sort((a, b) => a - b);
+  if (!nums.length) return null;
+  const mid = Math.floor(nums.length / 2);
+  return nums.length % 2 ? nums[mid] : 0.5 * (nums[mid - 1] + nums[mid]);
+}
+
+function slugifyBuildingLabel(text, fallback = 'building') {
+  const raw = String(text || '').trim().toLowerCase();
+  const slug = raw.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return slug || fallback;
+}
+
+function pointInTriangle2D(p, a, b, c) {
+  const area = (u, v, w) => (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+  const s1 = area(p, a, b);
+  const s2 = area(p, b, c);
+  const s3 = area(p, c, a);
+  const hasNeg = (s1 < -1e-9) || (s2 < -1e-9) || (s3 < -1e-9);
+  const hasPos = (s1 > 1e-9) || (s2 > 1e-9) || (s3 > 1e-9);
+  return !(hasNeg && hasPos);
+}
+
+function triangulateSimplePolygon(points) {
+  if (!Array.isArray(points) || points.length < 3) return [];
+  const signedArea = (() => {
+    let acc = 0.0;
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      acc += a.x * b.y - b.x * a.y;
+    }
+    return acc * 0.5;
+  })();
+  const orientation = signedArea >= 0 ? 1 : -1;
+  const remaining = points.map((_, i) => i);
+  const triangles = [];
+  let guard = 0;
+
+  while (remaining.length > 3 && guard < points.length * points.length) {
+    let clipped = false;
+    for (let i = 0; i < remaining.length; i++) {
+      const prevIndex = remaining[(i - 1 + remaining.length) % remaining.length];
+      const currIndex = remaining[i];
+      const nextIndex = remaining[(i + 1) % remaining.length];
+      const prev = points[prevIndex];
+      const curr = points[currIndex];
+      const next = points[nextIndex];
+      const cross = (curr.x - prev.x) * (next.y - prev.y) - (curr.y - prev.y) * (next.x - prev.x);
+      if (orientation * cross <= 1e-9) continue;
+
+      let containsOtherPoint = false;
+      for (const candidateIndex of remaining) {
+        if (candidateIndex === prevIndex || candidateIndex === currIndex || candidateIndex === nextIndex) continue;
+        if (pointInTriangle2D(points[candidateIndex], prev, curr, next)) {
+          containsOtherPoint = true;
+          break;
+        }
+      }
+      if (containsOtherPoint) continue;
+
+      triangles.push([prevIndex, currIndex, nextIndex]);
+      remaining.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) break;
+    guard += 1;
+  }
+
+  if (remaining.length === 3) {
+    triangles.push([remaining[0], remaining[1], remaining[2]]);
+  }
+
+  if (!triangles.length) {
+    for (let i = 1; i < points.length - 1; i++) {
+      triangles.push([0, i, i + 1]);
+    }
+  }
+  return triangles;
+}
+
+function buildingToGeoJsonFeature(building) {
+  const ring = normalizeBuildingRing(building?.geometry || []);
+  if (ring.length < 3) return null;
+  const coords = ring.map((p) => [p.lon, p.lat]);
+  coords.push([ring[0].lon, ring[0].lat]);
+  return {
+    type: 'Feature',
+    properties: {
+      id: building.id ?? null,
+      material: building.material ?? 'unknown',
+      height_m: building.height_m ?? null,
+      sampled_height_m: building.sampled_height_m ?? null,
+      area_sqm: building.area_sqm ?? null,
+      distance_to_point_m: building.distance_to_point_m ?? null,
+      match_type: building.match_type ?? null,
+      tags: building.tags || {},
+    },
+    geometry: {
+      type: 'Polygon',
+      coordinates: [coords],
+    },
+  };
+}
+
+function buildBuildingsGeoJsonCollection(buildings) {
+  return {
+    type: 'FeatureCollection',
+    features: buildings.map((b) => buildingToGeoJsonFeature(b)).filter(Boolean),
+  };
+}
+
+function buildBuildingHeightSampleSpec(building) {
+  const ring = normalizeBuildingRing(building?.geometry || []);
+  if (ring.length < 3) return null;
+  const centroid = (Number.isFinite(Number(building?.centroid?.lat)) && Number.isFinite(Number(building?.centroid?.lon)))
+    ? { lat: Number(building.centroid.lat), lon: Number(building.centroid.lon) }
+    : centroidFromRing(ring);
+  if (!centroid) return null;
+
+  const dedupe = new Map();
+  const addPoint = (arr, lat, lon) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    const key = `${lat.toFixed(8)},${lon.toFixed(8)}`;
+    if (dedupe.has(key)) return;
+    dedupe.set(key, true);
+    arr.push({ lat, lon });
+  };
+
+  const roofPoints = [];
+  addPoint(roofPoints, centroid.lat, centroid.lon);
+  const supportPoints = [];
+  for (let i = 0; i < ring.length; i++) {
+    const curr = ring[i];
+    const next = ring[(i + 1) % ring.length];
+    addPoint(roofPoints, curr.lat, curr.lon);
+    const mid = { lat: 0.5 * (curr.lat + next.lat), lon: 0.5 * (curr.lon + next.lon) };
+    addPoint(roofPoints, mid.lat, mid.lon);
+    supportPoints.push(curr, mid);
+  }
+
+  const groundPoints = [];
+  for (const sample of supportPoints) {
+    const local = localEnuFromOrigin(centroid.lat, centroid.lon, sample.lat, sample.lon);
+    const dist = Math.hypot(local.east_m, local.north_m);
+    if (!Number.isFinite(dist) || dist < 0.1) continue;
+    const scale = (dist + LOCAL_MESH_EXPORT_GROUND_MARGIN_M) / dist;
+    const outside = offsetLatLonMeters(centroid.lat, centroid.lon, local.east_m * scale, local.north_m * scale);
+    addPoint(groundPoints, outside.lat, outside.lon);
+  }
+
+  return { ring, centroid, roofPoints, groundPoints };
+}
+
+async function sampleCesiumHeights(samples, progressLabel) {
+  if (!samples.length) return [];
+  const out = Array(samples.length).fill(null);
+  for (let start = 0; start < samples.length; start += LOCAL_MESH_EXPORT_BATCH_SIZE) {
+    const batch = samples.slice(start, start + LOCAL_MESH_EXPORT_BATCH_SIZE);
+    const probes = batch.map((p) => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 2000.0));
+    const clamped = await viewer.scene.clampToHeightMostDetailed(probes);
+    for (let i = 0; i < batch.length; i++) {
+      const hit = clamped[i];
+      if (!hit) continue;
+      const carto = Cesium.Cartographic.fromCartesian(hit);
+      const height = Number(carto?.height);
+      out[start + i] = Number.isFinite(height) ? height : null;
+    }
+    if (progressLabel) {
+      setStatus(`${progressLabel}: sampled ${Math.min(samples.length, start + batch.length)}/${samples.length} points...`);
+    }
+  }
+  return out;
+}
+
+function buildExtrudedBuildingPlan(building, ring, originLat, originLon) {
+  const footprint = ring.map((p) => {
+    const local = localEnuFromOrigin(originLat, originLon, p.lat, p.lon);
+    return { x_m: local.east_m, y_m: local.north_m };
+  });
+  const triangles = triangulateSimplePolygon(footprint.map((p) => ({ x: p.x_m, y: p.y_m })));
+  return {
+    footprint,
+    triangles,
+  };
+}
+
+function materialColorForBuilding(material) {
+  switch (String(material || 'unknown').toLowerCase()) {
+    case 'wood':
+      return [0.72, 0.55, 0.38];
+    case 'brick':
+      return [0.70, 0.29, 0.22];
+    case 'concrete':
+      return [0.66, 0.66, 0.66];
+    case 'metal':
+      return [0.58, 0.63, 0.70];
+    case 'glass':
+      return [0.55, 0.74, 0.86];
+    default:
+      return [0.78, 0.78, 0.72];
+  }
+}
+
+function buildBuildingsMtl(buildings) {
+  const seen = new Set();
+  const lines = ['# RF Planner building export materials'];
+  for (const building of buildings) {
+    const material = slugifyBuildingLabel(building.material || 'unknown', 'unknown');
+    if (seen.has(material)) continue;
+    seen.add(material);
+    const [r, g, b] = materialColorForBuilding(material);
+    lines.push(`newmtl ${material}`);
+    lines.push(`Kd ${r.toFixed(4)} ${g.toFixed(4)} ${b.toFixed(4)}`);
+    lines.push('Ka 0.1000 0.1000 0.1000');
+    lines.push('Ks 0.0500 0.0500 0.0500');
+    lines.push('Ns 8.0000');
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function appendBuildingObj(lines, building, vertexOffset, originHeightM, objectName) {
+  const materialName = slugifyBuildingLabel(building.material || 'unknown', 'unknown');
+  const footprint = building.mesh_plan?.footprint || [];
+  const triangles = building.mesh_plan?.triangles || [];
+  if (footprint.length < 3 || !triangles.length) return vertexOffset;
+
+  const baseZ = Number(building.ground_height_abs_m) - originHeightM;
+  const roofZ = Number(building.roof_height_abs_m) - originHeightM;
+  lines.push(`o ${objectName}`);
+  lines.push(`usemtl ${materialName}`);
+  for (const p of footprint) {
+    lines.push(`v ${p.x_m.toFixed(4)} ${p.y_m.toFixed(4)} ${baseZ.toFixed(4)}`);
+  }
+  for (const p of footprint) {
+    lines.push(`v ${p.x_m.toFixed(4)} ${p.y_m.toFixed(4)} ${roofZ.toFixed(4)}`);
+  }
+
+  const n = footprint.length;
+  for (const tri of triangles) {
+    lines.push(`f ${vertexOffset + tri[2] + 1} ${vertexOffset + tri[1] + 1} ${vertexOffset + tri[0] + 1}`);
+  }
+  for (const tri of triangles) {
+    lines.push(`f ${vertexOffset + n + tri[0] + 1} ${vertexOffset + n + tri[1] + 1} ${vertexOffset + n + tri[2] + 1}`);
+  }
+  for (let i = 0; i < n; i++) {
+    const next = (i + 1) % n;
+    const b1 = vertexOffset + i + 1;
+    const b2 = vertexOffset + next + 1;
+    const t1 = vertexOffset + n + i + 1;
+    const t2 = vertexOffset + n + next + 1;
+    lines.push(`f ${b1} ${b2} ${t2}`);
+    lines.push(`f ${b1} ${t2} ${t1}`);
+  }
+  lines.push('');
+  return vertexOffset + n * 2;
+}
+
+function buildBuildingObjText(building, originHeightM) {
+  const objectName = building.file_stem;
+  const lines = [
+    '# RF Planner building export',
+    'mtllib buildings.mtl',
+    `# building_id ${building.id ?? 'unknown'}`,
+    `# sampled_height_m ${Number(building.sampled_height_m || 0).toFixed(3)}`,
+    '',
+  ];
+  appendBuildingObj(lines, building, 0, originHeightM, objectName);
+  return lines.join('\n') + '\n';
+}
+
+function buildCombinedBuildingsObj(buildings, originHeightM, metadata) {
+  const lines = [
+    '# RF Planner building scene export',
+    'mtllib buildings.mtl',
+    `# center_lat ${metadata.center.lat}`,
+    `# center_lon ${metadata.center.lon}`,
+    `# radius_m ${metadata.radius_m}`,
+    `# building_count ${buildings.length}`,
+    '',
+  ];
+  let vertexOffset = 0;
+  for (const building of buildings) {
+    vertexOffset = appendBuildingObj(lines, building, vertexOffset, originHeightM, building.file_stem);
+  }
+  return lines.join('\n') + '\n';
+}
+
+async function exportLocalMesh() {
+  const center = getLocalMeshExportCenter();
+  if (!center) {
+    setStatus('Select or queue a TX point first.');
+    return;
+  }
+  if (!viewer) {
+    setStatus('Cesium viewer is not initialized.');
+    return;
+  }
+
+  const btn = document.getElementById('export-local-mesh-btn');
+  if (btn) btn.disabled = true;
+  try {
+    setStatus('Exporting buildings: resolving OSM footprints...');
+    const lookup = await fetchOsmBuildingsNearPoint(center.lat, center.lon, LOCAL_MESH_EXPORT_RADIUS_M, LOCAL_MESH_EXPORT_MAX_BUILDINGS);
+    const rawBuildings = Array.isArray(lookup.buildings) ? lookup.buildings : [];
+    if (!rawBuildings.length) {
+      throw new Error('No OSM buildings were found within 50m of the selected point.');
+    }
+
+    viewer.scene.requestRender();
+    await waitForNextFrame();
+
+    const exportedBuildings = [];
+    for (let i = 0; i < rawBuildings.length; i++) {
+      const building = rawBuildings[i];
+      const sampleSpec = buildBuildingHeightSampleSpec(building);
+      if (!sampleSpec) continue;
+
+      setStatus(`Exporting buildings: sampling ${i + 1}/${rawBuildings.length}...`);
+      const [roofHeights, groundHeights] = await Promise.all([
+        sampleCesiumHeights(sampleSpec.roofPoints, `Exporting buildings ${i + 1}/${rawBuildings.length} roof`),
+        sampleCesiumHeights(sampleSpec.groundPoints, `Exporting buildings ${i + 1}/${rawBuildings.length} ground`),
+      ]);
+
+      const osmHeight = Number(building.height_m);
+      let sampledRoofAbs = median(roofHeights);
+      let sampledGroundAbs = median(groundHeights);
+      let heightM = Number.isFinite(osmHeight) && osmHeight >= LOCAL_MESH_EXPORT_MIN_HEIGHT_M ? osmHeight : null;
+      if (heightM == null && Number.isFinite(sampledRoofAbs) && Number.isFinite(sampledGroundAbs)) {
+        heightM = sampledRoofAbs - sampledGroundAbs;
+      }
+      if (!Number.isFinite(heightM) || heightM < LOCAL_MESH_EXPORT_MIN_HEIGHT_M) {
+        heightM = Number.isFinite(osmHeight) && osmHeight > 0.0 ? Math.max(osmHeight, LOCAL_MESH_EXPORT_MIN_HEIGHT_M) : LOCAL_MESH_EXPORT_DEFAULT_HEIGHT_M;
+      }
+      if (!Number.isFinite(sampledGroundAbs)) {
+        sampledGroundAbs = Number.isFinite(sampledRoofAbs) ? sampledRoofAbs - heightM : 0.0;
+      }
+      if (!Number.isFinite(sampledRoofAbs) || sampledRoofAbs < sampledGroundAbs + LOCAL_MESH_EXPORT_MIN_HEIGHT_M) {
+        sampledRoofAbs = sampledGroundAbs + heightM;
+      }
+      heightM = Math.max(sampledRoofAbs - sampledGroundAbs, LOCAL_MESH_EXPORT_MIN_HEIGHT_M);
+
+      const meshPlan = buildExtrudedBuildingPlan(building, sampleSpec.ring, center.lat, center.lon);
+      if (!meshPlan.footprint.length || !meshPlan.triangles.length) continue;
+
+      const fileStem = `building_${String(exportedBuildings.length + 1).padStart(3, '0')}_id_${building.id ?? 'unknown'}`;
+      exportedBuildings.push({
+        ...building,
+        centroid: sampleSpec.centroid,
+        ground_height_abs_m: sampledGroundAbs,
+        roof_height_abs_m: sampledRoofAbs,
+        sampled_height_m: heightM,
+        roof_sample_count: roofHeights.filter((v) => Number.isFinite(v)).length,
+        ground_sample_count: groundHeights.filter((v) => Number.isFinite(v)).length,
+        mesh_plan: meshPlan,
+        file_stem: fileStem,
+      });
+    }
+
+    if (!exportedBuildings.length) {
+      throw new Error('OSM buildings were found, but none could be turned into exportable meshes.');
+    }
+
+    const originHeightM = Math.min(...exportedBuildings.map((b) => Number(b.ground_height_abs_m)).filter((v) => Number.isFinite(v)));
+    const metadata = {
+      exported_at_iso: new Date().toISOString(),
+      center,
+      radius_m: LOCAL_MESH_EXPORT_RADIUS_M,
+      source: 'OSM footprints extruded with Cesium Google mesh roof/ground sampling',
+      building_count: exportedBuildings.length,
+      scene_origin_height_m: originHeightM,
+      buildings: exportedBuildings.map((b) => ({
+        id: b.id ?? null,
+        file: `${b.file_stem}.obj`,
+        material: b.material ?? 'unknown',
+        area_sqm: b.area_sqm ?? null,
+        distance_to_point_m: b.distance_to_point_m ?? null,
+        match_type: b.match_type ?? null,
+        osm_height_m: b.height_m ?? null,
+        sampled_height_m: b.sampled_height_m ?? null,
+        ground_height_abs_m: b.ground_height_abs_m ?? null,
+        roof_height_abs_m: b.roof_height_abs_m ?? null,
+        roof_sample_count: b.roof_sample_count ?? 0,
+        ground_sample_count: b.ground_sample_count ?? 0,
+        tags: b.tags || {},
+      })),
+    };
+
+    const geojson = buildBuildingsGeoJsonCollection(exportedBuildings);
+    const mtlText = buildBuildingsMtl(exportedBuildings);
+    const combinedObjText = buildCombinedBuildingsObj(exportedBuildings, originHeightM, metadata);
+
+    const ts = new Date();
+    const stem = `building_objects_${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, '0')}-${String(ts.getDate()).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}${String(ts.getMinutes()).padStart(2, '0')}${String(ts.getSeconds()).padStart(2, '0')}`;
+    if (typeof JSZip === 'undefined') {
+      throw new Error('JSZip is required for building export ZIP creation.');
+    }
+    const zip = new JSZip();
+    zip.file('buildings_scene.obj', combinedObjText);
+    zip.file('buildings.mtl', mtlText);
+    zip.file('metadata.json', JSON.stringify(metadata, null, 2));
+    zip.file('osm_buildings.geojson', JSON.stringify(geojson, null, 2));
+    for (const building of exportedBuildings) {
+      zip.file(`${building.file_stem}.obj`, buildBuildingObjText(building, originHeightM));
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${stem}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+
+    const first = exportedBuildings[0];
+    setStatus(`Exported building ZIP. Buildings=${exportedBuildings.length} First building id=${first.id ?? 'unknown'} Height=${Number(first.sampled_height_m || 0).toFixed(1)}m`);
+  } catch (err) {
+    console.error('Building export failed:', err);
+    setStatus(`Building export failed: ${err}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function clearMap() {
   clearOverlay();
   clearRaytraceOverlay();
@@ -2088,7 +2758,12 @@ async function applyPlanResponseToViewer(out, {
         renderGridCoverage(out.grid);
       }
     } else {
-      renderGridCoverage(out.grid);
+      // 2D OSM: same ellipse PNG drape as 3D OSM (continuous field, not radial point grid).
+      if (out.heatmap && out.heatmap.png_b64) {
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
+      } else {
+        renderGridCoverage(out.grid);
+      }
     }
   }
 
@@ -2362,6 +3037,8 @@ async function init() {
 
   try {
     const tileset = await Cesium.createGooglePhotorealistic3DTileset();
+    googleTileset = tileset;
+    attachGoogleTileInspectionHook(tileset);
     viewer.scene.primitives.add(tileset);
     if (tileset.readyPromise) await tileset.readyPromise;
   } catch (e) {
@@ -2507,6 +3184,7 @@ Click Plan RF Queue.`);
     clearRaytraceOverlay();
   });
   document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
+  document.getElementById("export-local-mesh-btn")?.addEventListener("click", () => exportLocalMesh());
   document.getElementById("clear-map-btn").addEventListener("click", () => clearMap());
   await loadRfParamsDefaults();
   updateTxInputSummary();
