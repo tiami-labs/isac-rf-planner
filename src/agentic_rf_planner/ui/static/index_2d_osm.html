@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>2D OSM Infinite-Height Ray Tracing</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121933;
+      --panel2: #172145;
+      --text: #e7ecff;
+      --muted: #a9b3d9;
+      --accent: #7ecbff;
+      --good: #5ee27a;
+      --warn: #ffb86b;
+      --bad: #ff6b6b;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    .wrap {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 16px;
+      padding: 16px;
+      box-sizing: border-box;
+      min-height: 100vh;
+    }
+    .panel {
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 14px;
+      box-sizing: border-box;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+      overflow: auto;
+    }
+    .panel h1 { margin: 0 0 10px 0; font-size: 20px; }
+    .panel h2 { margin: 16px 0 8px 0; font-size: 15px; color: var(--accent); }
+    .small { color: var(--muted); font-size: 12px; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+      margin: 8px 0;
+    }
+    .row label { color: var(--muted); }
+    input[type="range"] { width: 100%; }
+    button {
+      background: rgba(255,255,255,0.08);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+    button:hover { background: rgba(255,255,255,0.12); }
+    button.active {
+      outline: 2px solid var(--accent);
+      background: rgba(126,203,255,0.14);
+    }
+    button.primary {
+      background: rgba(94,226,122,0.16);
+      border-color: rgba(94,226,122,0.5);
+    }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .stat {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      margin: 8px 0;
+    }
+    .mapWrap {
+      background: #0d1328;
+      border-radius: 14px;
+      padding: 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .topbar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    #mapContainer {
+      position: relative;
+      width: 100%;
+      min-height: 720px;
+      height: calc(100vh - 86px);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #f6f8fc;
+    }
+    #map { width: 100%; height: 100%; }
+    #overlayCanvas {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 500;
+    }
+    .legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .swatch {
+      display: inline-block;
+      width: 16px;
+      height: 3px;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    a.linkish { color: #7ecbff; text-decoration: none; }
+    @media (max-width: 1100px) {
+      .wrap { grid-template-columns: 1fr; }
+      #mapContainer { height: 70vh; min-height: 540px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>2D OSM Infinite-Height Ray Tracing</h1>
+      <div class="small">
+        Same forward specular model as the rectangle demo, but the reflectors are OSM building footprints.
+        Buildings are treated as opaque infinite-height prisms: boundary-only reflections, no rooftop path,
+        no penetration, no diffraction.
+      </div>
+
+      <h2>Interaction</h2>
+      <div class="small">
+        Click to place <strong>Tx</strong>. <strong>Shift+click</strong> to place <strong>Rx</strong>. Use
+        <strong>Steer Tx</strong> and move the mouse over the map to set the beam center.
+      </div>
+      <div class="btns">
+        <button id="placeTxBtn" class="active">Place Tx</button>
+        <button id="steerBtn">Steer Tx</button>
+        <button id="autoAimBtn">Auto-aim at Rx</button>
+        <button id="clearBtn">Clear rays</button>
+      </div>
+
+      <h2>Beam and propagation</h2>
+      <div class="row">
+        <label for="rayCount">Ray count: <span id="rayCountVal">121</span></label>
+        <input id="rayCount" type="range" min="1" max="721" step="2" value="121" />
+      </div>
+      <div class="row">
+        <label for="spreadDeg">Beam spread (deg): <span id="spreadDegVal">50</span></label>
+        <input id="spreadDeg" type="range" min="0" max="180" value="50" />
+      </div>
+      <div class="row">
+        <label for="maxBounces">Max bounces: <span id="maxBouncesVal">4</span></label>
+        <input id="maxBounces" type="range" min="0" max="12" value="4" />
+      </div>
+      <div class="row">
+        <label for="maxRange">Max range (m): <span id="maxRangeVal">1200</span></label>
+        <input id="maxRange" type="range" min="100" max="4000" step="50" value="1200" />
+      </div>
+      <div class="row">
+        <label for="rxRadius">Rx capture radius (m): <span id="rxRadiusVal">12</span></label>
+        <input id="rxRadius" type="range" min="2" max="40" step="1" value="12" />
+      </div>
+      <div class="row">
+        <label for="fetchPad">OSM fetch pad (m): <span id="fetchPadVal">140</span></label>
+        <input id="fetchPad" type="range" min="0" max="500" step="10" value="140" />
+      </div>
+      <div class="stat" id="angleStat">Steer angle: <code>0.0°</code></div>
+      <div class="btns">
+        <button id="launchBtn" class="primary">Launch rays</button>
+        <button id="refreshBtn">Refresh OSM buildings</button>
+      </div>
+
+      <h2>Stats</h2>
+      <div class="stat" id="statsBox">No trace yet.</div>
+      <div class="stat" id="sceneBox">OSM scene not loaded yet.</div>
+      <div class="small">
+        A ray hits only if its next event is the Rx disk before any wall. Corner hits terminate the trace.
+        Rays stop at the configured maximum path length or maximum bounce count.
+      </div>
+      <div class="small" style="margin-top:12px;">
+        Default 2D planner (Leaflet + RF queue): <a class="linkish" href="/">/</a>
+      </div>
+    </div>
+
+    <div class="mapWrap">
+      <div class="topbar">
+        <div><strong>Use:</strong> click for Tx, shift+click for Rx, steer beam, launch rays.</div>
+        <div><strong>OSM footprints</strong> are fetched for the current viewport.</div>
+      </div>
+      <div id="mapContainer">
+        <div id="map"></div>
+        <canvas id="overlayCanvas"></canvas>
+      </div>
+      <div class="legend">
+        <span><span class="swatch" style="background:#ff8c42"></span>missed ray</span>
+        <span><span class="swatch" style="background:#2bb24c"></span>ray that reaches Rx</span>
+        <span><span class="swatch" style="background:#d32f2f"></span>Tx</span>
+        <span><span class="swatch" style="background:#1565c0"></span>Rx disk</span>
+        <span><span class="swatch" style="background:#808080"></span>OSM building footprints</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="./raytrace_2d_osm.js"></script>
+</body>
+</html>

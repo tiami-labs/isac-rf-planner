@@ -278,6 +278,14 @@ function loadLastResults() {
 
       // Restore the heatmap
       renderHeatmap(data);
+
+      if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
+        try {
+          window.rf2dIngestPlannerOsm(data.osm_buildings_for_client);
+        } catch (e) {
+          console.warn("[RF Planner] rf2dIngestPlannerOsm (restore):", e);
+        }
+      }
       
       // Restore metadata if available
       if (data.clutter_type || data.world_model_source) {
@@ -372,10 +380,14 @@ async function runRFPlanning(lat, lng, source = "click") {
   // Navigate map to coordinates
   map.setView([lat, lng], 15);
 
-  // Show selected point (add to currentLayerGroup for markers/overlays)
-  window.txMarker = L.marker([lat, lng], { icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] }) })
-    .addTo(currentLayerGroup)
-    .bindPopup("TX Location");
+  // Show selected point (directional TX when ray UI is loaded)
+  if (typeof window.rf2dSetTxFromPlanner === "function") {
+    window.rf2dSetTxFromPlanner(lat, lng);
+  } else {
+    window.txMarker = L.marker([lat, lng], { icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] }) })
+      .addTo(currentLayerGroup)
+      .bindPopup("TX Location");
+  }
 
   console.log(`[RF Planner] Selected point: ${lat}, ${lng}`);
   
@@ -608,10 +620,21 @@ async function runRFPlanning(lat, lng, source = "click") {
     }
     
     renderHeatmap(data);
+
+    if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
+      try {
+        window.rf2dIngestPlannerOsm(data.osm_buildings_for_client);
+        console.log("[RF Planner] Reused planner OSM footprints for 2D ray tracer (shared cache).");
+      } catch (e) {
+        console.warn("[RF Planner] rf2dIngestPlannerOsm:", e);
+      }
+    }
     
-    // Save results to localStorage for persistence across page refreshes
+    // Save results to localStorage (omit OSM blob — ray tracer keeps `rf2d_osm_scene_v1`; avoids quota blowups)
     try {
-      localStorage.setItem('rf_planning_last_result', JSON.stringify(data));
+      const forStorage = { ...data };
+      delete forStorage.osm_buildings_for_client;
+      localStorage.setItem('rf_planning_last_result', JSON.stringify(forStorage));
       localStorage.setItem('rf_planning_timestamp', Date.now().toString());
       console.log("[RF Planner] Results saved to localStorage");
     } catch (e) {
@@ -649,6 +672,8 @@ async function runRFPlanning(lat, lng, source = "click") {
 // Clear map function - removes all drawings and visualization (but preserves OSM cache)
 async function clearMap() {
   console.log("[RF Planner] clearMap() called");
+
+  if (typeof window.rf2dClearAll === "function") window.rf2dClearAll();
   
   // Remove and recreate the layer groups to ensure everything is cleared
   map.removeLayer(currentLayerGroup);
@@ -1058,12 +1083,15 @@ function addPolygonPoint(lat, lon) {
     currentTxLocation = { lat, lon: lon };
     polygonDrawingMode.txPointSet = true;
     
-    // Show TX marker
-    L.marker([lat, lon], { 
-      icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] }) 
-    })
-      .addTo(currentLayerGroup)
-      .bindPopup("TX Location");
+    if (typeof window.rf2dSetTxFromPlanner === "function") {
+      window.rf2dSetTxFromPlanner(lat, lon);
+    } else {
+      L.marker([lat, lon], { 
+        icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] }) 
+      })
+        .addTo(currentLayerGroup)
+        .bindPopup("TX Location");
+    }
     
     // Update status
     const sectorDiv = document.getElementById(`sector-${polygonDrawingMode.sectorId}`);
@@ -1530,6 +1558,10 @@ map.on("click", (e) => {
     addPolygonPoint(lat, lng);
     return;
   }
+
+  if (typeof window.rf2dHandleMapClick === "function" && window.rf2dHandleMapClick(e)) {
+    return;
+  }
   
   // If not in drawing mode, clicking map just sets/updates TX location
   // This allows user to set TX point before starting polygon drawing
@@ -1556,6 +1588,10 @@ map.on("click", (e) => {
   console.log(`[RF Planner] TX location set: ${lat}, ${lng} (preserving existing RF heatmap)`);
 });
 
+map.on("mousemove", (e) => {
+  if (typeof window.rf2dHandleMouseMove === "function") window.rf2dHandleMouseMove(e);
+});
+
 // Map right-click handler - finish polygon drawing (does NOT trigger RF planning)
 map.on("contextmenu", (e) => {
   e.originalEvent.preventDefault();
@@ -1580,6 +1616,15 @@ map.on("dblclick", (e) => {
 const FIXED_RSRP_MIN = -140.0;  // dBm - weak but still measurable macro-cell coverage
 const FIXED_RSRP_MAX = -60.0;   // dBm - strong macro-cell reference-signal level
 
+/** Local tangent-plane offset (east m, north m) from (latDeg, lonDeg). */
+function offsetEnuToLatLon(latDeg, lonDeg, eastM, northM) {
+  const R = 6371000.0;
+  const φ = (latDeg * Math.PI) / 180.0;
+  const dLat = (northM / R) * (180.0 / Math.PI);
+  const dLon = (eastM / (R * Math.cos(φ))) * (180.0 / Math.PI);
+  return { lat: latDeg + dLat, lon: lonDeg + dLon };
+}
+
 function renderHeatmap(result) {
   const grid = result.grid;
   const lats = grid.cell_lat;
@@ -1597,45 +1642,56 @@ function renderHeatmap(result) {
     return;
   }
 
-  // Use fixed scale for consistent comparison across locations
-  // Find actual min/max in data - use these for color mapping to show full gradient
   let actualMin = Infinity;
   let actualMax = -Infinity;
   for (const v of rsrp) {
     if (v < actualMin) actualMin = v;
     if (v > actualMax) actualMax = v;
   }
-  
-  // Use actual data range for color mapping (not fixed scale)
-  // This makes FSPL attenuation visible: red near TX (strong) to blue far away (weak)
-  const min = actualMin;
-  const max = actualMax;
-  
-  // Update RSRP legend with actual range (for color mapping) and fixed scale (for reference)
-  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
-  
-  for (let i = 0; i < lats.length; i++) {
-    const v = rsrp[i];
-    // Use actual data range for color mapping - no clamping needed since v is within [actualMin, actualMax]
-    const color = rsrpToColor(v, min, max);
-    const lat = lats[i];
-    const lon = lons[i];
 
-    L.circle([lat, lon], {
-      radius: 10,       // meters
-      color: color,
-      fillColor: color,
-      fillOpacity: 0.6,
-      weight: 0,
+  const h = result.heatmap;
+  if (h && Number.isFinite(h.actual_min)) actualMin = Number(h.actual_min);
+  if (h && Number.isFinite(h.actual_max)) actualMax = Number(h.actual_max);
+
+  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
+
+  const pngSrc = h && h.png_b64 ? h.png_b64 : null;
+  const tx = result.snapped_tx || grid.tx;
+  const txLat = tx && Number.isFinite(tx.lat) ? tx.lat : null;
+  const txLon = tx && Number.isFinite(tx.lon) ? tx.lon : null;
+  let radiusM =
+    (h && Number.isFinite(h.radius_m) ? Number(h.radius_m) : NaN) ||
+    (grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN);
+
+  if (pngSrc && Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(radiusM) && radiusM > 0) {
+    const sw = offsetEnuToLatLon(txLat, txLon, -radiusM, -radiusM);
+    const ne = offsetEnuToLatLon(txLat, txLon, radiusM, radiusM);
+    const bounds = L.latLngBounds([sw.lat, sw.lon], [ne.lat, ne.lon]);
+    L.imageOverlay(pngSrc, bounds, {
+      opacity: 0.78,
+      interactive: false,
+      className: "rf-heatmap-drape",
     }).addTo(heatmapLayerGroup);
+  } else {
+    const min = actualMin;
+    const max = actualMax;
+    for (let i = 0; i < lats.length; i++) {
+      const v = rsrp[i];
+      const color = rsrpToColor(v, min, max);
+      L.circle([lats[i], lons[i]], {
+        radius: 10,
+        color: color,
+        fillColor: color,
+        fillOpacity: 0.6,
+        weight: 0,
+      }).addTo(heatmapLayerGroup);
+    }
   }
 
-  // Center map on snapped TX point
   if (result.snapped_tx) {
     map.setView([result.snapped_tx.lat, result.snapped_tx.lon], map.getZoom());
   }
-  
-  // Draw sector visualization (cones for partial sectors, circles for 360°)
+
   if (result.sectors && result.sectors.length > 0 && result.snapped_tx) {
     drawSectorVisualization(result.sectors, result.snapped_tx, result.grid);
   }

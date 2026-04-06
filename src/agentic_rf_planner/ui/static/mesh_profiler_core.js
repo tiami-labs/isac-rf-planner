@@ -1,4 +1,4 @@
-// Shared mesh profiling core used by both /mesh-profiler and the main planner UI.
+// Client-side Google Photorealistic mesh sampling; imported by app.js (/, /2d) and planner_3d.js (/3d).
 //
 // Exports: buildAndUploadProfiles({containerId, lat, lon, txHeightM, rxHeightM, maxRangeM, drM, dthetaDeg, mode, onProgress})
 //

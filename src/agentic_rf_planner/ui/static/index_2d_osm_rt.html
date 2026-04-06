@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>2D OSM Infinite-Height Ray Tracing</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121933;
+      --panel2: #172145;
+      --text: #e7ecff;
+      --muted: #a9b3d9;
+      --accent: #7ecbff;
+      --good: #5ee27a;
+      --warn: #ffb86b;
+      --bad: #ff6b6b;
+      --building: rgba(180, 180, 180, 0.18);
+      --buildingStroke: rgba(110, 110, 110, 0.92);
+    }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg); color: var(--text); font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px; box-sizing: border-box; min-height: 100vh; }
+    .panel {
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 14px;
+      box-sizing: border-box;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+      overflow: auto;
+    }
+    .panel h1 { margin: 0 0 10px 0; font-size: 20px; }
+    .panel h2 { margin: 16px 0 8px 0; font-size: 15px; color: var(--accent); }
+    .small { color: var(--muted); font-size: 12px; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; margin: 8px 0; }
+    input[type="range"] { width: 100%; }
+    button {
+      background: rgba(255,255,255,0.08);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+    button:hover { background: rgba(255,255,255,0.12); }
+    button.active { outline: 2px solid var(--accent); background: rgba(126,203,255,0.14); }
+    button.primary { background: rgba(94,226,122,0.16); border-color: rgba(94,226,122,0.5); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .stat {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      margin: 8px 0;
+    }
+    .stat code { color: #ffd587; }
+    .mapWrap {
+      position: relative;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+      min-height: calc(100vh - 32px);
+    }
+    #map { width: 100%; height: calc(100vh - 32px); }
+    #overlayCanvas { position: absolute; inset: 0; pointer-events: none; z-index: 500; }
+    .topOverlay {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      z-index: 600;
+      background: rgba(16,18,29,0.75);
+      color: #eef;
+      padding: 8px 10px;
+      border-radius: 10px;
+      font-size: 12px;
+      backdrop-filter: blur(3px);
+    }
+    .legend { display: flex; gap: 12px; flex-wrap: wrap; color: #eef; font-size: 12px; }
+    .swatch { display: inline-block; width: 16px; height: 3px; margin-right: 6px; vertical-align: middle; }
+    @media (max-width: 1100px) { .wrap { grid-template-columns: 1fr; } .mapWrap, #map { min-height: 70vh; height: 70vh; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>2D OSM Infinite-Height Ray Tracing</h1>
+      <div class="small">
+        OSM footprints define the blocks. After those blocks are loaded, the launcher behaves like the rectangle demo:
+        rays live in 2D free space, reflect only on boundary edges, and never enter building interiors.
+      </div>
+
+      <h2>Placement</h2>
+      <div class="small">Normal click places <strong>Tx</strong>. <strong>Shift+click</strong> places <strong>Rx</strong>. Steering only changes when <strong>Steer Tx</strong> mode is active.</div>
+      <div class="btns">
+        <button id="placeTxBtn" class="active">Place Tx</button>
+        <button id="steerBtn">Steer Tx</button>
+        <button id="clearBtn">Clear rays</button>
+        <button id="autoAimBtn">Auto-aim at Rx</button>
+        <button id="reloadBtn">Reload buildings</button>
+      </div>
+
+      <h2>Beam and propagation</h2>
+      <div class="row"><label for="rayCount">Ray count: <span id="rayCountVal">181</span></label><input id="rayCount" type="range" min="1" max="721" step="2" value="181" /></div>
+      <div class="row"><label for="spreadDeg">Beam spread (deg): <span id="spreadDegVal">50</span></label><input id="spreadDeg" type="range" min="0" max="180" value="50" /></div>
+      <div class="row"><label for="maxBounces">Max bounces: <span id="maxBouncesVal">4</span></label><input id="maxBounces" type="range" min="0" max="12" value="4" /></div>
+      <div class="row"><label for="maxRangeM">Max range (m): <span id="maxRangeMVal">600</span></label><input id="maxRangeM" type="range" min="50" max="2500" step="10" value="600" /></div>
+      <div class="row"><label for="rxRadiusPx">Rx capture radius (px): <span id="rxRadiusPxVal">12</span></label><input id="rxRadiusPx" type="range" min="4" max="30" value="12" /></div>
+      <div class="stat" id="angleStat">Steer angle: <code>0.0°</code></div>
+      <div class="btns">
+        <button id="launchBtn" class="primary" disabled>Launch rays</button>
+      </div>
+
+      <h2>Scene loading</h2>
+      <div class="row"><label for="fetchRadiusM">Building radius (m): <span id="fetchRadiusMVal">500</span></label><input id="fetchRadiusM" type="range" min="150" max="1500" step="25" value="500" /></div>
+      <div class="small">Blocks are fetched once around the current Tx (or map center if Tx is unset), then reused locally in the browser for all ray launches.</div>
+
+      <h2>Stats</h2>
+      <div class="stat" id="statsBox">No scene loaded yet.</div>
+      <div class="small">First wall hit wins. Corner hits are rejected. Any leg whose open segment enters a building interior is rejected.</div>
+    </div>
+
+    <div class="mapWrap">
+      <div id="map"></div>
+      <canvas id="overlayCanvas"></canvas>
+      <div class="topOverlay">
+        <div><strong>Use:</strong> click = Tx, Shift+click = Rx, choose Steer Tx to adjust angle, then Launch rays</div>
+        <div class="legend">
+          <span><span class="swatch" style="background:#ff8c42"></span>missed ray</span>
+          <span><span class="swatch" style="background:#2bb24c"></span>ray that reaches Rx</span>
+          <span><span class="swatch" style="background:#d32f2f"></span>Tx</span>
+          <span><span class="swatch" style="background:#1565c0"></span>Rx disk</span>
+          <span><span class="swatch" style="background:rgba(120,120,120,0.9)"></span>OSM building edges</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    const map = L.map('map', { preferCanvas: true }).setView([37.7749, -122.4194], 17);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    const canvas = document.getElementById('overlayCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const ui = {
+      rayCount: document.getElementById('rayCount'),
+      rayCountVal: document.getElementById('rayCountVal'),
+      spreadDeg: document.getElementById('spreadDeg'),
+      spreadDegVal: document.getElementById('spreadDegVal'),
+      maxBounces: document.getElementById('maxBounces'),
+      maxBouncesVal: document.getElementById('maxBouncesVal'),
+      maxRangeM: document.getElementById('maxRangeM'),
+      maxRangeMVal: document.getElementById('maxRangeMVal'),
+      rxRadiusPx: document.getElementById('rxRadiusPx'),
+      rxRadiusPxVal: document.getElementById('rxRadiusPxVal'),
+      fetchRadiusM: document.getElementById('fetchRadiusM'),
+      fetchRadiusMVal: document.getElementById('fetchRadiusMVal'),
+      placeTxBtn: document.getElementById('placeTxBtn'),
+      steerBtn: document.getElementById('steerBtn'),
+      clearBtn: document.getElementById('clearBtn'),
+      autoAimBtn: document.getElementById('autoAimBtn'),
+      reloadBtn: document.getElementById('reloadBtn'),
+      launchBtn: document.getElementById('launchBtn'),
+      statsBox: document.getElementById('statsBox'),
+      angleStat: document.getElementById('angleStat'),
+    };
+
+    const state = {
+      mode: 'tx',
+      tx: null,
+      rx: null,
+      steerAngle: 0,
+      rays: [],
+      buildings: [],
+      walls: [],
+      mouseDown: false,
+      isLoading: false,
+      sceneAnchor: null,
+      sceneRadiusM: 0,
+    };
+
+    const EPS = 1e-9;
+    const RAY_EPS = 0.05;
+    const CORNER_EPS_PX = 2.5;
+
+    function dot(a, b) { return a.x * b.x + a.y * b.y; }
+    function cross(a, b) { return a.x * b.y - a.y * b.x; }
+    function sub(a, b) { return {x: a.x - b.x, y: a.y - b.y}; }
+    function add(a, b) { return {x: a.x + b.x, y: a.y + b.y}; }
+    function mul(a, s) { return {x: a.x * s, y: a.y * s}; }
+    function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+    function normalize(v) { const L = Math.hypot(v.x, v.y) || 1; return {x: v.x / L, y: v.y / L}; }
+    function angleToDir(a) { return {x: Math.cos(a), y: Math.sin(a)}; }
+    function reflect(dir, normal) {
+      const dn = dot(dir, normal);
+      return normalize({x: dir.x - 2 * dn * normal.x, y: dir.y - 2 * dn * normal.y});
+    }
+    function ringSignedArea(pts) {
+      let a = 0;
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i], q = pts[(i + 1) % pts.length];
+        a += p.x * q.y - q.x * p.y;
+      }
+      return 0.5 * a;
+    }
+    function pointInRing(pt, ring) {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const a = ring[i], b = ring[j];
+        const crosses = ((a.y > pt.y) !== (b.y > pt.y)) &&
+          (pt.x < (b.x - a.x) * (pt.y - a.y) / ((b.y - a.y) || 1e-20) + a.x);
+        if (crosses) inside = !inside;
+      }
+      return inside;
+    }
+    function segPointDistance(pt, a, b) {
+      const ab = sub(b, a);
+      const ap = sub(pt, a);
+      const L2 = dot(ab, ab);
+      if (L2 < EPS) return dist(pt, a);
+      let t = dot(ap, ab) / L2;
+      t = Math.max(0, Math.min(1, t));
+      const proj = {x: a.x + t * ab.x, y: a.y + t * ab.y};
+      return dist(pt, proj);
+    }
+    function raySegmentIntersection(origin, dir, segA, segB) {
+      const s = sub(segB, segA);
+      const denom = cross(dir, s);
+      if (Math.abs(denom) < EPS) return null;
+      const ao = sub(segA, origin);
+      const t = cross(ao, s) / denom;
+      const u = cross(ao, dir) / denom;
+      if (t <= RAY_EPS) return null;
+      if (u < -EPS || u > 1 + EPS) return null;
+      const point = add(origin, mul(dir, t));
+      return { t, u, point };
+    }
+    function rayCircleIntersection(origin, dir, center, radius) {
+      if (!center) return null;
+      const oc = sub(origin, center);
+      const a = dot(dir, dir);
+      const b = 2 * dot(oc, dir);
+      const c = dot(oc, oc) - radius * radius;
+      const disc = b * b - 4 * a * c;
+      if (disc < 0) return null;
+      const s = Math.sqrt(disc);
+      const t1 = (-b - s) / (2 * a);
+      const t2 = (-b + s) / (2 * a);
+      const t = (t1 > RAY_EPS) ? t1 : ((t2 > RAY_EPS) ? t2 : null);
+      if (t == null) return null;
+      return { t, point: add(origin, mul(dir, t)) };
+    }
+    function metersToPixels(meters, lat) {
+      const p1 = map.latLngToContainerPoint([lat, 0]);
+      const p2 = map.latLngToContainerPoint([lat, 0.0001]);
+      const metersRef = map.distance([lat, 0], [lat, 0.0001]);
+      const pxRef = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      if (metersRef < 1e-6 || pxRef < 1e-6) return meters;
+      return meters * pxRef / metersRef;
+    }
+    function projectLatLng(ll) {
+      const p = map.latLngToContainerPoint(ll);
+      return {x: p.x, y: p.y};
+    }
+    function latLngObjectFromPoint(pt) {
+      const ll = map.containerPointToLatLng([pt.x, pt.y]);
+      return {lat: ll.lat, lng: ll.lng};
+    }
+
+    function syncCanvas() {
+      const rect = map.getContainer().getBoundingClientRect();
+      canvas.width = Math.round(rect.width * devicePixelRatio);
+      canvas.height = Math.round(rect.height * devicePixelRatio);
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+      ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    }
+
+    function pointInAnyBuilding(pt) {
+      return state.buildings.some(b => pointInRing(pt, b.screen));
+    }
+
+    function buildWalls() {
+      const walls = [];
+      for (const b of state.buildings) {
+        const pts = b.screen;
+        if (!pts || pts.length < 3) continue;
+        const ccw = ringSignedArea(pts) > 0;
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i];
+          const c = pts[(i + 1) % pts.length];
+          const edge = sub(c, a);
+          const normal = ccw
+            ? normalize({x: edge.y, y: -edge.x})
+            : normalize({x: -edge.y, y: edge.x});
+          walls.push({
+            a,
+            b: c,
+            normal,
+            buildingId: b.id,
+            bbox: {
+              minX: Math.min(a.x, c.x), maxX: Math.max(a.x, c.x),
+              minY: Math.min(a.y, c.y), maxY: Math.max(a.y, c.y)
+            }
+          });
+        }
+      }
+      state.walls = walls;
+    }
+
+    function projectBuildings() {
+      for (const b of state.buildings) {
+        b.screen = (b.geometry || []).map(pt => projectLatLng([pt.lat, pt.lon]));
+        if (b.screen.length > 3) {
+          const first = b.screen[0], last = b.screen[b.screen.length - 1];
+          if (dist(first, last) < 0.5) b.screen.pop();
+        }
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of b.screen) {
+          minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+          maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+        }
+        b.bbox = { minX, minY, maxX, maxY };
+      }
+      state.buildings = state.buildings.filter(b => (b.screen || []).length >= 3);
+      buildWalls();
+    }
+
+    function bboxOverlapsSegment(box, a, b, pad = 2) {
+      const minX = Math.min(a.x, b.x) - pad;
+      const maxX = Math.max(a.x, b.x) + pad;
+      const minY = Math.min(a.y, b.y) - pad;
+      const maxY = Math.max(a.y, b.y) + pad;
+      return !(box.maxX < minX || box.minX > maxX || box.maxY < minY || box.minY > maxY);
+    }
+
+    function openSegmentCrossesInterior(a, b, skipBuildingIds = null) {
+      const L = dist(a, b);
+      if (L < 1e-6) return false;
+      const steps = Math.max(8, Math.ceil(L / 8));
+      for (const building of state.buildings) {
+        if (skipBuildingIds && skipBuildingIds.has(building.id)) continue;
+        if (!bboxOverlapsSegment(building.bbox, a, b)) continue;
+        for (let i = 1; i < steps; i++) {
+          const t = i / steps;
+          const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+          if (pointInRing(p, building.screen)) return true;
+        }
+      }
+      return false;
+    }
+
+    function nearestWallHit(origin, dir) {
+      let best = null;
+      const tied = [];
+      for (const wall of state.walls) {
+        const hit = raySegmentIntersection(origin, dir, wall.a, wall.b);
+        if (!hit) continue;
+        if (dot(dir, wall.normal) >= -1e-8) continue; // only front-face hits
+        const cornerish = segPointDistance(hit.point, wall.a, wall.b) < 0.0; // placeholder for readability
+        void(cornerish);
+        if (!best || hit.t < best.t - 1e-4) {
+          best = { ...hit, wall };
+          tied.length = 0;
+          tied.push(best);
+        } else if (Math.abs(hit.t - best.t) < 1e-4) {
+          tied.push({ ...hit, wall });
+        }
+      }
+      return best ? { best, tied } : null;
+    }
+
+    function isCornerHit(hit) {
+      return dist(hit.point, hit.wall.a) <= CORNER_EPS_PX || dist(hit.point, hit.wall.b) <= CORNER_EPS_PX;
+    }
+
+    function traceOneRay(angle) {
+      if (!state.tx || state.walls.length === 0) return null;
+      const rxRadius = parseFloat(ui.rxRadiusPx.value);
+      const maxBounces = parseInt(ui.maxBounces.value, 10);
+      const maxRangePx = metersToPixels(parseFloat(ui.maxRangeM.value), state.tx.lat);
+      let origin = projectLatLng(state.tx);
+      let dir = angleToDir(angle);
+      let pts = [{...origin}];
+      let bounces = 0;
+      let status = 'max-range';
+      let hitRx = false;
+      let pathLen = 0;
+
+      while (pathLen <= maxRangePx + 1e-6) {
+        const wallRes = nearestWallHit(origin, dir);
+        const wallHit = wallRes ? wallRes.best : null;
+        const rxCenter = state.rx ? projectLatLng(state.rx) : null;
+        const rxHit = rxCenter ? rayCircleIntersection(origin, dir, rxCenter, rxRadius) : null;
+
+        let nearestT = maxRangePx - pathLen;
+        let event = 'range';
+        let eventPoint = add(origin, mul(dir, nearestT));
+
+        if (wallHit && wallHit.t < nearestT) {
+          nearestT = wallHit.t;
+          event = 'wall';
+          eventPoint = wallHit.point;
+        }
+        if (rxHit && rxHit.t < nearestT && !openSegmentCrossesInterior(origin, rxHit.point)) {
+          nearestT = rxHit.t;
+          event = 'rx';
+          eventPoint = rxHit.point;
+        }
+
+        pts.push({...eventPoint});
+        pathLen += nearestT;
+
+        if (event === 'rx') {
+          status = 'hit-rx';
+          hitRx = true;
+          break;
+        }
+        if (event === 'range') {
+          status = 'max-range';
+          break;
+        }
+        if (event === 'wall') {
+          if (!wallRes || wallRes.tied.length > 1 || isCornerHit(wallHit)) {
+            status = 'corner-hit';
+            break;
+          }
+          if (openSegmentCrossesInterior(origin, eventPoint)) {
+            status = 'interior-cross';
+            break;
+          }
+          if (bounces >= maxBounces) {
+            status = 'max-bounces';
+            break;
+          }
+          dir = reflect(dir, wallHit.wall.normal);
+          origin = add(eventPoint, mul(dir, RAY_EPS));
+          bounces += 1;
+        }
+      }
+
+      return { pts, bounces, hitRx, status, angle, pathLen };
+    }
+
+    function launchRays() {
+      state.rays = [];
+      if (!state.tx) {
+        ui.statsBox.innerHTML = 'Place <code>Tx</code> first.';
+        draw();
+        return;
+      }
+      if (state.walls.length === 0) {
+        ui.statsBox.innerHTML = 'No OSM building blocks are loaded yet. Click <code>Reload buildings</code> after setting Tx.';
+        draw();
+        return;
+      }
+      const n = parseInt(ui.rayCount.value, 10);
+      const spread = parseFloat(ui.spreadDeg.value) * Math.PI / 180;
+      const base = state.steerAngle;
+      for (let i = 0; i < n; i++) {
+        let a = base;
+        if (n > 1) {
+          const t = i / (n - 1);
+          a = base - spread / 2 + t * spread;
+        }
+        state.rays.push(traceOneRay(a));
+      }
+      updateStats();
+      draw();
+    }
+
+    function updateStats() {
+      const hits = state.rays.filter(r => r && r.hitRx);
+      const minB = hits.length ? Math.min(...hits.map(r => r.bounces)) : '–';
+      const maxB = hits.length ? Math.max(...hits.map(r => r.bounces)) : '–';
+      const escaped = state.rays.filter(r => r && r.status === 'max-range').length;
+      const corner = state.rays.filter(r => r && r.status === 'corner-hit').length;
+      const maxed = state.rays.filter(r => r && r.status === 'max-bounces').length;
+      const interior = state.rays.filter(r => r && r.status === 'interior-cross').length;
+      const anchorText = state.sceneAnchor ? `${state.sceneAnchor.lat.toFixed(6)}, ${state.sceneAnchor.lng.toFixed(6)}` : 'unset';
+      ui.statsBox.innerHTML = `
+        Scene anchor: <code>${anchorText}</code><br>
+        Buildings loaded: <code>${state.buildings.length}</code> &nbsp; Segments: <code>${state.walls.length}</code><br>
+        Rays launched: <code>${state.rays.length}</code><br>
+        Rays reaching Rx: <code>${hits.length}</code><br>
+        Min / max bounces among hits: <code>${minB}</code> / <code>${maxB}</code><br>
+        Max-range exits: <code>${escaped}</code> &nbsp;|&nbsp; Corner hits rejected: <code>${corner}</code> &nbsp;|&nbsp; Interior-cross rejects: <code>${interior}</code><br>
+        Stopped at max-bounces: <code>${maxed}</code>
+      `;
+      ui.launchBtn.disabled = !(state.tx && state.walls.length > 0 && !state.isLoading);
+    }
+
+    function setMode(mode) {
+      state.mode = mode;
+      ui.placeTxBtn.classList.toggle('active', mode === 'tx');
+      ui.steerBtn.classList.toggle('active', mode === 'steer');
+      map.getContainer().style.cursor = mode === 'steer' ? 'grab' : 'crosshair';
+    }
+
+    function updateAngleLabel() {
+      const deg = (state.steerAngle * 180 / Math.PI + 360) % 360;
+      ui.angleStat.innerHTML = `Steer angle: <code>${deg.toFixed(1)}°</code>`;
+    }
+
+    function autoAim() {
+      if (!state.tx || !state.rx) return;
+      const tx = projectLatLng(state.tx);
+      const rx = projectLatLng(state.rx);
+      state.steerAngle = Math.atan2(rx.y - tx.y, rx.x - tx.x);
+      updateAngleLabel();
+      draw();
+    }
+
+    async function loadBuildings(force = false) {
+      const anchor = state.tx || map.getCenter();
+      const radius = parseFloat(ui.fetchRadiusM.value);
+      const key = `${anchor.lat.toFixed(5)}:${anchor.lng.toFixed(5)}:${Math.round(radius)}`;
+      if (!force && state.sceneAnchor && key === `${state.sceneAnchor.lat.toFixed(5)}:${state.sceneAnchor.lng.toFixed(5)}:${Math.round(state.sceneRadiusM)}`) {
+        return;
+      }
+      state.isLoading = true;
+      state.sceneAnchor = { lat: anchor.lat, lng: anchor.lng };
+      state.sceneRadiusM = radius;
+      state.rays = [];
+      ui.launchBtn.disabled = true;
+      ui.statsBox.innerHTML = 'Loading OSM building blocks…';
+      draw();
+      try {
+        const url = `/api/osm/buildings-near-point?lat=${encodeURIComponent(anchor.lat)}&lon=${encodeURIComponent(anchor.lng)}&radius_m=${encodeURIComponent(radius)}&max_count=1200`;
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const buildings = Array.isArray(data.buildings) ? data.buildings : [];
+        state.buildings = buildings
+          .map((b, idx) => ({ id: b.id ?? (idx + 1), geometry: Array.isArray(b.geometry) ? b.geometry : [], screen: [] }))
+          .filter(b => b.geometry.length >= 3);
+        projectBuildings();
+        if (state.buildings.length === 0) {
+          ui.statsBox.innerHTML = 'Loaded 0 buildings. The tracer will not run until OSM blocks are available for this anchor / radius.';
+        } else {
+          updateStats();
+        }
+      } catch (err) {
+        state.buildings = [];
+        state.walls = [];
+        ui.statsBox.innerHTML = `OSM load failed: <code>${String(err.message || err)}</code>`;
+      } finally {
+        state.isLoading = false;
+        updateStats();
+        draw();
+      }
+    }
+
+    function drawTriangle(ll, color, up = true, size = 12) {
+      if (!ll) return;
+      const p = projectLatLng(ll);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      if (up) {
+        ctx.moveTo(p.x, p.y - size);
+        ctx.lineTo(p.x - size * 0.9, p.y + size * 0.8);
+        ctx.lineTo(p.x + size * 0.9, p.y + size * 0.8);
+      } else {
+        ctx.moveTo(p.x, p.y + size);
+        ctx.lineTo(p.x - size * 0.9, p.y - size * 0.8);
+        ctx.lineTo(p.x + size * 0.9, p.y - size * 0.8);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+      ctx.stroke();
+    }
+
+    function drawArrow() {
+      if (!state.tx) return;
+      const from = projectLatLng(state.tx);
+      const len = 85;
+      const to = { x: from.x + Math.cos(state.steerAngle) * len, y: from.y + Math.sin(state.steerAngle) * len };
+      ctx.save();
+      ctx.strokeStyle = '#ff5566';
+      ctx.fillStyle = '#ff5566';
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+      const ah = 10;
+      const a1 = state.steerAngle + Math.PI * 0.85;
+      const a2 = state.steerAngle - Math.PI * 0.85;
+      ctx.beginPath();
+      ctx.moveTo(to.x, to.y);
+      ctx.lineTo(to.x + Math.cos(a1) * ah, to.y + Math.sin(a1) * ah);
+      ctx.lineTo(to.x + Math.cos(a2) * ah, to.y + Math.sin(a2) * ah);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawBeamPreview() {
+      if (!state.tx) return;
+      const p = projectLatLng(state.tx);
+      const spread = parseFloat(ui.spreadDeg.value) * Math.PI / 180;
+      const r = 120;
+      ctx.save();
+      ctx.fillStyle = 'rgba(255, 120, 60, 0.08)';
+      ctx.strokeStyle = 'rgba(255, 120, 60, 0.55)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.arc(p.x, p.y, r, state.steerAngle - spread / 2, state.steerAngle + spread / 2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function draw() {
+      syncCanvas();
+      projectBuildings();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(160,160,160,0.11)';
+      ctx.strokeStyle = 'rgba(120,120,120,0.9)';
+      ctx.lineWidth = 1.2;
+      for (const b of state.buildings) {
+        if (!b.screen || b.screen.length < 3) continue;
+        ctx.beginPath();
+        ctx.moveTo(b.screen[0].x, b.screen[0].y);
+        for (let i = 1; i < b.screen.length; i++) ctx.lineTo(b.screen[i].x, b.screen[i].y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      drawBeamPreview();
+
+      for (const ray of state.rays) {
+        if (!ray) continue;
+        ctx.save();
+        ctx.lineWidth = ray.hitRx ? 2.4 : 1.4;
+        ctx.strokeStyle = ray.hitRx ? '#2bb24c' : '#ff8c42';
+        if (!ray.hitRx) ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(ray.pts[0].x, ray.pts[0].y);
+        for (let i = 1; i < ray.pts.length; i++) ctx.lineTo(ray.pts[i].x, ray.pts[i].y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = ray.hitRx ? '#2bb24c' : '#ff8c42';
+        for (let i = 1; i < ray.pts.length - (ray.hitRx ? 1 : 0); i++) {
+          ctx.beginPath();
+          ctx.arc(ray.pts[i].x, ray.pts[i].y, 2.8, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      if (state.rx) {
+        const p = projectLatLng(state.rx);
+        const rr = parseFloat(ui.rxRadiusPx.value);
+        ctx.save();
+        ctx.strokeStyle = 'rgba(21,101,192,0.38)';
+        ctx.fillStyle = 'rgba(21,101,192,0.08)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      drawArrow();
+      drawTriangle(state.tx, '#b50000', true, 12);
+      drawTriangle(state.rx, '#0a41bf', false, 12);
+
+      if (state.tx) {
+        const p = projectLatLng(state.tx);
+        ctx.fillStyle = '#700000';
+        ctx.font = 'bold 14px system-ui';
+        ctx.fillText('Tx', p.x + 12, p.y - 10);
+      }
+      if (state.rx) {
+        const p = projectLatLng(state.rx);
+        ctx.fillStyle = '#0a41bf';
+        ctx.font = 'bold 14px system-ui';
+        ctx.fillText('Rx', p.x + 12, p.y - 10);
+      }
+
+      ctx.fillStyle = 'rgba(0,0,0,0.74)';
+      ctx.font = '13px system-ui';
+      const modeLabel = state.mode === 'steer' ? 'Steer Tx' : 'Place Tx';
+      ctx.fillText(`Mode: ${modeLabel}`, 12, 20);
+    }
+
+    map.on('click', async (evt) => {
+      const p = projectLatLng(evt.latlng);
+      if (evt.originalEvent.shiftKey) {
+        if (pointInAnyBuilding(p)) return;
+        state.rx = evt.latlng;
+        state.rays = [];
+        updateStats();
+        draw();
+        return;
+      }
+      if (state.mode !== 'tx') return;
+      if (pointInAnyBuilding(p)) return;
+      state.tx = evt.latlng;
+      state.rays = [];
+      if (!state.rx) state.steerAngle = 0;
+      updateAngleLabel();
+      await loadBuildings(true);
+      draw();
+    });
+
+    map.on('mousedown', (evt) => {
+      state.mouseDown = true;
+      if (state.mode === 'steer' && state.tx) {
+        const tx = projectLatLng(state.tx);
+        const p = projectLatLng(evt.latlng);
+        state.steerAngle = Math.atan2(p.y - tx.y, p.x - tx.x);
+        updateAngleLabel();
+        draw();
+      }
+    });
+
+    map.on('mousemove', (evt) => {
+      if (!(state.mode === 'steer' && state.tx && state.mouseDown)) return;
+      const tx = projectLatLng(state.tx);
+      const p = projectLatLng(evt.latlng);
+      state.steerAngle = Math.atan2(p.y - tx.y, p.x - tx.x);
+      updateAngleLabel();
+      draw();
+    });
+
+    map.on('mouseup', () => { state.mouseDown = false; });
+    map.getContainer().addEventListener('mouseleave', () => { state.mouseDown = false; });
+    map.on('move zoom resize', () => { draw(); });
+
+    ui.placeTxBtn.addEventListener('click', () => setMode('tx'));
+    ui.steerBtn.addEventListener('click', () => setMode('steer'));
+    ui.clearBtn.addEventListener('click', () => { state.rays = []; updateStats(); draw(); });
+    ui.autoAimBtn.addEventListener('click', autoAim);
+    ui.reloadBtn.addEventListener('click', () => loadBuildings(true));
+    ui.launchBtn.addEventListener('click', launchRays);
+
+    for (const id of ['rayCount', 'spreadDeg', 'maxBounces', 'maxRangeM', 'rxRadiusPx', 'fetchRadiusM']) {
+      const el = ui[id];
+      const val = ui[id + 'Val'];
+      if (val) {
+        val.textContent = el.value;
+        el.addEventListener('input', () => {
+          val.textContent = el.value;
+          if (id === 'fetchRadiusM' && state.tx) state.sceneRadiusM = -1;
+          draw();
+        });
+      }
+    }
+
+    setMode('tx');
+    updateAngleLabel();
+    syncCanvas();
+    loadBuildings(true).then(draw);
+  </script>
+</body>
+</html>
