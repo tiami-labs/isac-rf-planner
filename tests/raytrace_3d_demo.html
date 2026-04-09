@@ -1,0 +1,1052 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>3D City Ray Tracing Demo</title>
+<style>
+  :root { --bg:#111318; --panel:#1b1f27; --muted:#9aa4b2; --text:#e8edf2; --accent:#4da3ff; --good:#4dd17d; --warn:#ffb347; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { display:grid; grid-template-columns: 340px 1fr; height:100vh; }
+  .panel { overflow:auto; padding:14px; background:var(--panel); border-right:1px solid #2b3440; }
+  .panel h2 { margin:0 0 8px; font-size:18px; }
+  .panel h3 { margin:14px 0 8px; font-size:14px; color:#d7dce2; }
+  .panel p, .panel li, .panel label, .panel button, .panel input, .panel select { font-size:13px; }
+  .muted { color:var(--muted); }
+  .row { display:grid; grid-template-columns: 1fr auto; gap:8px; align-items:center; margin:6px 0; }
+  .row input[type="range"], .row input[type="number"] { width:100%; }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+  button { background:#283241; color:var(--text); border:1px solid #3b4759; border-radius:8px; padding:8px 10px; cursor:pointer; }
+  button.active { outline:2px solid var(--accent); }
+  button:hover { background:#324052; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 12px; }
+  .legend { display:grid; grid-template-columns: 12px 1fr; gap:8px; align-items:center; margin:4px 0; }
+  .sw { width:12px; height:12px; border-radius:2px; }
+  canvas { width:100%; height:100%; display:block; background:#0e1014; }
+  .view { position:relative; }
+  .hud { position:absolute; left:12px; top:12px; background:rgba(18,22,28,0.8); border:1px solid rgba(255,255,255,0.08); padding:8px 10px; border-radius:8px; font-size:12px; line-height:1.35; max-width:440px; }
+  .status { margin-top:8px; padding:8px; border:1px solid #334155; border-radius:8px; background:#151922; white-space:pre-wrap; }
+  code { color:#dbeafe; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h2>3D city ray tracing</h2>
+    <p class="muted">Opaque 3D blocks, specular reflections on faces only, no diffraction, no penetration, no scattering. Rays have horizontal and vertical steering.</p>
+
+    <h3>Scene</h3>
+    <div class="grid2">
+      <div class="row"><label>Buildings</label><input id="numBuildings" type="number" min="1" max="60" value="18"></div>
+      <div class="row"><label>Seed</label><input id="seed" type="number" min="1" max="99999" value="7"></div>
+    </div>
+    <div class="btns">
+      <button id="regenBtn">Regenerate scene</button>
+      <button id="resetCameraBtn">Reset camera</button>
+    </div>
+
+    <h3>Placement</h3>
+    <div class="btns">
+      <button id="placeTxBtn">Place Tx</button>
+      <button id="placeRxBtn">Place Rx</button>
+      <button id="steerBtn">Steer Tx</button>
+    </div>
+    <div class="row"><label>Tx height (m)</label><input id="txHeight" type="range" min="1" max="40" step="0.5" value="12"></div>
+    <div class="row"><span></span><span id="txHeightVal">12.0</span></div>
+    <div class="row"><label>Rx height (m)</label><input id="rxHeight" type="range" min="1" max="20" step="0.5" value="2"></div>
+    <div class="row"><span></span><span id="rxHeightVal">2.0</span></div>
+    <div class="row"><label>Rx radius (m)</label><input id="rxRadius" type="range" min="0.5" max="8" step="0.1" value="2.0"></div>
+    <div class="row"><span></span><span id="rxRadiusVal">2.0</span></div>
+
+    <h3>Transmit steering</h3>
+    <div class="row"><label>Yaw (deg)</label><input id="yaw" type="range" min="-180" max="180" step="1" value="35"></div>
+    <div class="row"><span></span><span id="yawVal">35</span></div>
+    <div class="row"><label>Pitch (deg)</label><input id="pitch" type="range" min="-60" max="60" step="1" value="0"></div>
+    <div class="row"><span></span><span id="pitchVal">0</span></div>
+    <div class="row"><label>H spread (deg)</label><input id="hSpread" type="range" min="0" max="120" step="1" value="30"></div>
+    <div class="row"><span></span><span id="hSpreadVal">30</span></div>
+    <div class="row"><label>V spread (deg)</label><input id="vSpread" type="range" min="0" max="80" step="1" value="20"></div>
+    <div class="row"><span></span><span id="vSpreadVal">20</span></div>
+
+    <h3>Trace</h3>
+    <div class="row"><label>Rays</label><input id="numRays" type="range" min="1" max="1200" step="1" value="220"></div>
+    <div class="row"><span></span><span id="numRaysVal">220</span></div>
+    <div class="row"><label>Max bounces</label><input id="maxBounces" type="range" min="0" max="8" step="1" value="3"></div>
+    <div class="row"><span></span><span id="maxBouncesVal">3</span></div>
+    <div class="row"><label>Max distance (m)</label><input id="maxDistance" type="range" min="50" max="1200" step="10" value="500"></div>
+    <div class="row"><span></span><span id="maxDistanceVal">500</span></div>
+    <div class="btns">
+      <button id="launchBtn">Launch rays</button>
+      <button id="clearRaysBtn">Clear rays</button>
+    </div>
+
+    <h3>Legend</h3>
+    <div class="legend"><div class="sw" style="background:#cf4444"></div><div>Tx</div></div>
+    <div class="legend"><div class="sw" style="background:#3b82f6"></div><div>Rx capture sphere</div></div>
+    <div class="legend"><div class="sw" style="background:#a3e635"></div><div>Ray that hit Rx</div></div>
+    <div class="legend"><div class="sw" style="background:#f59e0b"></div><div>Ray reflected on building face</div></div>
+    <div class="legend"><div class="sw" style="background:#94a3b8"></div><div>Building</div></div>
+
+    <div id="status" class="status">Click <code>Place Tx</code> or <code>Place Rx</code>, then click the ground in the 3D view.</div>
+  </div>
+  <div class="view">
+    <canvas id="canvas"></canvas>
+    <div class="hud">
+      Left-drag: orbit camera<br>
+      Right-drag or Shift+drag: pan<br>
+      Wheel: zoom<br>
+      Place Tx / Rx: click ground plane<br>
+      Steer Tx: click ground to point the boresight there in yaw; pitch remains from slider<br>
+      
+    </div>
+  </div>
+</div>
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+
+  const ui = {
+    numBuildings: document.getElementById('numBuildings'),
+    seed: document.getElementById('seed'),
+    txHeight: document.getElementById('txHeight'), txHeightVal: document.getElementById('txHeightVal'),
+    rxHeight: document.getElementById('rxHeight'), rxHeightVal: document.getElementById('rxHeightVal'),
+    rxRadius: document.getElementById('rxRadius'), rxRadiusVal: document.getElementById('rxRadiusVal'),
+    yaw: document.getElementById('yaw'), yawVal: document.getElementById('yawVal'),
+    pitch: document.getElementById('pitch'), pitchVal: document.getElementById('pitchVal'),
+    hSpread: document.getElementById('hSpread'), hSpreadVal: document.getElementById('hSpreadVal'),
+    vSpread: document.getElementById('vSpread'), vSpreadVal: document.getElementById('vSpreadVal'),
+    numRays: document.getElementById('numRays'), numRaysVal: document.getElementById('numRaysVal'),
+    maxBounces: document.getElementById('maxBounces'), maxBouncesVal: document.getElementById('maxBouncesVal'),
+    maxDistance: document.getElementById('maxDistance'), maxDistanceVal: document.getElementById('maxDistanceVal'),
+    regenBtn: document.getElementById('regenBtn'), resetCameraBtn: document.getElementById('resetCameraBtn'),
+    placeTxBtn: document.getElementById('placeTxBtn'), placeRxBtn: document.getElementById('placeRxBtn'),
+    steerBtn: document.getElementById('steerBtn'), launchBtn: document.getElementById('launchBtn'), clearRaysBtn: document.getElementById('clearRaysBtn')
+  };
+
+  const scene = {
+    worldMin: {x:-120, y:0, z:-120},
+    worldMax: {x:120, y:90, z:120},
+    buildings: [],
+    tx: null,
+    rx: null,
+    rays: [],
+    mode: null,
+    camera: { target:{x:0,y:12,z:0}, yaw:0.9, pitch:-0.55, radius:300 },
+    drag: null,
+  };
+
+  function setStatus(text) { statusEl.textContent = text; }
+  function setMode(mode) {
+    scene.mode = mode;
+    for (const [btn, m] of [[ui.placeTxBtn,'tx'], [ui.placeRxBtn,'rx'], [ui.steerBtn,'steer']]) {
+      btn.classList.toggle('active', scene.mode === m);
+    }
+  }
+
+  // ---------- math ----------
+  const V = {
+    add:(a,b)=>({x:a.x+b.x,y:a.y+b.y,z:a.z+b.z}),
+    sub:(a,b)=>({x:a.x-b.x,y:a.y-b.y,z:a.z-b.z}),
+    mul:(a,s)=>({x:a.x*s,y:a.y*s,z:a.z*s}),
+    dot:(a,b)=>a.x*b.x+a.y*b.y+a.z*b.z,
+    len:(a)=>Math.hypot(a.x,a.y,a.z),
+    norm:(a)=>{ const L=Math.hypot(a.x,a.y,a.z)||1; return {x:a.x/L,y:a.y/L,z:a.z/L}; },
+    cross:(a,b)=>({x:a.y*b.z-a.z*b.y, y:a.z*b.x-a.x*b.z, z:a.x*b.y-a.y*b.x}),
+    reflect:(d,n)=> V.sub(d, V.mul(n, 2*V.dot(d,n)))
+  };
+
+  function clamp(x,a,b){ return Math.max(a, Math.min(b, x)); }
+  function rad(deg){ return deg*Math.PI/180; }
+
+  function mulMatVec(m, v) {
+    return {
+      x: m[0]*v.x + m[1]*v.y + m[2]*v.z + m[3],
+      y: m[4]*v.x + m[5]*v.y + m[6]*v.z + m[7],
+      z: m[8]*v.x + m[9]*v.y + m[10]*v.z + m[11],
+      w: m[12]*v.x + m[13]*v.y + m[14]*v.z + m[15]
+    };
+  }
+
+  function matMul(a,b){
+    const out = new Array(16).fill(0);
+    for(let r=0;r<4;r++) for(let c=0;c<4;c++) for(let k=0;k<4;k++) out[r*4+c] += a[r*4+k]*b[k*4+c];
+    return out;
+  }
+
+  function lookAt(eye, target, up) {
+    const z = V.norm(V.sub(eye, target));
+    const x = V.norm(V.cross(up, z));
+    const y = V.cross(z, x);
+    return [
+      x.x,x.y,x.z,-V.dot(x,eye),
+      y.x,y.y,y.z,-V.dot(y,eye),
+      z.x,z.y,z.z,-V.dot(z,eye),
+      0,0,0,1
+    ];
+  }
+
+  function perspective(fovy, aspect, near, far){
+    const f = 1/Math.tan(fovy/2), nf = 1/(near-far);
+    return [
+      f/aspect,0,0,0,
+      0,f,0,0,
+      0,0,(far+near)*nf,2*far*near*nf,
+      0,0,-1,0
+    ];
+  }
+
+  function invert4(m){
+    const a = m.slice();
+    const inv = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+    for(let i=0;i<4;i++){
+      let pivot=i;
+      for(let r=i+1;r<4;r++) if(Math.abs(a[r*4+i])>Math.abs(a[pivot*4+i])) pivot=r;
+      if(Math.abs(a[pivot*4+i])<1e-10) return null;
+      if(pivot!==i) {
+        for(let c=0;c<4;c++) [a[i*4+c], a[pivot*4+c]] = [a[pivot*4+c], a[i*4+c]];
+        for(let c=0;c<4;c++) [inv[i*4+c], inv[pivot*4+c]] = [inv[pivot*4+c], inv[i*4+c]];
+      }
+      const d = a[i*4+i];
+      for(let c=0;c<4;c++){ a[i*4+c]/=d; inv[i*4+c]/=d; }
+      for(let r=0;r<4;r++) if(r!==i){
+        const f = a[r*4+i];
+        for(let c=0;c<4;c++){ a[r*4+c]-=f*a[i*4+c]; inv[r*4+c]-=f*inv[i*4+c]; }
+      }
+    }
+    return inv;
+  }
+
+  function getCameraEye() {
+    const c = scene.camera;
+    const cp = Math.cos(c.pitch);
+    return {
+      x: c.target.x + c.radius * cp * Math.sin(c.yaw),
+      y: c.target.y + c.radius * Math.sin(c.pitch),
+      z: c.target.z + c.radius * cp * Math.cos(c.yaw)
+    };
+  }
+
+  function getMatrices(){
+    const eye = getCameraEye();
+    const aspect = canvas.width/canvas.height;
+    const view = lookAt(eye, scene.camera.target, {x:0,y:1,z:0});
+    const proj = perspective(rad(45), aspect, 0.5, 2000);
+    const vp = matMul(proj, view);
+    return {eye, view, proj, vp, invVP: invert4(vp)};
+  }
+
+  function project(p){
+    const {vp} = getMatrices();
+    const q = mulMatVec(vp, p);
+    if (q.w === 0) return null;
+    const ndc = {x:q.x/q.w, y:q.y/q.w, z:q.z/q.w};
+    return {x:(ndc.x*0.5+0.5)*canvas.width, y:(-ndc.y*0.5+0.5)*canvas.height, z:ndc.z};
+  }
+
+  function screenRay(sx, sy){
+    const {eye, invVP} = getMatrices();
+    if (!invVP) return null;
+    const nx = sx / canvas.width * 2 - 1;
+    const ny = 1 - sy / canvas.height * 2;
+    const near = mulMatVec(invVP, {x:nx, y:ny, z:-1});
+    const far  = mulMatVec(invVP, {x:nx, y:ny, z: 1});
+    const p0 = {x:near.x/near.w, y:near.y/near.w, z:near.z/near.w};
+    const p1 = {x:far.x/far.w, y:far.y/far.w, z:far.z/far.w};
+    return {origin: eye, dir: V.norm(V.sub(p1, p0))};
+  }
+
+  function intersectGround(ray){
+    if (Math.abs(ray.dir.y) < 1e-9) return null;
+    const t = -ray.origin.y / ray.dir.y;
+    if (t <= 0) return null;
+    return V.add(ray.origin, V.mul(ray.dir, t));
+  }
+
+  // ---------- rng + scene ----------
+  function mulberry32(a) { return function() { let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  function randomBuildings(num, seed){
+    const rand = mulberry32(seed);
+    const out = [];
+    let tries = 0;
+    while(out.length < num && tries < num*300){
+      tries++;
+      const w = 10 + rand()*24;
+      const d = 10 + rand()*24;
+      const h = 15 + rand()*45;
+      const x = -95 + rand()*190;
+      const z = -95 + rand()*190;
+      const box = {min:{x:x, y:0, z:z}, max:{x:x+w, y:h, z:z+d}};
+      let ok = true;
+      for(const b of out){
+        if (!(box.max.x + 7 < b.min.x || box.min.x - 7 > b.max.x || box.max.z + 7 < b.min.z || box.min.z - 7 > b.max.z)) { ok=false; break; }
+      }
+      if (ok) out.push(box);
+    }
+    return out;
+  }
+
+  function regenerate(){
+    scene.buildings = randomBuildings(parseInt(ui.numBuildings.value,10), parseInt(ui.seed.value,10));
+    scene.rays = [];
+    draw();
+    setStatus('Scene regenerated. Click Place Tx / Place Rx, then click the ground.');
+  }
+
+  // ---------- tracing ----------
+  function dirFromYawPitch(yawDeg, pitchDeg){
+    const yaw = rad(yawDeg), pitch = rad(pitchDeg);
+    const cp = Math.cos(pitch);
+    return V.norm({ x: cp * Math.sin(yaw), y: Math.sin(pitch), z: cp * Math.cos(yaw) });
+  }
+
+  function basisFromForward(forward){
+    const upGuess = Math.abs(forward.y) > 0.98 ? {x:1,y:0,z:0} : {x:0,y:1,z:0};
+    const right = V.norm(V.cross(forward, upGuess));
+    const up = V.norm(V.cross(right, forward));
+    return {right, up};
+  }
+
+  function sampleBeamDirections(n, forward, hSpreadDeg, vSpreadDeg){
+    const dirs=[];
+    const {right, up} = basisFromForward(forward);
+    const h = rad(hSpreadDeg/2), v = rad(vSpreadDeg/2);
+    if (n === 1) return [forward];
+    for(let i=0;i<n;i++){
+      const u = (i+0.5)/n;
+      const a = (Math.sqrt(5)-1)/2;
+      const j = (i*a)%1;
+      const yawOff = (j*2-1)*h;
+      const pitchOff = (u*2-1)*v;
+      let d = V.add(forward, V.add(V.mul(right, Math.tan(yawOff)), V.mul(up, Math.tan(pitchOff))));
+      dirs.push(V.norm(d));
+    }
+    return dirs;
+  }
+
+  function raySphereFirst(origin, dir, center, radius){
+    const oc = V.sub(origin, center);
+    const b = V.dot(oc, dir);
+    const c = V.dot(oc, oc) - radius*radius;
+    const disc = b*b - c;
+    if (disc < 0) return null;
+    const s = Math.sqrt(disc);
+    const t1 = -b - s, t2 = -b + s;
+    if (t1 > 1e-6) return t1;
+    if (t2 > 1e-6) return t2;
+    return null;
+  }
+
+  function rayAabbFirst(origin, dir, box){
+    let tmin = -Infinity, tmax = Infinity, hitAxis = null, hitSign = 0;
+    for(const axis of ['x','y','z']){
+      if (Math.abs(dir[axis]) < 1e-9) {
+        if (origin[axis] < box.min[axis] || origin[axis] > box.max[axis]) return null;
+      } else {
+        let t1 = (box.min[axis]-origin[axis]) / dir[axis];
+        let t2 = (box.max[axis]-origin[axis]) / dir[axis];
+        let enterSign = -1;
+        if (t1 > t2) { [t1,t2] = [t2,t1]; enterSign = 1; }
+        if (t1 > tmin) { tmin = t1; hitAxis = axis; hitSign = enterSign; }
+        tmax = Math.min(tmax, t2);
+        if (tmin > tmax) return null;
+      }
+    }
+    if (tmax < 1e-6) return null;
+    const t = tmin > 1e-6 ? tmin : tmax;
+    const p = V.add(origin, V.mul(dir, t));
+    let n = {x:0,y:0,z:0};
+    n[hitAxis] = hitSign;
+    const eps = 1e-5;
+    let cornerHits = 0;
+    if (Math.abs(p.x - box.min.x) < eps || Math.abs(p.x - box.max.x) < eps) cornerHits++;
+    if (Math.abs(p.y - box.min.y) < eps || Math.abs(p.y - box.max.y) < eps) cornerHits++;
+    if (Math.abs(p.z - box.min.z) < eps || Math.abs(p.z - box.max.z) < eps) cornerHits++;
+    return {t, point:p, normal:n, box, isEdgeOrCorner: cornerHits >= 2};
+  }
+
+  function traceOneRay(origin, dir, maxBounces, maxDistance, rxCenter, rxRadius){
+    const pts = [origin];
+    const segments = [];
+    let pos = origin;
+    let d = V.norm(dir);
+    let traveled = 0;
+    let bounces = 0;
+    let hitRx = false;
+
+    for(let iter=0; iter <= maxBounces; iter++) {
+      let nearestBoxHit = null;
+      for(const box of scene.buildings){
+        const hit = rayAabbFirst(pos, d, box);
+        if (!hit) continue;
+        if (hit.t <= 1e-5) continue;
+        if (!nearestBoxHit || hit.t < nearestBoxHit.t) nearestBoxHit = hit;
+      }
+
+      const tRx = raySphereFirst(pos, d, rxCenter, rxRadius);
+      const boundaryT = maxDistance - traveled;
+
+      if (tRx !== null && tRx <= boundaryT && (!nearestBoxHit || tRx < nearestBoxHit.t)) {
+        const p = V.add(pos, V.mul(d, tRx));
+        pts.push(p);
+        segments.push({a: pos, b: p, kind: 'hit'});
+        hitRx = true;
+        break;
+      }
+
+      if (!nearestBoxHit || nearestBoxHit.t > boundaryT) {
+        const p = V.add(pos, V.mul(d, boundaryT));
+        pts.push(p);
+        segments.push({a: pos, b: p, kind: 'miss'});
+        break;
+      }
+
+      if (nearestBoxHit.isEdgeOrCorner) {
+        const p = nearestBoxHit.point;
+        pts.push(p);
+        segments.push({a: pos, b: p, kind: 'corner-reject'});
+        break;
+      }
+
+      const hit = nearestBoxHit;
+      traveled += hit.t;
+      pts.push(hit.point);
+      segments.push({a: pos, b: hit.point, kind: 'bounce'});
+      if (iter === maxBounces) break;
+      d = V.norm(V.reflect(d, hit.normal));
+      pos = V.add(hit.point, V.mul(d, 1e-4));
+      bounces++;
+    }
+
+    return {points: pts, segments, bounces, hitRx};
+  }
+
+  function launchRays(){
+    if (!scene.tx || !scene.rx) { setStatus('Place both Tx and Rx first.'); return; }
+    const forward = dirFromYawPitch(parseFloat(ui.yaw.value), parseFloat(ui.pitch.value));
+    const dirs = sampleBeamDirections(parseInt(ui.numRays.value,10), forward, parseFloat(ui.hSpread.value), parseFloat(ui.vSpread.value));
+    const maxBounces = parseInt(ui.maxBounces.value,10);
+    const maxDistance = parseFloat(ui.maxDistance.value);
+    const rxRadius = parseFloat(ui.rxRadius.value);
+    scene.rays = dirs.map(d => traceOneRay(scene.tx, d, maxBounces, maxDistance, scene.rx, rxRadius));
+
+    let hits = 0, best = Infinity, maxHitBounces = -1;
+    for (const r of scene.rays) if (r.hitRx) { hits++; best = Math.min(best, r.bounces); maxHitBounces = Math.max(maxHitBounces, r.bounces); }
+    const msg = hits ?
+      `Launched ${scene.rays.length} rays. Hits on Rx: ${hits}. Minimum hit bounces found: ${best}. Maximum hit bounces found: ${maxHitBounces}.` :
+      `Launched ${scene.rays.length} rays. No ray reached Rx. Increase rays, widen spread, adjust steering, or increase max bounces.`;
+    setStatus(msg);
+    draw();
+  }
+
+  // ---------- drawing ----------
+  function resize(){
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(rect.width*dpr));
+    canvas.height = Math.max(1, Math.round(rect.height*dpr));
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    draw();
+  }
+
+  function sortFacesForPainter(buildings){
+    const items=[];
+    for(const b of buildings){
+      const vs = boxVertices(b);
+      const faces = [
+        {pts:[vs[0],vs[1],vs[2],vs[3]], fill:'#67707b'}, // bottom
+        {pts:[vs[4],vs[5],vs[6],vs[7]], fill:'#9099a5'}, // top
+        {pts:[vs[0],vs[1],vs[5],vs[4]], fill:'#717b86'},
+        {pts:[vs[1],vs[2],vs[6],vs[5]], fill:'#7b8590'},
+        {pts:[vs[2],vs[3],vs[7],vs[6]], fill:'#6a737f'},
+        {pts:[vs[3],vs[0],vs[4],vs[7]], fill:'#76808b'}
+      ];
+      for(const f of faces){
+        const c = centroid(f.pts);
+        const eye = getCameraEye();
+        f.depth = V.len(V.sub(c, eye));
+        items.push(f);
+      }
+    }
+    items.sort((a,b)=> b.depth-a.depth);
+    return items;
+  }
+
+  function boxVertices(b){
+    const {min,max}=b;
+    return [
+      {x:min.x,y:min.y,z:min.z},{x:max.x,y:min.y,z:min.z},{x:max.x,y:min.y,z:max.z},{x:min.x,y:min.y,z:max.z},
+      {x:min.x,y:max.y,z:min.z},{x:max.x,y:max.y,z:min.z},{x:max.x,y:max.y,z:max.z},{x:min.x,y:max.y,z:max.z}
+    ];
+  }
+  function centroid(pts){ let s={x:0,y:0,z:0}; for(const p of pts) s=V.add(s,p); return V.mul(s,1/pts.length); }
+
+  function drawGround(){
+    const step=20;
+    ctx.save();
+    ctx.lineWidth=1;
+    for(let x=scene.worldMin.x; x<=scene.worldMax.x; x+=step){
+      draw3DLine({x,y:0,z:scene.worldMin.z},{x,y:0,z:scene.worldMax.z}, '#20262f');
+    }
+    for(let z=scene.worldMin.z; z<=scene.worldMax.z; z+=step){
+      draw3DLine({x:scene.worldMin.x,y:0,z},{x:scene.worldMax.x,y:0,z}, '#20262f');
+    }
+    drawAxes();
+    ctx.restore();
+  }
+  function drawAxes(){
+    draw3DLine({x:0,y:0,z:0},{x:30,y:0,z:0},'#b91c1c',2);
+    draw3DLine({x:0,y:0,z:0},{x:0,y:30,z:0},'#16a34a',2);
+    draw3DLine({x:0,y:0,z:0},{x:0,y:0,z:30},'#2563eb',2);
+  }
+  function draw3DLine(a,b,color,width=1.5, dash=[]){
+    const pa=project(a), pb=project(b);
+    if(!pa||!pb) return;
+    ctx.save(); ctx.strokeStyle=color; ctx.lineWidth=width; ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke(); ctx.restore();
+  }
+  function drawPoint3D(p,color,r=5){
+    const pp=project(p); if(!pp) return;
+    ctx.save(); ctx.fillStyle=color; ctx.beginPath(); ctx.arc(pp.x, pp.y, r, 0, Math.PI*2); ctx.fill(); ctx.restore();
+  }
+  function drawSphereApprox(center, radius, color){
+    const pc=project(center), px=project({x:center.x+radius,y:center.y,z:center.z});
+    if(!pc||!px) return;
+    const rr = Math.abs(px.x-pc.x);
+    ctx.save(); ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(pc.x, pc.y, rr, 0, Math.PI*2); ctx.stroke(); ctx.restore();
+  }
+
+  function draw(){
+    const rect = canvas.getBoundingClientRect();
+    ctx.clearRect(0,0,rect.width,rect.height);
+    drawGround();
+
+    const faces = sortFacesForPainter(scene.buildings);
+    for(const f of faces){
+      const pts = f.pts.map(project).filter(Boolean);
+      if (pts.length !== f.pts.length) continue;
+      ctx.save();
+      ctx.fillStyle = f.fill; ctx.strokeStyle = '#4b5563'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+      for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    for(const ray of scene.rays){
+      for(const seg of ray.segments){
+        const color = seg.kind === 'hit' ? '#a3e635' : seg.kind === 'bounce' ? '#f59e0b' : seg.kind === 'corner-reject' ? '#ef4444' : '#94a3b8';
+        const dash = seg.kind === 'miss' ? [6,4] : [];
+        draw3DLine(seg.a, seg.b, color, seg.kind==='hit' ? 2.4 : 1.2, dash);
+      }
+    }
+
+    if (scene.tx) {
+      drawPoint3D(scene.tx, '#cf4444', 6);
+      const fwd = dirFromYawPitch(parseFloat(ui.yaw.value), parseFloat(ui.pitch.value));
+      draw3DLine(scene.tx, V.add(scene.tx, V.mul(fwd, 24)), '#cf4444', 2.5);
+    }
+    if (scene.rx) {
+      drawPoint3D(scene.rx, '#2563eb', 6);
+      drawSphereApprox(scene.rx, parseFloat(ui.rxRadius.value), '#3b82f6');
+    }
+  }
+
+  // ---------- interactions ----------
+  function syncLabels(){
+    for (const [i, o] of [
+      [ui.txHeight, ui.txHeightVal], [ui.rxHeight, ui.rxHeightVal], [ui.rxRadius, ui.rxRadiusVal],
+      [ui.yaw, ui.yawVal], [ui.pitch, ui.pitchVal], [ui.hSpread, ui.hSpreadVal], [ui.vSpread, ui.vSpreadVal],
+      [ui.numRays, ui.numRaysVal], [ui.maxBounces, ui.maxBouncesVal], [ui.maxDistance, ui.maxDistanceVal]
+    ]) o.textContent = (+i.value).toFixed(i.step && i.step.includes('.') ? 1 : 0);
+    if (scene.tx) scene.tx.y = parseFloat(ui.txHeight.value);
+    if (scene.rx) scene.rx.y = parseFloat(ui.rxHeight.value);
+    draw();
+  }
+
+  function canvasPos(evt){ const r=canvas.getBoundingClientRect(); return {x:evt.clientX-r.left, y:evt.clientY-r.top}; }
+
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('mousedown', (e) => {
+    const pos = canvasPos(e);
+    if (e.button === 0 && scene.mode) return; // click handled on mouseup for placement
+    scene.drag = {button:e.button, x:pos.x, y:pos.y, startYaw:scene.camera.yaw, startPitch:scene.camera.pitch, startTarget:{...scene.camera.target}};
+  });
+  window.addEventListener('mouseup', () => { scene.drag = null; });
+  window.addEventListener('mousemove', (e) => {
+    if (!scene.drag) return;
+    const r=canvas.getBoundingClientRect();
+    const x=e.clientX-r.left, y=e.clientY-r.top;
+    const dx=x-scene.drag.x, dy=y-scene.drag.y;
+    if (scene.drag.button === 2 || e.shiftKey) {
+      const eye = getCameraEye();
+      const forward = V.norm(V.sub(scene.camera.target, eye));
+      const right = V.norm(V.cross(forward, {x:0,y:1,z:0}));
+      const up = V.norm(V.cross(right, forward));
+      const scale = scene.camera.radius * 0.0025;
+      scene.camera.target = V.add(scene.drag.startTarget, V.add(V.mul(right, -dx*scale), V.mul(up, dy*scale)));
+    } else {
+      scene.camera.yaw = scene.drag.startYaw - dx*0.007;
+      scene.camera.pitch = clamp(scene.drag.startPitch - dy*0.007, -1.35, 1.35);
+    }
+    draw();
+  });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    scene.camera.radius = clamp(scene.camera.radius * (1 + Math.sign(e.deltaY)*0.09), 60, 900);
+    draw();
+  }, {passive:false});
+  canvas.addEventListener('click', (e) => {
+    if (!scene.mode) return;
+    const pos = canvasPos(e);
+    const ray = screenRay(pos.x * (window.devicePixelRatio||1), pos.y * (window.devicePixelRatio||1));
+    if (!ray) return;
+    const p = intersectGround(ray);
+    if (!p) { setStatus('Click on visible ground.'); return; }
+    if (scene.mode === 'tx') {
+      scene.tx = {x:p.x, y:parseFloat(ui.txHeight.value), z:p.z};
+      setStatus(`Tx placed at (${scene.tx.x.toFixed(1)}, ${scene.tx.y.toFixed(1)}, ${scene.tx.z.toFixed(1)}).`);
+    } else if (scene.mode === 'rx') {
+      scene.rx = {x:p.x, y:parseFloat(ui.rxHeight.value), z:p.z};
+      setStatus(`Rx placed at (${scene.rx.x.toFixed(1)}, ${scene.rx.y.toFixed(1)}, ${scene.rx.z.toFixed(1)}).`);
+    } else if (scene.mode === 'steer') {
+      if (!scene.tx) { setStatus('Place Tx first.'); return; }
+      const d = V.sub({x:p.x,y:scene.tx.y,z:p.z}, scene.tx);
+      ui.yaw.value = (Math.atan2(d.x, d.z)*180/Math.PI).toFixed(0);
+      ui.yawVal.textContent = ui.yaw.value;
+      setStatus(`Tx yaw steered toward ground point (${p.x.toFixed(1)}, ${p.z.toFixed(1)}). Pitch remains ${ui.pitch.value}°.`);
+    }
+    draw();
+  });
+
+  ui.regenBtn.addEventListener('click', regenerate);
+  ui.resetCameraBtn.addEventListener('click', ()=>{ scene.camera = { target:{x:0,y:12,z:0}, yaw:0.9, pitch:-0.55, radius:300 }; draw(); });
+  ui.placeTxBtn.addEventListener('click', ()=> setMode(scene.mode==='tx'?null:'tx'));
+  ui.placeRxBtn.addEventListener('click', ()=> setMode(scene.mode==='rx'?null:'rx'));
+  ui.steerBtn.addEventListener('click', ()=> setMode(scene.mode==='steer'?null:'steer'));
+  ui.launchBtn.addEventListener('click', launchRays);
+  ui.clearRaysBtn.addEventListener('click', ()=>{ scene.rays=[]; setStatus('Cleared rays.'); draw(); });
+
+  for (const inp of [ui.txHeight,ui.rxHeight,ui.rxRadius,ui.yaw,ui.pitch,ui.hSpread,ui.vSpread,ui.numRays,ui.maxBounces,ui.maxDistance]) {
+    inp.addEventListener('input', syncLabels);
+  }
+
+  window.addEventListener('resize', resize);
+  regenerate();
+  syncLabels();
+  resize();
+})();
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Specular Ray Tracing Demo</title>
+  <style>
+    :root { --bg:#111827; --panel:#1f2937; --muted:#9ca3af; --text:#f9fafb; --accent:#60a5fa; }
+    html, body { margin:0; height:100%; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+    #wrap { display:grid; grid-template-columns: 340px 1fr; height:100%; }
+    #ui { background:var(--panel); padding:14px; overflow:auto; border-right:1px solid #374151; }
+    h1 { font-size:18px; margin:0 0 10px 0; }
+    h2 { font-size:14px; margin:16px 0 8px; color:#d1d5db; }
+    .row { margin:8px 0; }
+    label { display:block; font-size:12px; color:#d1d5db; margin-bottom:4px; }
+    input, button, select { width:100%; box-sizing:border-box; padding:8px; border-radius:8px; border:1px solid #4b5563; background:#111827; color:var(--text); }
+    input[type="range"] { padding:0; }
+    button { cursor:pointer; background:#2563eb; border-color:#2563eb; font-weight:600; }
+    button.secondary { background:#374151; border-color:#4b5563; }
+    button.mode.active { outline:2px solid #93c5fd; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .hint { font-size:12px; color:var(--muted); line-height:1.35; }
+    .stats { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#0b1220; padding:10px; border-radius:8px; border:1px solid #374151; font-size:12px; }
+    #view { position:relative; }
+    #overlay { position:absolute; left:12px; top:12px; background:rgba(17,24,39,.7); padding:8px 10px; border-radius:8px; font-size:12px; pointer-events:none; }
+    canvas { display:block; width:100%; height:100%; }
+    a { color:#93c5fd; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="ui">
+    <h1>3D Specular Ray Tracing Demo</h1>
+    <div class="hint">Click <b>Place Tx</b> or <b>Place Rx</b>, then click the ground plane. Rays reflect only on building faces. Edge/corner hits are rejected. Rx is a capture sphere.</div>
+
+    <h2>Placement</h2>
+    <div class="grid2">
+      <button id="modeTx" class="mode active">Place Tx</button>
+      <button id="modeRx" class="mode">Place Rx</button>
+    </div>
+
+    <div class="row"><label>Tx height (m): <span id="txhVal"></span></label><input id="txh" type="range" min="1" max="50" step="0.5" value="10"></div>
+    <div class="row"><label>Rx height (m): <span id="rxhVal"></span></label><input id="rxh" type="range" min="1" max="50" step="0.5" value="2"></div>
+    <div class="row"><label>Rx capture radius (m): <span id="rxrVal"></span></label><input id="rxr" type="range" min="1" max="10" step="0.5" value="3"></div>
+
+    <h2>Scene</h2>
+    <div class="row"><label>Building count</label><input id="count" type="number" min="1" max="80" step="1" value="24"></div>
+    <div class="row"><label>Seed</label><input id="seed" type="number" step="1" value="7"></div>
+    <div class="grid2">
+      <button id="regen" class="secondary">Regenerate scene</button>
+      <button id="resetRays" class="secondary">Clear rays</button>
+    </div>
+
+    <h2>Steering</h2>
+    <div class="row"><label>Yaw center (deg): <span id="yawVal"></span></label><input id="yaw" type="range" min="-180" max="180" step="1" value="20"></div>
+    <div class="row"><label>Pitch center (deg): <span id="pitchVal"></span></label><input id="pitch" type="range" min="-45" max="45" step="1" value="0"></div>
+    <div class="row"><label>Horizontal spread (deg): <span id="hspreadVal"></span></label><input id="hspread" type="range" min="1" max="180" step="1" value="50"></div>
+    <div class="row"><label>Vertical spread (deg): <span id="vspreadVal"></span></label><input id="vspread" type="range" min="1" max="90" step="1" value="20"></div>
+
+    <h2>Ray tracing</h2>
+    <div class="row"><label>Ray count</label><input id="rayCount" type="number" min="1" max="5000" step="1" value="200"></div>
+    <div class="row"><label>Max bounces</label><input id="maxBounces" type="number" min="0" max="20" step="1" value="4"></div>
+    <div class="row"><label>Max distance (m)</label><input id="maxDist" type="number" min="10" max="5000" step="10" value="800"></div>
+    <div class="grid2">
+      <button id="launch">Launch rays</button>
+      <button id="traceToward">Steer to Rx</button>
+    </div>
+
+    <h2>Stats</h2>
+    <div id="stats" class="stats"></div>
+  </div>
+  <div id="view">
+    <div id="overlay">Mouse: orbit | Shift+drag: pan | Wheel: zoom | Click ground to place Tx/Rx</div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+const view = document.getElementById('view');
+const statsEl = document.getElementById('stats');
+const els = Object.fromEntries([...document.querySelectorAll('input,button')].map(e => [e.id, e]));
+const labels = ['txh','rxh','rxr','yaw','pitch','hspread','vspread'];
+for (const id of labels) {
+  const out = document.getElementById(id + 'Val');
+  const sync = () => out.textContent = els[id].value;
+  els[id].addEventListener('input', sync); sync();
+}
+
+let mode = 'tx';
+function setMode(m){ mode=m; document.querySelectorAll('.mode').forEach(b=>b.classList.remove('active')); (m==='tx'?els.modeTx:els.modeRx).classList.add('active'); }
+els.modeTx.onclick=()=>setMode('tx'); els.modeRx.onclick=()=>setMode('rx');
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xeef2f7);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 5000);
+camera.position.set(160, 170, 220);
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+view.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0,0,0);
+controls.update();
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1); sun.position.set(150,250,120); scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(500, 500),
+  new THREE.MeshStandardMaterial({ color:0xdbe4ee, side:THREE.DoubleSide })
+);
+ground.rotation.x = -Math.PI/2; ground.position.y = 0; scene.add(ground);
+
+const grid = new THREE.GridHelper(500, 25, 0x94a3b8, 0xcbd5e1); scene.add(grid);
+
+const txMat = new THREE.MeshStandardMaterial({ color:0xaa0000 });
+const rxMat = new THREE.MeshStandardMaterial({ color:0x0033aa });
+const txMesh = new THREE.Mesh(new THREE.SphereGeometry(2.6, 24, 16), txMat);
+const rxMesh = new THREE.Mesh(new THREE.SphereGeometry(2.6, 24, 16), rxMat);
+scene.add(txMesh); scene.add(rxMesh);
+let tx = new THREE.Vector3(-80, parseFloat(els.txh.value), 0);
+let rx = new THREE.Vector3(80, parseFloat(els.rxh.value), 40);
+
+txMesh.position.copy(tx); rxMesh.position.copy(rx);
+
+const rxCapture = new THREE.Mesh(
+  new THREE.SphereGeometry(parseFloat(els.rxr.value), 20, 16),
+  new THREE.MeshBasicMaterial({ color:0x2563eb, wireframe:true })
+);
+scene.add(rxCapture);
+
+let buildings = [];
+let buildingGroup = new THREE.Group(); scene.add(buildingGroup);
+let rayGroup = new THREE.Group(); scene.add(rayGroup);
+
+function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; } }
+function randRange(rng, a, b){ return a + (b-a)*rng(); }
+
+function overlaps2D(a, b, pad=6){
+  return !(a.maxX + pad < b.minX || b.maxX + pad < a.minX || a.maxZ + pad < b.minZ || b.maxZ + pad < a.minZ);
+}
+
+function clearGroup(g){ while(g.children.length) g.remove(g.children[0]); }
+
+function generateScene(){
+  clearGroup(buildingGroup); buildings=[]; clearGroup(rayGroup);
+  const rng = mulberry32(parseInt(els.seed.value,10)||1);
+  const target = parseInt(els.count.value,10);
+  const placed = [];
+  let tries = 0;
+  while (placed.length < target && tries < target*200){
+    tries++;
+    const w = randRange(rng, 12, 40);
+    const d = randRange(rng, 12, 40);
+    const h = randRange(rng, 15, 90);
+    const x = randRange(rng, -210, 210);
+    const z = randRange(rng, -210, 210);
+    const box = { minX:x-w/2, maxX:x+w/2, minZ:z-d/2, maxZ:z+d/2, minY:0, maxY:h };
+    if (Math.hypot(x-tx.x, z-tx.z) < 20 || Math.hypot(x-rx.x, z-rx.z) < 20) continue;
+    if (placed.some(p => overlaps2D(p, box))) continue;
+    placed.push(box);
+  }
+  for (const b of placed){
+    const geo = new THREE.BoxGeometry(b.maxX-b.minX, b.maxY-b.minY, b.maxZ-b.minZ);
+    const mat = new THREE.MeshStandardMaterial({ color:0xbfc6ce, transparent:true, opacity:0.95 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set((b.minX+b.maxX)/2, (b.minY+b.maxY)/2, (b.minZ+b.maxZ)/2);
+    buildingGroup.add(mesh);
+    buildings.push({ ...b, mesh });
+  }
+  updateStats('Scene regenerated.');
+}
+
+generateScene();
+
+function updateTxRx(){
+  tx.y = parseFloat(els.txh.value); rx.y = parseFloat(els.rxh.value);
+  txMesh.position.copy(tx); rxMesh.position.copy(rx);
+  rxCapture.position.copy(rx);
+  rxCapture.geometry.dispose();
+  rxCapture.geometry = new THREE.SphereGeometry(parseFloat(els.rxr.value), 20, 16);
+}
+for (const id of ['txh','rxh','rxr']) els[id].addEventListener('input', updateTxRx);
+
+function resize(){
+  const w = view.clientWidth, h = view.clientHeight;
+  camera.aspect = w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h,false);
+}
+window.addEventListener('resize', resize); resize();
+
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+renderer.domElement.addEventListener('pointerdown', e => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(ground);
+  if (!hits.length) return;
+  const p = hits[0].point;
+  if (mode === 'tx') tx.set(p.x, parseFloat(els.txh.value), p.z);
+  else rx.set(p.x, parseFloat(els.rxh.value), p.z);
+  updateTxRx();
+  clearGroup(rayGroup);
+  updateStats('Placed ' + mode.toUpperCase());
+});
+
+function directionFromYawPitch(yawDeg, pitchDeg){
+  const yaw = THREE.MathUtils.degToRad(yawDeg);
+  const pitch = THREE.MathUtils.degToRad(pitchDeg);
+  const cp = Math.cos(pitch);
+  return new THREE.Vector3(Math.cos(yaw)*cp, Math.sin(pitch), Math.sin(yaw)*cp).normalize();
+}
+
+function sampleDirection(i, n, yawDeg, pitchDeg, hSpreadDeg, vSpreadDeg){
+  const u = n===1 ? 0.5 : i/(n-1);
+  const v = ((i*0.6180339887498949)%1);
+  const yaw = yawDeg + (u-0.5)*hSpreadDeg;
+  const pitch = pitchDeg + (v-0.5)*vSpreadDeg;
+  return directionFromYawPitch(yaw, pitch);
+}
+
+function pointInsideBox(p, b, eps=1e-6){
+  return p.x > b.minX+eps && p.x < b.maxX-eps && p.y > b.minY+eps && p.y < b.maxY-eps && p.z > b.minZ+eps && p.z < b.maxZ-eps;
+}
+
+function segmentCrossesInterior(a, c, eps=1e-4){
+  const d = new THREE.Vector3().subVectors(c, a);
+  const len = d.length();
+  if (len < eps) return false;
+  const dir = d.clone().normalize();
+  const start = a.clone().addScaledVector(dir, eps);
+  const end = c.clone().addScaledVector(dir, -eps);
+  const seg = new THREE.Vector3().subVectors(end, start);
+  const segLen = seg.length();
+  if (segLen <= 0) return false;
+  for (const b of buildings){
+    // slab intersection with AABB
+    let tmin = 0, tmax = 1;
+    for (const axis of ['x','y','z']){
+      const s = start[axis], e = seg[axis];
+      const min = axis==='x'?b.minX:axis==='y'?b.minY:b.minZ;
+      const max = axis==='x'?b.maxX:axis==='y'?b.maxY:b.maxZ;
+      if (Math.abs(e) < 1e-12){ if (s <= min || s >= max) { tmin = 2; break; } }
+      else {
+        let t1 = (min - s)/e, t2 = (max - s)/e;
+        if (t1 > t2) [t1,t2] = [t2,t1];
+        tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+        if (tmax <= tmin) { tmin = 2; break; }
+      }
+    }
+    if (tmin <= tmax && tmin < 1 && tmax > 0) return true;
+  }
+  return false;
+}
+
+function rayBoxIntersection(origin, dir, b, eps=1e-6){
+  let tmin = -Infinity, tmax = Infinity;
+  let nearAxis = null, nearSign = 0;
+  for (const axis of ['x','y','z']) {
+    const o = origin[axis], d = dir[axis];
+    const min = axis==='x'?b.minX:axis==='y'?b.minY:b.minZ;
+    const max = axis==='x'?b.maxX:axis==='y'?b.maxY:b.maxZ;
+    if (Math.abs(d) < eps) {
+      if (o < min || o > max) return null;
+      continue;
+    }
+    let t1 = (min - o) / d;
+    let t2 = (max - o) / d;
+    let sign = -1;
+    if (t1 > t2) { [t1, t2] = [t2, t1]; sign = 1; }
+    if (t1 > tmin) { tmin = t1; nearAxis = axis; nearSign = sign; }
+    tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return null;
+  }
+  if (tmax < eps) return null;
+  const t = tmin > eps ? tmin : tmax;
+  if (t < eps) return null;
+  const p = origin.clone().addScaledVector(dir, t);
+  let normal = new THREE.Vector3();
+  if (nearAxis==='x') normal.set(nearSign,0,0);
+  else if (nearAxis==='y') normal.set(0,nearSign,0);
+  else normal.set(0,0,nearSign);
+
+  // reject edge/corner hits: exactly one non-normal coordinate must be strict interior
+  const tol = 1e-4;
+  let boundaryCount = 0;
+  const on = (val, lo, hi) => Math.abs(val-lo)<tol || Math.abs(val-hi)<tol;
+  if (on(p.x,b.minX,b.maxX)) boundaryCount++;
+  if (on(p.y,b.minY,b.maxY)) boundaryCount++;
+  if (on(p.z,b.minZ,b.maxZ)) boundaryCount++;
+  if (boundaryCount !== 1) return { t, point:p, normal, box:b, degenerate:true };
+  return { t, point:p, normal, box:b, degenerate:false };
+}
+
+function firstHit(origin, dir, ignoreBox=null){
+  let best = null;
+  for (const b of buildings){
+    if (b === ignoreBox) continue;
+    const hit = rayBoxIntersection(origin, dir, b);
+    if (!hit || hit.degenerate) continue;
+    if (!best || hit.t < best.t) best = hit;
+  }
+  return best;
+}
+
+function sphereHitDistance(origin, dir, center, radius){
+  const oc = origin.clone().sub(center);
+  const a = dir.dot(dir);
+  const b = 2 * oc.dot(dir);
+  const c = oc.dot(oc) - radius*radius;
+  const disc = b*b - 4*a*c;
+  if (disc < 0) return null;
+  const s = Math.sqrt(disc);
+  const t1 = (-b - s)/(2*a), t2 = (-b + s)/(2*a);
+  const eps = 1e-6;
+  if (t1 > eps) return t1;
+  if (t2 > eps) return t2;
+  return null;
+}
+
+function reflect(dir, normal){ return dir.clone().sub(normal.clone().multiplyScalar(2 * dir.dot(normal))).normalize(); }
+
+function traceRay(origin, dir, maxBounces, maxDist, rxCenter, rxRadius){
+  const pts = [origin.clone()];
+  let pos = origin.clone();
+  let d = dir.clone().normalize();
+  let distLeft = maxDist;
+  let bounces = 0;
+  let lastBox = null;
+  while (distLeft > 0) {
+    const tRx = sphereHitDistance(pos, d, rxCenter, rxRadius);
+    const hit = firstHit(pos, d, lastBox);
+    if (tRx !== null && (!hit || tRx < hit.t)) {
+      const p = pos.clone().addScaledVector(d, tRx);
+      if (!segmentCrossesInterior(pos, p)) {
+        pts.push(p);
+        return { points:pts, hitRx:true, bounces };
+      }
+    }
+    if (!hit) {
+      pts.push(pos.clone().addScaledVector(d, Math.min(distLeft, 600)));
+      return { points:pts, hitRx:false, bounces };
+    }
+    if (hit.t > distLeft) {
+      pts.push(pos.clone().addScaledVector(d, distLeft));
+      return { points:pts, hitRx:false, bounces };
+    }
+    if (segmentCrossesInterior(pos, hit.point)) {
+      pts.push(hit.point.clone());
+      return { points:pts, hitRx:false, bounces };
+    }
+    pts.push(hit.point.clone());
+    if (bounces >= maxBounces) return { points:pts, hitRx:false, bounces };
+    pos = hit.point.clone().addScaledVector(hit.normal, 1e-3);
+    d = reflect(d, hit.normal);
+    distLeft -= hit.t;
+    bounces++;
+    lastBox = hit.box;
+  }
+  return { points:pts, hitRx:false, bounces };
+}
+
+function drawPolyline(points, color){
+  const geom = new THREE.BufferGeometry().setFromPoints(points);
+  const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color }));
+  rayGroup.add(line);
+}
+
+function launchRays(){
+  clearGroup(rayGroup);
+  updateTxRx();
+  const rayCount = parseInt(els.rayCount.value,10);
+  const maxBounces = parseInt(els.maxBounces.value,10);
+  const maxDist = parseFloat(els.maxDist.value);
+  const yaw = parseFloat(els.yaw.value), pitch = parseFloat(els.pitch.value), hs = parseFloat(els.hspread.value), vs = parseFloat(els.vspread.value);
+  let hits = 0, minB = Infinity, maxB = -Infinity;
+  for (let i=0;i<rayCount;i++){
+    const dir = sampleDirection(i, rayCount, yaw, pitch, hs, vs);
+    const result = traceRay(tx, dir, maxBounces, maxDist, rx, parseFloat(els.rxr.value));
+    drawPolyline(result.points, result.hitRx ? 0x16a34a : 0xcc6600);
+    if (result.hitRx) { hits++; minB = Math.min(minB, result.bounces); maxB = Math.max(maxB, result.bounces); }
+  }
+  updateStats(`Launched ${rayCount} rays\nHits on Rx: ${hits}\nMin bounces among hits: ${hits?minB:'-'}\nMax bounces among hits: ${hits?maxB:'-'}\n\nModel: 3D specular only\n- reflections only on box faces\n- no diffraction\n- no penetration\n- edge/corner hits rejected`);
+}
+
+function steerTowardRx(){
+  const d = rx.clone().sub(tx).normalize();
+  const yaw = THREE.MathUtils.radToDeg(Math.atan2(d.z, d.x));
+  const pitch = THREE.MathUtils.radToDeg(Math.asin(d.y));
+  els.yaw.value = Math.round(yaw); els.pitch.value = Math.round(pitch);
+  document.getElementById('yawVal').textContent = els.yaw.value;
+  document.getElementById('pitchVal').textContent = els.pitch.value;
+  launchRays();
+}
+
+function updateStats(text){ statsEl.textContent = `Tx = (${tx.x.toFixed(1)}, ${tx.y.toFixed(1)}, ${tx.z.toFixed(1)})\nRx = (${rx.x.toFixed(1)}, ${rx.y.toFixed(1)}, ${rx.z.toFixed(1)})\nBuildings = ${buildings.length}\n\n${text}`; }
+updateStats('Ready.');
+
+els.regen.onclick = generateScene;
+els.resetRays.onclick = () => { clearGroup(rayGroup); updateStats('Rays cleared.'); };
+els.launch.onclick = launchRays;
+els.traceToward.onclick = steerTowardRx;
+
+function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+animate();
+</script>
+</body>
+</html>
