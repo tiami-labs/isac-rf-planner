@@ -1914,7 +1914,16 @@ if static_dir.exists():
             return FileResponse(str(idx3), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
-    
+
+    @app.get("/tests/google_mesh_radial_raycast_demo.html")
+    async def serve_google_mesh_radial_raycast_demo():
+        """Minimal Cesium page: fixed TX/RX, radial rays vs Google Photorealistic3D Tiles only."""
+        demo_path = repo_root / "tests" / "google_mesh_radial_raycast_demo.html"
+        if demo_path.exists():
+            return FileResponse(str(demo_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
     # Explicit routes for known static files
     @app.get("/index.html")
     async def serve_index_html():
