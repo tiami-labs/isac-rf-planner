@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Google mesh radial rays (fixed TX/RX)</title>
+  <link rel="stylesheet" href="/Cesium/Widgets/widgets.css" />
+  <style>
+    html, body, #cesiumContainer { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; background: #0a0a0a; }
+    .panel {
+      position: absolute; top: 10px; left: 10px; z-index: 10;
+      background: rgba(22, 24, 28, 0.92); color: #e8eaed;
+      padding: 12px 14px; border-radius: 10px; font-family: system-ui, sans-serif;
+      font-size: 12px; max-width: 420px; border: 1px solid rgba(255,255,255,0.08);
+    }
+    .panel h1 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+    .muted { color: #9aa0a6; font-size: 11px; line-height: 1.4; }
+    .row { margin: 8px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    label { font-size: 11px; }
+    input[type="number"] { width: 72px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; }
+    button {
+      background: #1a4d8c; color: #fff; border: none; border-radius: 6px;
+      padding: 8px 12px; font-size: 12px; cursor: pointer; font-weight: 600;
+    }
+    button.secondary { background: #3d3d3d; }
+    #status { margin-top: 10px; font-size: 11px; color: #b7f3c9; white-space: pre-wrap; }
+ code { color: #a8c7fa; font-size: 10px; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div class="panel">
+    <h1>Google mesh · radial ray cast</h1>
+    <p class="muted">Fixed TX/RX in San Francisco. Rays use <code>pickFromRayMostDetailed</code> against <strong>Photorealistic 3D Tiles only</strong> (no OSM). Directions: Fibonacci sphere in local ENU at TX.</p>
+    <p class="muted"><strong>TX</strong> <code>37.7749, -122.4194</code><br/><strong>RX</strong> <code>37.77972646137100, -122.42014536960282</code></p>
+    <div class="row">
+      <label>Ray count <input type="number" id="rayCount" value="120" min="8" max="800" step="1" /></label>
+      <label>Max dist (m) <input type="number" id="maxDist" value="600" min="50" max="5000" step="10" /></label>
+    </div>
+    <div class="row">
+      <label>TX AGL (m) <input type="number" id="txAgl" value="10" min="0" max="200" step="0.5" /></label>
+      <label>RX AGL (m) <input type="number" id="rxAgl" value="1.5" min="0" max="100" step="0.5" /></label>
+    </div>
+    <div class="row">
+      <button type="button" id="btnCast">Cast radial rays</button>
+      <button type="button" id="btnClear" class="secondary">Clear rays</button>
+    </div>
+    <div id="status">Loading…</div>
+  </div>
+
+  <script type="module">
+    import * as Cesium from "/Cesium/index.js";
+
+    const TX = { lat: 37.7749, lon: -122.4194 };
+    const RX = { lat: 37.77972646137100, lon: -122.42014536960282 };
+
+    const statusEl = document.getElementById("status");
+    function setStatus(t) { statusEl.textContent = t; }
+
+    /** Fibonacci sphere in local ENU: x=east, y=north, z=up (Cesium EastNorthUp). */
+    function fibonacciDirectionsEnu(n) {
+      const dirs = [];
+      const gr = (1 + Math.sqrt(5)) / 2;
+      for (let i = 0; i < n; i++) {
+        const t = (i + 0.5) / n;
+        const z = 1 - 2 * t;
+        const r = Math.sqrt(Math.max(0, 1 - z * z));
+        const theta = 2 * Math.PI * i / gr;
+        const east = r * Math.cos(theta);
+        const north = r * Math.sin(theta);
+        const up = z;
+        const v = new Cesium.Cartesian3(east, north, up);
+        Cesium.Cartesian3.normalize(v, v);
+        dirs.push(v);
+      }
+      return dirs;
+    }
+
+    async function clampMeshHeight(viewer, lon, lat, probeZ = 400) {
+      const probe = Cesium.Cartesian3.fromDegrees(lon, lat, probeZ);
+      const arr = await viewer.scene.clampToHeightMostDetailed([probe]);
+      if (arr && arr[0]) {
+        const c = Cesium.Cartographic.fromCartesian(arr[0]);
+        return Number(c.height);
+      }
+      return 0;
+    }
+
+    function localEnuToWorldDir(enuMatrix, localUnit) {
+      const w = Cesium.Matrix4.multiplyByPointAsVector(enuMatrix, localUnit, new Cesium.Cartesian3());
+      return Cesium.Cartesian3.normalize(w, w);
+    }
+
+    let viewer = null;
+    let rayEntities = [];
+
+    function clearRays() {
+      if (!viewer) return;
+      for (const e of rayEntities) {
+        try { viewer.entities.remove(e); } catch (_) {}
+      }
+      rayEntities = [];
+    }
+
+    async function main() {
+      if (!window.CESIUM_BASE_URL) window.CESIUM_BASE_URL = "/Cesium/";
+
+      const cfg = await fetch("/api/config").then((r) => r.json());
+      if (!cfg.google_maps_api_key_present) {
+        setStatus("Set GOOGLE_MAPS_API_KEY in server env and open this page via the planner server (e.g. http://127.0.0.1:8000/tests/google_mesh_radial_raycast_demo.html).");
+        return;
+      }
+      Cesium.GoogleMaps.defaultApiKey = cfg.google_maps_api_key;
+
+      viewer = new Cesium.Viewer("cesiumContainer", {
+        animation: false,
+        timeline: false,
+        geocoder: false,
+        homeButton: true,
+        sceneModePicker: false,
+        navigationHelpButton: true,
+        baseLayerPicker: false,
+        terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+      });
+      viewer.scene.globe.depthTestAgainstTerrain = true;
+
+      setStatus("Loading Google Photorealistic 3D Tiles…");
+      const tileset = await Cesium.createGooglePhotorealistic3DTileset();
+      viewer.scene.primitives.add(tileset);
+      if (tileset.readyPromise) await tileset.readyPromise;
+
+      setStatus("Sampling mesh heights at TX/RX…");
+      const txBase = await clampMeshHeight(viewer, TX.lon, TX.lat);
+      const rxBase = await clampMeshHeight(viewer, RX.lon, RX.lat);
+      const txAgl = () => Number(document.getElementById("txAgl").value) || 0;
+      const rxAgl = () => Number(document.getElementById("rxAgl").value) || 0;
+      const txH = txBase + txAgl();
+      const rxH = rxBase + rxAgl();
+
+      const txCart = Cesium.Cartesian3.fromDegrees(TX.lon, TX.lat, txH);
+      const rxCart = Cesium.Cartesian3.fromDegrees(RX.lon, RX.lat, rxH);
+
+      viewer.entities.add({
+        position: txCart,
+        point: { pixelSize: 14, color: Cesium.Color.RED, outlineColor: Cesium.Color.WHITE, outlineWidth: 2 },
+        label: { text: "TX", font: "14px sans-serif", fillColor: Cesium.Color.WHITE, pixelOffset: new Cesium.Cartesian2(0, -20) },
+      });
+      viewer.entities.add({
+        position: rxCart,
+        point: { pixelSize: 12, color: Cesium.Color.CYAN, outlineColor: Cesium.Color.WHITE, outlineWidth: 2 },
+        label: { text: "RX", font: "14px sans-serif", fillColor: Cesium.Color.CYAN, pixelOffset: new Cesium.Cartesian2(0, -18) },
+      });
+
+      const midLat = (TX.lat + RX.lat) / 2;
+      const midLon = (TX.lon + RX.lon) / 2;
+      viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(midLon, midLat, 850),
+        orientation: {
+          heading: Cesium.Math.toRadians(0),
+          pitch: Cesium.Math.toRadians(-45),
+          roll: 0,
+        },
+      });
+
+      const enuAtTx = Cesium.Transforms.eastNorthUpToFixedFrame(txCart);
+
+      document.getElementById("btnClear").addEventListener("click", () => {
+        clearRays();
+        setStatus("Cleared ray polylines.");
+      });
+
+      document.getElementById("btnCast").addEventListener("click", async () => {
+        clearRays();
+        const n = Math.max(8, Math.min(800, Math.round(Number(document.getElementById("rayCount").value) || 120)));
+        const maxDist = Math.max(20, Number(document.getElementById("maxDist").value) || 600);
+
+        const txBaseNow = await clampMeshHeight(viewer, TX.lon, TX.lat);
+        const txHNow = txBaseNow + txAgl();
+        const origin = Cesium.Cartesian3.fromDegrees(TX.lon, TX.lat, txHNow);
+        const enu = Cesium.Transforms.eastNorthUpToFixedFrame(origin);
+
+        const dirs = fibonacciDirectionsEnu(n);
+        let hits = 0;
+        let miss = 0;
+        const BATCH = 8;
+
+        setStatus(`Casting ${n} rays (max ${maxDist} m)…`);
+
+        for (let i = 0; i < dirs.length; i += BATCH) {
+          const slice = dirs.slice(i, i + BATCH);
+          await Promise.all(
+            slice.map(async (localDir, j) => {
+              const worldDir = localEnuToWorldDir(enu, localDir);
+              const ray = new Cesium.Ray(origin, worldDir);
+              let endCart = null;
+              let isHit = false;
+              try {
+                const pick = await viewer.scene.pickFromRayMostDetailed(ray);
+                if (Cesium.defined(pick) && Cesium.defined(pick.position)) {
+                  const d = Cesium.Cartesian3.distance(origin, pick.position);
+                  if (Number.isFinite(d) && d > 0.2 && d <= maxDist) {
+                    endCart = pick.position;
+                    isHit = true;
+                  }
+                }
+              } catch (_) {}
+              if (!endCart) {
+                endCart = Cesium.Cartesian3.add(
+                  origin,
+                  Cesium.Cartesian3.multiplyByScalar(worldDir, maxDist, new Cesium.Cartesian3()),
+                  new Cesium.Cartesian3(),
+                );
+                miss++;
+              } else {
+                hits++;
+              }
+              const color = isHit
+                ? Cesium.Color.ORANGE.withAlpha(0.72)
+                : Cesium.Color.GRAY.withAlpha(0.35);
+              const ent = viewer.entities.add({
+                polyline: {
+                  positions: [origin, endCart],
+                  width: isHit ? 1.5 : 1,
+                  material: color,
+                },
+              });
+              rayEntities.push(ent);
+            }),
+          );
+        }
+
+        setStatus(
+          `Done. Rays=${n}  mesh_hit=${hits}  no_hit_to_max=${miss}\n` +
+            `TX h=${txHNow.toFixed(2)} m  RX h=${(await clampMeshHeight(viewer, RX.lon, RX.lat)) + rxAgl()} m (mesh+AGL)\n` +
+            `Uses Google 3D Tiles only; compare with OSM footprints separately.`,
+        );
+      });
+
+      setStatus(
+        `Ready. TX mesh+AGL ${txH.toFixed(1)} m, RX mesh+AGL ${rxH.toFixed(1)} m.\nClick Cast radial rays.`,
+      );
+    }
+
+    main().catch((e) => setStatus(`Error: ${e}\n${e.stack || ""}`));
+  </script>
+</body>
+</html>
