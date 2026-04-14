@@ -37,12 +37,34 @@
       <div style="margin-top: 8px;">
         <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
           <input type="checkbox" id="show-raytrace-toggle" style="cursor:pointer;" />
-          <span>Show multipath rays (SHIFT+click to set RX)</span>
+          <span>Show multipath rays</span>
         </label>
-        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">Remote plans from <code>/api/ui/remote-plan-rf</code> and pasted <code>/api/plan</code>/<code>/api/3d/plan-and-trace</code> JSON draw through the same Cesium viewer path.</div>
+        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">Client-side 3D specular tracing against Google photorealistic mesh. Camera pan/tilt/zoom never changes ray physics.</div>
       </div>
 
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+      <div style="margin-top: 8px;">
+        <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" id="show-osm-rt-buildings-toggle" style="cursor:pointer;" />
+          <span>Enable optional OSM preview shells</span>
+        </label>
+        <div style="margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap;">
+          <button type="button" id="rt-load-osm-layout-btn" style="padding: 6px 8px; background: #3d3d1a; color: #f5f5c8; border: 1px solid #6b6b2a; border-radius: 4px; cursor: pointer; font-size: 11px;">Load OSM preview</button>
+        </div>
+        <div style="margin-top: 4px; font-size: 10px; color: #888;">Fetches OSM footprints only for optional preview. Ray bounces still use Google mesh directly, never OSM.</div>
+      </div>
+
+      <div style="margin-top: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+        <button type="button" id="rt-place-tx-btn" style="padding: 6px; background: #4a3416; color: #fff4d6; border: 1px solid #8b5e1a; border-radius: 4px; cursor: pointer; font-size: 11px;">Place TX</button>
+        <button type="button" id="rt-place-rx-btn" style="padding: 6px; background: #0f3558; color: #d7f0ff; border: 1px solid #236aa3; border-radius: 4px; cursor: pointer; font-size: 11px;">Place RX</button>
+        <button type="button" id="rt-steer-btn" style="padding: 6px; background: #2d2d2d; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; font-size: 11px;">Steer TX</button>
+      </div>
+      <div style="margin-top: 6px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;">
+        <button type="button" id="rt-launch-btn" style="padding: 6px; background: #1f5f2a; color: white; border: 1px solid #3a8b4b; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold;">Launch rays</button>
+        <button type="button" id="rt-clear-btn" style="padding: 6px; background: #4b1f1f; color: white; border: 1px solid #8a3838; border-radius: 4px; cursor: pointer; font-size: 11px;">Clear rays</button>
+      </div>
+      <div style="margin-top: 6px; font-size: 10px; color: #aaa;">Click mode sets TX, RX, or steering target directly on the 3D scene. Steer uses the picked point to solve TX yaw/pitch.</div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
         <div>
           <label for="tx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">TX height (m)</label>
           <input type="number" id="tx-height-m" step="0.5" value="10.0"
@@ -71,7 +93,51 @@
         </div>
       </div>
 
+      <div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <div>
+          <label for="rt-ray-count" style="display: block; font-size: 11px; margin-bottom: 3px;">Ray count</label>
+          <input type="number" id="rt-ray-count" step="1" min="1" max="4000" value="240"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-max-bounces" style="display: block; font-size: 11px; margin-bottom: 3px;">Max bounces</label>
+          <input type="number" id="rt-max-bounces" step="1" min="0" max="12" value="3"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-rx-radius-m" style="display: block; font-size: 11px; margin-bottom: 3px;">RX capture radius (~10m)</label>
+          <input type="number" id="rt-rx-radius-m" step="0.1" min="0.2" max="50" value="10.0"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-max-distance-m" style="display: block; font-size: 11px; margin-bottom: 3px;">Max trace distance (m)</label>
+          <input type="number" id="rt-max-distance-m" step="10" min="10" max="10000" value="800"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-yaw-deg" style="display: block; font-size: 11px; margin-bottom: 3px;">Yaw (deg)</label>
+          <input type="number" id="rt-yaw-deg" step="0.1" value="0"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-pitch-deg" style="display: block; font-size: 11px; margin-bottom: 3px;">Pitch (deg)</label>
+          <input type="number" id="rt-pitch-deg" step="0.1" value="0"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-h-spread-deg" style="display: block; font-size: 11px; margin-bottom: 3px;">Horizontal spread (deg)</label>
+          <input type="number" id="rt-h-spread-deg" step="0.1" min="0" max="180" value="30"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+        <div>
+          <label for="rt-v-spread-deg" style="display: block; font-size: 11px; margin-bottom: 3px;">Vertical spread (deg)</label>
+          <input type="number" id="rt-v-spread-deg" step="0.1" min="0" max="180" value="18"
+            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;" />
+        </div>
+      </div>
+
       <div id="mesh-profile-status"></div>
+      <div id="rt-status" style="margin-top: 8px; font-size: 11px; color: #b7f3c9; white-space: pre-wrap;"></div>
     </div>
 
     <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
