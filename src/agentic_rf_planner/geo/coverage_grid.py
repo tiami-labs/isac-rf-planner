@@ -12,6 +12,29 @@ from .physical_spanning import MapProvider
 logger = logging.getLogger(__name__)
 
 
+def _use_additive_post_los_excess_losses(rf_params: RFParams) -> bool:
+    """Whether to apply the planner's legacy post-blocker excess-loss ramps.
+
+    Standards-backed rationale:
+    - 3GPP TR 38.901 §7.4.1 defines the mean outdoor LOS/NLOS path loss.
+    - 3GPP TR 38.901 §7.4.3.1 models O2I as basic outdoor path loss plus
+      building penetration and indoor-depth loss.
+    - 3GPP TR 38.901 §7.4.4 models shadow fading as a zero-mean log-normal
+      variation around the mean path loss, not as a deterministic penalty that
+      keeps ramping upward behind the first blocker.
+    - Nokia's white paper "Coverage evaluation of 7–15 GHz bands from existing
+      sites" uses the same decomposition: "basic" outdoor loss plus building
+      penetration loss.
+
+    Therefore, when the planner is using the 3GPP 38.901 scenario models, we
+    should not also add deterministic shadow/diffraction-vs-distance ramps after
+    the first blocker; that double-counts post-blocker attenuation. Those ramps
+    remain available for the legacy non-3GPP path-loss mode.
+    """
+    model = str(getattr(rf_params, "path_loss_model", "legacy") or "legacy").strip().lower()
+    return model != "3gpp_38901"
+
+
 def build_coverage_grid(
     tx: LatLon, 
     rf_params: RFParams,
@@ -30,7 +53,10 @@ def build_coverage_grid(
 
     Vendor-grade roadmap notes:
     - penetration is only applied while the ray is actually inside a blocker interval
-    - after the first blocker, LOS is lost and the ray transitions into a shadow/recovery state
+    - for 3GPP 38.901 mode, outdoor LOS/NLOS mean loss comes from the selected
+      scenario path-loss model; we do not add deterministic post-blocker
+      shadow/diffraction ramps on top of that
+    - legacy mode keeps the older shadow/recovery continuation terms
     - we do not carry every prior wall forever once the ray exits the structure
     """
     from ..rf.sector_config import SectorConfig, create_omnidirectional_sector, validate_sectors
@@ -92,6 +118,7 @@ def build_coverage_grid(
 
     # Building attenuation config (overall + per-material from rf.params.yaml)
     bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
+    use_additive_post_los_losses = _use_additive_post_los_excess_losses(rf_params)
 
     # Get frequency once (used for all calculations)
     freq_mhz = rf_params.freq_mhz
@@ -492,7 +519,7 @@ def build_coverage_grid(
                         else 0.0
                     )
                     shadow_loss_db = 0.0
-                    if not is_los and penetration_loss_db <= 0.0:
+                    if not is_los and penetration_loss_db <= 0.0 and use_additive_post_los_losses:
                         shadow_loss_db = min(
                             float(getattr(rf_params, "shadow_loss_cap_db", 22.0) or 22.0),
                             float(getattr(rf_params, "shadow_loss_db", 6.0) or 6.0)
@@ -506,7 +533,7 @@ def build_coverage_grid(
                     )
                     diffraction_loss_db = 0.0
                     canyon_recovery_db = 0.0
-                    if not is_los and penetration_loss_db <= 0.0:
+                    if not is_los and penetration_loss_db <= 0.0 and use_additive_post_los_losses:
                         diffraction_loss_db = min(
                             float(getattr(rf_params, "diffraction_loss_cap_db", 18.0) or 18.0),
                             float(getattr(rf_params, "diffraction_base_loss_db", 6.0) or 6.0)
