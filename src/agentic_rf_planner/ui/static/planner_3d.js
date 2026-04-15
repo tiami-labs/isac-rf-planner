@@ -664,6 +664,24 @@ function rtDirectionFromYawPitchDeg(yawDeg, pitchDeg) {
   return RT3.norm({ x: Math.sin(yaw) * cp, y: Math.sin(pitch), z: Math.cos(yaw) * cp });
 }
 
+function rtYawPitchDegFromLocalDirection(localDir) {
+  const horiz = Math.hypot(localDir.x, localDir.z);
+  return {
+    yawDeg: Cesium.Math.toDegrees(Math.atan2(localDir.x, localDir.z)),
+    pitchDeg: Cesium.Math.toDegrees(Math.atan2(localDir.y, Math.max(horiz, 1e-9))),
+  };
+}
+
+function rtLocalDirectionTowardWorldPoint(originCartesian, targetCartesian) {
+  const worldVec = Cesium.Cartesian3.subtract(targetCartesian, originCartesian, new Cesium.Cartesian3());
+  if (Cesium.Cartesian3.magnitudeSquared(worldVec) < 1e-10) return null;
+  const enu = Cesium.Transforms.eastNorthUpToFixedFrame(originCartesian);
+  const invEnu = Cesium.Matrix4.inverseTransformation(enu, new Cesium.Matrix4());
+  const localVec = Cesium.Matrix4.multiplyByPointAsVector(invEnu, worldVec, new Cesium.Cartesian3());
+  if (Cesium.Cartesian3.magnitudeSquared(localVec) < 1e-10) return null;
+  return Cesium.Cartesian3.normalize(localVec, localVec);
+}
+
 function rtHammersley(index, count) {
   let bits = index;
   let rev = 0;
@@ -790,41 +808,115 @@ function updateRtHeadingEntity() {
   raytraceAuxEntities = [];
   const tx = getCurrentTxWorldPoint();
   if (!tx) return;
+
   const yaw = getRtNumber("rt-yaw-deg", 0.0);
   const pitch = getRtNumber("rt-pitch-deg", 0.0);
-  const dirLocal = rtDirectionFromYawPitchDeg(yaw, pitch);
   const txCart = rtWorldFromGeo(tx);
+  const dirLocal = rtDirectionFromYawPitchDeg(yaw, pitch);
   const dirWorld = rtWorldDirectionFromLocal(txCart, dirLocal);
-  const lenM = Math.min(getRtNumber("rt-max-distance-m", 800.0), 140.0);
-  const arrowEnd = Cesium.Cartesian3.add(txCart, Cesium.Cartesian3.multiplyByScalar(dirWorld, lenM, new Cesium.Cartesian3()), new Cesium.Cartesian3());
-  const heading = Cesium.Math.toRadians(yaw);
-  const pitchRad = Cesium.Math.toRadians(pitch);
-  const coneLength = Math.max(12.0, Math.min(40.0, lenM * 0.35));
-  const coneRadius = Math.max(4.0, coneLength * Math.tan(Cesium.Math.toRadians(Math.max(3.0, getRtNumber("rt-h-spread-deg", 30.0) * 0.5))));
-  const axisMid = Cesium.Cartesian3.add(txCart, Cesium.Cartesian3.multiplyByScalar(dirWorld, coneLength * 0.5, new Cesium.Cartesian3()), new Cesium.Cartesian3());
-  const orientation = Cesium.Transforms.headingPitchRollQuaternion(axisMid, new Cesium.HeadingPitchRoll(heading, pitchRad, 0.0));
+  const carto = Cesium.Cartographic.fromCartesian(txCart);
+  let refUp = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormalCartographic(carto, new Cesium.Cartesian3());
+  if (!Cesium.defined(refUp) || Cesium.Cartesian3.magnitudeSquared(refUp) < 1e-10) {
+    refUp = Cesium.Cartesian3.normalize(txCart, new Cesium.Cartesian3());
+  }
+  const { u, v } = rtMakePerpBasis(dirWorld, refUp);
 
+  const guideLen = Math.max(18.0, Math.min(getRtNumber("rt-max-distance-m", 800.0), 140.0));
+  const shaftEnd = Cesium.Cartesian3.add(txCart, Cesium.Cartesian3.multiplyByScalar(dirWorld, guideLen, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const headLen = Math.max(6.0, Math.min(18.0, guideLen * 0.18));
+  const headWidth = Math.max(3.0, headLen * 0.45);
+  const headBase = Cesium.Cartesian3.subtract(shaftEnd, Cesium.Cartesian3.multiplyByScalar(dirWorld, headLen, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const headLeft = Cesium.Cartesian3.add(headBase, Cesium.Cartesian3.multiplyByScalar(u, headWidth, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const headRight = Cesium.Cartesian3.add(headBase, Cesium.Cartesian3.multiplyByScalar(u, -headWidth, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const headUp = Cesium.Cartesian3.add(headBase, Cesium.Cartesian3.multiplyByScalar(v, headWidth, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const headDown = Cesium.Cartesian3.add(headBase, Cesium.Cartesian3.multiplyByScalar(v, -headWidth, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+
+  const coneLength = Math.max(10.0, Math.min(42.0, guideLen * 0.36));
+  const spreadDeg = Math.max(3.0, 0.5 * Math.max(getRtNumber("rt-h-spread-deg", 30.0), getRtNumber("rt-v-spread-deg", 18.0)));
+  const coneRadius = Math.max(3.0, coneLength * Math.tan(Cesium.Math.toRadians(spreadDeg)));
+  const coneCenter = Cesium.Cartesian3.add(txCart, Cesium.Cartesian3.multiplyByScalar(dirWorld, coneLength, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const coneSegments = 24;
+  const ringPositions = [];
+  for (let i = 0; i <= coneSegments; i++) {
+    const angle = (i / coneSegments) * Math.PI * 2.0;
+    const radial = Cesium.Cartesian3.add(
+      Cesium.Cartesian3.multiplyByScalar(u, Math.cos(angle) * coneRadius, new Cesium.Cartesian3()),
+      Cesium.Cartesian3.multiplyByScalar(v, Math.sin(angle) * coneRadius, new Cesium.Cartesian3()),
+      new Cesium.Cartesian3(),
+    );
+    ringPositions.push(Cesium.Cartesian3.add(coneCenter, radial, new Cesium.Cartesian3()));
+  }
+
+  const arrowColor = Cesium.Color.RED.withAlpha(0.95);
+  const coneColor = Cesium.Color.RED.withAlpha(0.48);
   raytraceAuxEntities.push(viewer.entities.add({
     polyline: {
-      positions: [txCart, arrowEnd],
-      width: 3.0,
-      material: Cesium.Color.RED.withAlpha(0.92),
+      positions: [txCart, shaftEnd],
+      width: 4.0,
+      material: arrowColor,
       clampToGround: false,
     },
   }));
+  for (const tip of [headLeft, headRight, headUp, headDown]) {
+    raytraceAuxEntities.push(viewer.entities.add({
+      polyline: {
+        positions: [shaftEnd, tip],
+        width: 3.0,
+        material: arrowColor,
+        clampToGround: false,
+      },
+    }));
+  }
   raytraceAuxEntities.push(viewer.entities.add({
-    position: axisMid,
-    orientation,
-    cylinder: {
-      length: coneLength,
-      topRadius: 0.0,
-      bottomRadius: coneRadius,
-      material: Cesium.Color.RED.withAlpha(0.12),
-      outline: true,
-      outlineColor: Cesium.Color.RED.withAlpha(0.55),
-      numberOfVerticalLines: 12,
+    polyline: {
+      positions: ringPositions,
+      width: 2.0,
+      material: coneColor,
+      clampToGround: false,
     },
   }));
+  for (let i = 0; i < coneSegments; i += 4) {
+    raytraceAuxEntities.push(viewer.entities.add({
+      polyline: {
+        positions: [txCart, ringPositions[i]],
+        width: 1.5,
+        material: coneColor,
+        clampToGround: false,
+      },
+    }));
+  }
+}
+
+function steerTxTowardWorldPoint(targetCartesian, label = "target") {
+  const tx = getCurrentTxWorldPoint();
+  if (!tx) {
+    setRtStatus("Place TX before steering it.");
+    return false;
+  }
+  const txCart = rtWorldFromGeo(tx);
+  const localDir = rtLocalDirectionTowardWorldPoint(txCart, targetCartesian);
+  if (!localDir) {
+    setRtStatus(`Unable to solve TX steering toward ${label}.`);
+    return false;
+  }
+  const { yawDeg, pitchDeg } = rtYawPitchDegFromLocalDirection(localDir);
+  setInputValue("rt-yaw-deg", yawDeg.toFixed(2));
+  setInputValue("rt-pitch-deg", pitchDeg.toFixed(2));
+  updateRtHeadingEntity();
+  setRtStatus(`TX steering set toward ${label}. Yaw=${yawDeg.toFixed(1)}°, pitch=${pitchDeg.toFixed(1)}°.`);
+  if ((document.getElementById("show-raytrace-toggle")?.checked ?? false) && currentTxLocation && currentRxLocation && getString("ray-mode", "3d").toLowerCase() === "3d_rt") {
+    renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon, currentRxLocation.lat, currentRxLocation.lon).catch(() => {});
+  }
+  return true;
+}
+
+function steerTxTowardCurrentRx() {
+  const rx = getCurrentRxWorldPoint();
+  if (!rx) {
+    setRtStatus("Place RX before using Aim at RX.");
+    return false;
+  }
+  return steerTxTowardWorldPoint(rtWorldFromGeo(rx), "RX");
 }
 
 async function loadOsmRtBuildingsLayoutOnly() {
@@ -3657,30 +3749,7 @@ async function init() {
     }
 
     if (localRtState.clickMode === "steer") {
-      if (!currentTxLocation) {
-        setRtStatus("Place TX before steering it.");
-        return;
-      }
-      const origin = pointToRtLocal(
-        { lat: currentTxLocation.lat, lon: currentTxLocation.lon },
-        currentTxLocation.lat,
-        currentTxLocation.lon,
-        Number(currentTxLocation.ground_h || 0.0) + getNumber("tx-height-m", 10.0),
-      );
-      const target = pointToRtLocal({ lat: currentTxLocation.lat, lon: currentTxLocation.lon }, lat, lon, groundH);
-      const dx = target.x - origin.x;
-      const dy = target.y - origin.y;
-      const dz = target.z - origin.z;
-      const yawDeg = Cesium.Math.toDegrees(Math.atan2(dx, dz));
-      const horiz = Math.hypot(dx, dz);
-      const pitchDeg = Cesium.Math.toDegrees(Math.atan2(dy, Math.max(horiz, 1e-9)));
-      setInputValue("rt-yaw-deg", yawDeg.toFixed(2));
-      setInputValue("rt-pitch-deg", pitchDeg.toFixed(2));
-      updateRtHeadingEntity();
-      setRtStatus(`TX steering set from click. Yaw=${yawDeg.toFixed(1)}°, pitch=${pitchDeg.toFixed(1)}°.`);
-      if ((document.getElementById("show-raytrace-toggle")?.checked ?? false) && currentTxLocation && currentRxLocation) {
-        renderRaytraceOverlay(currentTxLocation.lat, currentTxLocation.lon, currentRxLocation.lat, currentRxLocation.lon).catch(() => {});
-      }
+      steerTxTowardWorldPoint(cartesian, "clicked mesh point");
       return;
     }
 
@@ -3787,6 +3856,7 @@ RX=(${lat.toFixed(6)}, ${lon.toFixed(6)})`);
   document.getElementById("rt-place-tx-btn")?.addEventListener("click", () => setRtClickMode("tx"));
   document.getElementById("rt-place-rx-btn")?.addEventListener("click", () => setRtClickMode("rx"));
   document.getElementById("rt-steer-btn")?.addEventListener("click", () => setRtClickMode("steer"));
+  document.getElementById("rt-aim-rx-btn")?.addEventListener("click", () => steerTxTowardCurrentRx());
   document.getElementById("rt-launch-btn")?.addEventListener("click", () => launchLocal3dRaytrace().catch((e) => setRtStatus(`3D RT launch failed: ${e}`)));
   document.getElementById("rt-clear-btn")?.addEventListener("click", () => {
     clearRaytraceOverlay({ clearOsmRtBuildings: false });
