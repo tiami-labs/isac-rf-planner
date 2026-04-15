@@ -12,27 +12,40 @@ from .physical_spanning import MapProvider
 logger = logging.getLogger(__name__)
 
 
-def _use_additive_post_los_excess_losses(rf_params: RFParams) -> bool:
-    """Whether to apply the planner's legacy post-blocker excess-loss ramps.
+def _local_post_exit_excess_loss_db(
+    *,
+    intervals: List[dict[str, Any]],
+    sample_distance_m: float,
+    base_loss_db: float,
+    width_slope_db_per_100m: float,
+    cap_db: float,
+    recovery_slope_db_per_100m: float,
+) -> float:
+    """Short-range shadow/diffraction after exiting nearby blockers.
 
-    Standards-backed rationale:
-    - 3GPP TR 38.901 §7.4.1 defines the mean outdoor LOS/NLOS path loss.
-    - 3GPP TR 38.901 §7.4.3.1 models O2I as basic outdoor path loss plus
-      building penetration and indoor-depth loss.
-    - 3GPP TR 38.901 §7.4.4 models shadow fading as a zero-mean log-normal
-      variation around the mean path loss, not as a deterministic penalty that
-      keeps ramping upward behind the first blocker.
-    - Nokia's white paper "Coverage evaluation of 7–15 GHz bands from existing
-      sites" uses the same decomposition: "basic" outdoor loss plus building
-      penetration loss.
-
-    Therefore, when the planner is using the 3GPP 38.901 scenario models, we
-    should not also add deterministic shadow/diffraction-vs-distance ramps after
-    the first blocker; that double-counts post-blocker attenuation. Those ramps
-    remain available for the legacy non-3GPP path-loss mode.
+    This deliberately ties post-blocker excess loss to blockers exited close to
+    the current sample instead of the first blocker on the whole bearing. The
+    old "behind first blocker forever" behavior created wedge artifacts and let a
+    single early building poison the rest of the ray. Here each exited blocker
+    contributes a local event loss that relaxes as the open gap behind that
+    blocker grows.
     """
-    model = str(getattr(rf_params, "path_loss_model", "legacy") or "legacy").strip().lower()
-    return model != "3gpp_38901"
+    total_loss_db = 0.0
+    for interval in intervals:
+        end_m = float(interval["end_m"])
+        if end_m > sample_distance_m + 1e-6:
+            continue
+
+        width_m = max(0.0, float(interval["end_m"]) - float(interval["start_m"]))
+        event_loss_db = min(
+            cap_db,
+            max(0.0, base_loss_db) + max(0.0, width_slope_db_per_100m) * (width_m / 100.0),
+        )
+        open_gap_m = max(0.0, sample_distance_m - end_m)
+        recovered_db = max(0.0, recovery_slope_db_per_100m) * (open_gap_m / 100.0)
+        total_loss_db += max(0.0, event_loss_db - recovered_db)
+
+    return min(max(0.0, cap_db), total_loss_db)
 
 
 def build_coverage_grid(
@@ -44,8 +57,9 @@ def build_coverage_grid(
     """
     Create a ring/grid of cells around TX with adaptive ray termination.
     
-    If sectors are provided, generates cells only for angles covered by sectors.
-    If no sectors (or None), generates omnidirectional coverage (360°).
+    If sectors are provided, each sector is evaluated across the same spatial sample field.
+    Serving/interference behavior is resolved later from per-sector RSRP candidates.
+    If no sectors (or None), generates a single omnidirectional candidate field.
     
     Rays stop when:
     1. Signal strength drops below the configured termination threshold
@@ -53,10 +67,7 @@ def build_coverage_grid(
 
     Vendor-grade roadmap notes:
     - penetration is only applied while the ray is actually inside a blocker interval
-    - for 3GPP 38.901 mode, outdoor LOS/NLOS mean loss comes from the selected
-      scenario path-loss model; we do not add deterministic post-blocker
-      shadow/diffraction ramps on top of that
-    - legacy mode keeps the older shadow/recovery continuation terms
+    - after the first blocker, LOS is lost and the ray transitions into a shadow/recovery state
     - we do not carry every prior wall forever once the ray exits the structure
     """
     from ..rf.sector_config import SectorConfig, create_omnidirectional_sector, validate_sectors
@@ -118,7 +129,6 @@ def build_coverage_grid(
 
     # Building attenuation config (overall + per-material from rf.params.yaml)
     bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
-    use_additive_post_los_losses = _use_additive_post_los_excess_losses(rf_params)
 
     # Get frequency once (used for all calculations)
     freq_mhz = rf_params.freq_mhz
@@ -228,43 +238,36 @@ def build_coverage_grid(
 
     store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
 
-# Generate cells for each sector
-    # For each sector, iterate through angles covered by that sector
+    # Generate cells for each sector.
+    #
+    # Real deployments do not behave like azimuth-clipped cones. Every sector radiates
+    # continuously according to its antenna pattern, then the strongest candidate serves
+    # the UE while neighboring same-carrier sectors remain as interference. Angle/polygon
+    # sector definitions are therefore treated as configuration/display hints, not as a
+    # binary RF admission mask.
     for sector in sector_configs:
         if sector.sector_type == "polygon":
-            logger.debug(f"Generating cells for polygon sector {sector.sector_id} "
-                        f"(polygon with {len(sector.polygon_points)} points)")
+            logger.debug(
+                f"Generating cells for polygon-design sector {sector.sector_id} "
+                f"(polygon with {len(sector.polygon_points)} points; not used as an RF cutoff)"
+            )
         else:
-            logger.debug(f"Generating cells for sector {sector.sector_id} "
-                        f"({sector.start_angle_deg:.1f}° to {sector.end_angle_deg:.1f}°)")
+            logger.debug(
+                f"Generating full-field candidates for sector {sector.sector_id} "
+                f"(nominal orientation {getattr(sector, 'azimuth_deg', 0.0):.1f}°, "
+                f"HPBW {getattr(sector, 'beamwidth_h_deg', 360.0):.1f}°)"
+            )
         
         # Use sector-specific frequency and power for this sector
         sector_freq_mhz = sector.freq_mhz
         sector_tx_power_dbm = sector.tx_power_dbm
         sector_rs_eirp_dbm = _reference_signal_eirp_dbm(rf_params, tx_power_dbm_override=sector_tx_power_dbm)
         
-        # Determine angle range for this sector
-        if sector.sector_type == "polygon":
-            # For polygon sectors, iterate through all angles (0-360) but only create cells
-            # if the point is inside the polygon
-            angle_range = [(0.0, 360.0)]
-        elif sector.sector_type == "360":
-            # 360° sector: full circle
-            angle_range = [(0.0, 360.0)]
-        else:
-            # Angle-based sector
-            start_angle = sector.start_angle_deg
-            end_angle = sector.end_angle_deg
-            
-            # Handle wrap-around: if start > end, sector wraps around 360°
-            if start_angle <= end_angle:
-                # Normal case: no wrap-around
-                angle_range = [(start_angle, end_angle)]
-            else:
-                # Wrap-around: e.g., 350° to 10° -> [350, 360) and [0, 10]
-                angle_range = [(start_angle, 360.0), (0.0, end_angle)]
-        
-        # Generate cells for each angle range in this sector
+        # All sectors share the same 360° sample lattice. The antenna pattern later
+        # determines the relative strength of each sector candidate at each point.
+        angle_range = [(0.0, 360.0)]
+
+        # Generate cells for each angle range in this sector.
         for range_start, range_end in angle_range:
             
 
@@ -470,13 +473,6 @@ def build_coverage_grid(
                             encountered_buildings.append(interval["building"])
                         next_hit_idx += 1
 
-                    # For polygon sectors, check if point is inside polygon. If not, skip creating a cell.
-                    if sector.sector_type == "polygon":
-                        is_inside = sector.covers_point(lat, lon, tx.lat, tx.lon)
-                        if not is_inside:
-                            r += dr
-                            continue
-
                     active_buildings = [
                         interval
                         for interval in building_intervals
@@ -505,26 +501,46 @@ def build_coverage_grid(
                         for interval in forest_intervals
                         if interval["end_m"] <= (r + 1e-6)
                     ]
+                    exited_intervals = [
+                        interval
+                        for interval in (building_intervals + forest_intervals)
+                        if interval["end_m"] <= (r + 1e-6)
+                    ]
 
                     first_blocker_distance_m = min(all_started) if all_started else None
                     last_exit_distance_m = max(all_exited) if all_exited else None
-                    is_los = first_blocker_distance_m is None
                     penetration_loss_db = (
                         sum(float(interval["penetration_loss_db"]) for interval in active_buildings)
                         + len(active_forest) * wood_loss_db
                     )
-                    behind_first_blocker_m = (
-                        max(0.0, r - first_blocker_distance_m)
-                        if first_blocker_distance_m is not None
-                        else 0.0
+                    # Treat LOS as a local state: if the current sample is not inside a
+                    # blocker, the broad outdoor decay resumes and local exited-blocker
+                    # shadow handles the nearby building effect.
+                    is_los = penetration_loss_db <= 0.0
+                    # Hybrid 3GPP tuning:
+                    # In dense UMi street-canyon deployments, immediate "full recovery" after
+                    # exiting blockers can be too optimistic at longer ranges. We keep local
+                    # post-exit recovery but damp the recovery slope to preserve moderate NLOS
+                    # memory in cluttered urban paths.
+                    recovery_slope_db_per_100m = float(
+                        getattr(rf_params, "canyon_recovery_slope_db_per_100m", 6.0) or 6.0
                     )
+                    model_name = str(getattr(rf_params, "path_loss_model", "") or "").strip().lower()
+                    scenario_name = str(getattr(rf_params, "propagation_scenario", "") or "").strip().lower()
+                    if model_name == "3gpp_38901" and scenario_name == "umi_street_canyon":
+                        recovery_slope_db_per_100m *= 0.7
+
                     shadow_loss_db = 0.0
-                    if not is_los and penetration_loss_db <= 0.0 and use_additive_post_los_losses:
-                        shadow_loss_db = min(
-                            float(getattr(rf_params, "shadow_loss_cap_db", 22.0) or 22.0),
-                            float(getattr(rf_params, "shadow_loss_db", 6.0) or 6.0)
-                            + float(getattr(rf_params, "shadow_decay_db_per_100m", 4.0) or 4.0)
-                            * (behind_first_blocker_m / 100.0),
+                    if penetration_loss_db <= 0.0 and exited_intervals:
+                        shadow_loss_db = _local_post_exit_excess_loss_db(
+                            intervals=exited_intervals,
+                            sample_distance_m=r,
+                            base_loss_db=float(getattr(rf_params, "shadow_loss_db", 6.0) or 6.0),
+                            width_slope_db_per_100m=float(
+                                getattr(rf_params, "shadow_decay_db_per_100m", 4.0) or 4.0
+                            ),
+                            cap_db=float(getattr(rf_params, "shadow_loss_cap_db", 22.0) or 22.0),
+                            recovery_slope_db_per_100m=recovery_slope_db_per_100m,
                         )
                     open_gap_after_exit_m = (
                         max(0.0, r - last_exit_distance_m)
@@ -533,17 +549,20 @@ def build_coverage_grid(
                     )
                     diffraction_loss_db = 0.0
                     canyon_recovery_db = 0.0
-                    if not is_los and penetration_loss_db <= 0.0 and use_additive_post_los_losses:
-                        diffraction_loss_db = min(
-                            float(getattr(rf_params, "diffraction_loss_cap_db", 18.0) or 18.0),
-                            float(getattr(rf_params, "diffraction_base_loss_db", 6.0) or 6.0)
-                            + float(getattr(rf_params, "diffraction_slope_db_per_100m", 3.0) or 3.0)
-                            * (behind_first_blocker_m / 100.0),
-                        )
-                        canyon_recovery_db = min(
-                            float(getattr(rf_params, "canyon_recovery_max_db", 8.0) or 8.0),
-                            float(getattr(rf_params, "canyon_recovery_slope_db_per_100m", 6.0) or 6.0)
-                            * (open_gap_after_exit_m / 100.0),
+                    if penetration_loss_db <= 0.0 and exited_intervals:
+                        diffraction_loss_db = _local_post_exit_excess_loss_db(
+                            intervals=exited_intervals,
+                            sample_distance_m=r,
+                            base_loss_db=float(
+                                getattr(rf_params, "diffraction_base_loss_db", 6.0) or 6.0
+                            ),
+                            width_slope_db_per_100m=float(
+                                getattr(rf_params, "diffraction_slope_db_per_100m", 3.0) or 3.0
+                            ),
+                            cap_db=float(
+                                getattr(rf_params, "diffraction_loss_cap_db", 18.0) or 18.0
+                            ),
+                            recovery_slope_db_per_100m=recovery_slope_db_per_100m,
                         )
 
                     extra_loss_db = max(
