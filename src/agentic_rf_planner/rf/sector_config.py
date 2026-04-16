@@ -12,23 +12,27 @@ class SectorConfig(BaseModel):
     Configuration for a single antenna sector.
     
     Each sector defines:
-    - Coverage shape: angular (start_angle_deg to end_angle_deg) OR polygon (list of lat/lon points)
-    - Frequency and bandwidth
-    - Transmit power
-    - Optional: antenna pattern parameters (for future beam pattern modeling)
+    - Radio configuration: frequency, power, bandwidth
+    - Antenna-pattern orientation: azimuth, beamwidth, tilt, attenuation caps
+    - Optional UI/planning geometry hints (angle span or polygon)
+
+    Important:
+    - ``angle`` and ``polygon`` are not hard RF cutoffs in the planner.
+    - Real radios are handled as continuous antenna gain fields, not geometric wedges.
+    - These shapes are retained for input compatibility and visualization/planning aids.
     """
     
     sector_id: str = Field(..., description="Unique identifier for this sector (e.g., 'sector_1', 'n78_azimuth_0')")
-    sector_type: Literal["360", "angle", "polygon"] = Field("angle", description="Type of sector: 360 (omnidirectional), angle (angular range), or polygon (abstract shape)")
+    sector_type: Literal["360", "angle", "polygon"] = Field("angle", description="Sector hint type: 360 (omnidirectional), angle (nominal azimuth span), or polygon (planning/display shape)")
     
-    # Angular coverage (for sector_type="angle" or "360")
-    start_angle_deg: Optional[float] = Field(None, ge=0.0, le=360.0, description="Start angle in degrees (0-360, absolute bearing). Required for angle-based sectors.")
-    end_angle_deg: Optional[float] = Field(None, ge=0.0, le=360.0, description="End angle in degrees (0-360, absolute bearing). Required for angle-based sectors.")
+    # Angular display/orientation hints (for sector_type="angle" or "360")
+    start_angle_deg: Optional[float] = Field(None, ge=0.0, le=360.0, description="Nominal start angle in degrees (0-360, absolute bearing). Used to derive boresight/HPBW defaults for angle sectors.")
+    end_angle_deg: Optional[float] = Field(None, ge=0.0, le=360.0, description="Nominal end angle in degrees (0-360, absolute bearing). Used to derive boresight/HPBW defaults for angle sectors.")
     
-    # Polygon coverage (for sector_type="polygon")
+    # Polygon planning/display hint (for sector_type="polygon")
     # List of [lat, lon] points forming a contiguous polygon
     # Origin point (TX location) is implicit - polygon points are relative to TX
-    polygon_points: Optional[List[List[float]]] = Field(None, description="List of [lat, lon] points for polygon sector. Required for polygon sectors. Must be contiguous (single polygon, not multi-polygon).")
+    polygon_points: Optional[List[List[float]]] = Field(None, description="List of [lat, lon] points for a planning/display polygon. Required for polygon sectors. Must be contiguous (single polygon, not multi-polygon).")
     
     # RF parameters specific to this sector
     freq_mhz: float = Field(..., gt=0.0, description="Frequency in MHz for this sector")
@@ -124,11 +128,10 @@ class SectorConfig(BaseModel):
     
     def covers_point(self, lat: float, lon: float, tx_lat: float, tx_lon: float) -> bool:
         """
-        Check if a point (lat, lon) is inside this sector.
-        
-        For polygon sectors: uses point-in-polygon test.
-        For angle-based sectors: checks if bearing from TX to point is within angle range.
-        For 360° sectors: always returns True.
+        Check if a point (lat, lon) is inside this sector's declared geometry hint.
+
+        This helper is kept for visualization/planning tools. The RF engine does not
+        use it as a hard serving cutoff.
         """
         if self.sector_type == "360":
             return True
@@ -316,4 +319,3 @@ def create_omnidirectional_sector(rf_params) -> SectorConfig:
         front_to_back_attenuation_db=float(getattr(rf_params, "front_to_back_attenuation_db", 25.0) or 25.0),
         max_vertical_attenuation_db=float(getattr(rf_params, "max_vertical_attenuation_db", 30.0) or 30.0),
     )
-
