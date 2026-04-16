@@ -1225,9 +1225,11 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
     logger.info(f"  freq_mhz: {req.freq_mhz}")
     logger.info(f"  tx_power_dbm: {req.tx_power_dbm}")
     logger.info("="*60)
+    _record_planner_phase("request_enter", f"/api/plan lat={req.lat:.6f} lon={req.lon:.6f}", None)
     
     try:
         logger.info("Step 1: Creating RFParams...")
+        _record_planner_phase("rf_params", "Resolving RF parameters", None)
         # Use UI-provided ray_mode if present, otherwise default to 2d (ignore env var)
         # The UI toggle should control this, not an environment variable
         effective_ray_mode = (req.ray_mode or "2d").strip().lower()
@@ -1304,6 +1306,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         logger.info(f"  Ray mode: {effective_ray_mode} (tx_height_m={rf_params.tx_height_m}, rx_height_m={rf_params.rx_height_m})")
         
         logger.info("Step 2: Calling run_rf_planning_for_point...")
+        _record_planner_phase("planner_dispatch", "Dispatching RF planning pipeline", None)
         # Run in executor to avoid blocking the event loop during long processing
         import asyncio
         from concurrent.futures import ThreadPoolExecutor
@@ -1316,9 +1319,11 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
                     lat=req.lat,
                     lon=req.lon,
                     rf_params=rf_params,
+                    progress_cb=lambda phase, detail: _record_planner_phase(phase, detail, None),
                 )
             )
         logger.info("Step 3: RF planning completed successfully")
+        _record_planner_phase("response_ready", "RF planning result ready for response", None)
         logger.info(f"  Result keys: {list(result.keys())}")
         return result
     except MissingMeshProfiles as e:
@@ -1333,9 +1338,11 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             },
         )
     except ValueError as e:
+        _record_planner_phase("error", f"ValueError: {e}", None)
         logger.error(f"ValueError in RF planning: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        _record_planner_phase("error", f"Unexpected error: {e}", None)
         logger.exception(f"Unexpected error in RF planning: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
