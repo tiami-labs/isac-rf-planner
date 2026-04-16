@@ -3,7 +3,7 @@
 import base64
 import io
 import logging
-from typing import Dict, Any, Optional, cast
+from typing import Dict, Any, Optional, Callable, cast
 
 import numpy as np
 from PIL import Image
@@ -65,6 +65,7 @@ def run_rf_planning_for_point(
     ray_mode: str = "2d",  # "2d" (OSM polygons) or "3d" (Google mesh profiles)
     tx_height_m: float = 0.0,
     rx_height_m: float = 1.5,
+    progress_cb: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Run complete RF planning pipeline for a point.
@@ -87,15 +88,25 @@ def run_rf_planning_for_point(
     logger.info(f"  max_snap_distance_m: {max_snap_distance_m}")
     logger.info("="*60)
 
+    def progress(phase: str, detail: str) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(phase, detail)
+        except Exception:
+            logger.debug("progress callback failed", exc_info=True)
+
     # 1) TX placement
     # 2D mode: snap to street (keeps 2D behavior consistent with earlier implementation)
     # 3D mode: DO NOT snap (profiles + Google mesh are computed for the clicked TX)
     ray_mode_eff = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
     if ray_mode_eff in ("3d", "mesh", "google_mesh", "google-mesh", "3d_rt", "3d-rt", "3d_osm", "3d-osm", "osm3d"):
+        progress("tx_placement", "3D mode: using clicked TX point directly")
         logger.info("STEP 1: 3D mode - skipping street snapping; using clicked point as TX")
         snapped = SnappedPoint(LatLon(lat=lat, lon=lon), 0.0)
         logger.info(f"✓ STEP 1 SUCCESS: TX (no-snap): ({snapped.latlon.lat:.6f}, {snapped.latlon.lon:.6f})")
     else:
+        progress("tx_placement", f"Snapping TX to nearest street within {max_snap_distance_m:.0f} m")
         logger.info(f"STEP 1: Snapping to street (max distance: {max_snap_distance_m}m)...")
         logger.info(f"  Calling snap_to_street({lat}, {lon}, max_distance_m={max_snap_distance_m})")
         snapped = snap_to_street(lat, lon, max_distance_m=max_snap_distance_m)
@@ -121,6 +132,7 @@ def run_rf_planning_for_point(
     # 2) Initialize map provider (PRIMARY: geometry-based)
     # Ray-mode selection is the ONLY place where 2D vs 3D diverges.
     logger.info("STEP 2: Initializing map provider...")
+    progress("map_provider", f"Initializing map provider for ray mode {ray_mode_eff}")
 
     # Allow RFParams to carry these fields if caller uses the REST API.
     # NOTE: ray_mode may be updated later if we fall back (e.g., missing mesh profiles).
@@ -213,13 +225,16 @@ def run_rf_planning_for_point(
     
     # Get clutter classification (non-blocking, can be slow)
     logger.info("STEP 2.1: Getting clutter classification...")
+    progress("clutter", "Classifying local clutter around TX")
     clutter_type = "unknown"
     try:
         clutter_type = map_provider.get_clutter_type(snapped.latlon, radius_m=200.0)
         logger.info(f"✓ Clutter type: {clutter_type}")
+        progress("clutter", f"Clutter classified as {clutter_type}")
     except Exception as e:
         logger.warning(f"  Could not get clutter type (non-critical): {e}")
         clutter_type = "unknown"
+        progress("clutter", "Clutter classification unavailable; continuing")
 
     # 3) OPTIONAL: Try to fetch Street View for refinement (non-blocking)
     pano = None
@@ -245,12 +260,17 @@ def run_rf_planning_for_point(
             streetview_provider = None
 
     if streetview_provider is not None:
+        progress("streetview", "Checking nearby street-level imagery")
         logger.debug("Checking Street View availability (optional refinement)...")
         try:
             streetview_available = streetview_provider.check_availability(
                 snapped.latlon.lat, snapped.latlon.lon
             )
             logger.info(f"Street View available (radius {streetview_provider.radius_m}m): {streetview_available}")
+            progress(
+                "streetview",
+                "Street-level imagery available" if streetview_available else "Street-level imagery not available"
+            )
 
             # Try fallback radius if not available
             if not streetview_available:
@@ -272,6 +292,7 @@ def run_rf_planning_for_point(
             if streetview_available:
                 try:
                     logger.debug("Fetching panorama for optional VLM refinement...")
+                    progress("streetview", "Fetching panorama for optional refinement")
                     pano = streetview_provider.fetch_pano(snapped.latlon.lat, snapped.latlon.lon)
                     logger.info(f"Loaded panorama: {pano.shape[1]}x{pano.shape[0]} pixels")
                     
@@ -293,6 +314,7 @@ def run_rf_planning_for_point(
     views = []
     vlm_used = False
     if vlm is not None and pano is not None:
+        progress("vlm", "Running VLM material refinement on panorama tiles")
         logger.debug("Running VLM analysis for material refinement...")
         try:
             tiles = tile_pano(pano, num_views=num_views)
@@ -312,15 +334,19 @@ def run_rf_planning_for_point(
                 logger.debug(f"Tile {tile.tile_id}: found {len(view.materials)} material segments")
             vlm_used = True
             logger.info("VLM analysis complete, materials will refine geometry-based model")
+            progress("vlm", f"VLM material refinement complete ({len(views)} view tiles)")
         except Exception as e:
             logger.warning(f"VLM analysis failed (non-critical): {e}")
+            progress("vlm", "VLM refinement failed; continuing with geometry-only model")
     else:
         if vlm is None:
             logger.debug("No VLM provided, using geometry-only model")
         if pano is None:
             logger.debug("No panorama available, using geometry-only model")
+        progress("vlm", "Using geometry-only model")
 
     # 5) Build world model (PRIMARY: geometry, SECONDARY: VLM refinement if available)
+    progress("world_model", "Building world model and coverage candidates")
     logger.debug("Building world model from geometry...")
     world = build_world_model(
         tx=snapped.latlon,
@@ -329,11 +355,14 @@ def run_rf_planning_for_point(
         map_provider=map_provider,
     )
     logger.info(f"Built world model with {len(world.cells)} cells")
+    progress("world_model", f"World model built ({len(world.cells)} candidate cells)")
 
     # 5) RF attenuation
+    progress("attenuation", "Computing per-cell RSRP, serving cell, and interference")
     logger.debug("Computing RF attenuation...")
     grid = compute_attenuation_grid(world)
     logger.info(f"Computed attenuation grid with {len(grid.cell_lat)} points")
+    progress("attenuation", f"RF attenuation complete ({len(grid.cell_lat)} output points)")
 
     # 6) heatmap / map overlay
     ray_mode_eff2 = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
@@ -347,8 +376,10 @@ def run_rf_planning_for_point(
     # 2D OSM and 3D modes share the same pre-colored ellipse PNG (local ENU → texture),
     # so Leaflet and Cesium both get a continuous drape instead of radial spoke circles.
     logger.debug(f"Generating ellipse heatmap PNG (size={tex_size}, ray_mode={ray_mode_eff2})...")
+    progress("heatmap", f"Rendering heatmap texture ({tex_size} px)")
     heatmap_payload = attenuation_grid_to_png_ellipse(grid, size=tex_size, vmin=-140.0, vmax=-60.0)
     logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
+    progress("heatmap", "Heatmap rendering complete")
 
 
     # Prepare sector information for visualization
@@ -357,8 +388,18 @@ def run_rf_planning_for_point(
         for sector_dict in rf_params.sectors:
             sectors_info.append({
                 "sector_id": sector_dict.get("sector_id", "unknown"),
+                "sector_type": sector_dict.get("sector_type", "angle"),
                 "start_angle_deg": sector_dict.get("start_angle_deg", 0.0),
                 "end_angle_deg": sector_dict.get("end_angle_deg", 360.0),
+                "polygon_points": sector_dict.get("polygon_points"),
+                "azimuth_deg": sector_dict.get("azimuth_deg"),
+                "beamwidth_h_deg": sector_dict.get("beamwidth_h_deg"),
+                "beamwidth_v_deg": sector_dict.get("beamwidth_v_deg"),
+                "electrical_tilt_deg": sector_dict.get("electrical_tilt_deg"),
+                "mechanical_tilt_deg": sector_dict.get("mechanical_tilt_deg"),
+                "max_horizontal_attenuation_db": sector_dict.get("max_horizontal_attenuation_db"),
+                "front_to_back_attenuation_db": sector_dict.get("front_to_back_attenuation_db"),
+                "max_vertical_attenuation_db": sector_dict.get("max_vertical_attenuation_db"),
                 "freq_mhz": sector_dict.get("freq_mhz", rf_params.freq_mhz),
                 "tx_power_dbm": sector_dict.get("tx_power_dbm", rf_params.tx_power_dbm),
             })
@@ -366,8 +407,18 @@ def run_rf_planning_for_point(
         # Omnidirectional (360°)
         sectors_info.append({
             "sector_id": "omnidirectional",
+            "sector_type": "360",
             "start_angle_deg": 0.0,
             "end_angle_deg": 360.0,
+            "polygon_points": None,
+            "azimuth_deg": 0.0,
+            "beamwidth_h_deg": 360.0,
+            "beamwidth_v_deg": rf_params.vertical_beamwidth_deg,
+            "electrical_tilt_deg": rf_params.electrical_tilt_deg,
+            "mechanical_tilt_deg": rf_params.mechanical_tilt_deg,
+            "max_horizontal_attenuation_db": rf_params.max_horizontal_attenuation_db,
+            "front_to_back_attenuation_db": rf_params.front_to_back_attenuation_db,
+            "max_vertical_attenuation_db": rf_params.max_vertical_attenuation_db,
             "freq_mhz": rf_params.freq_mhz,
             "tx_power_dbm": rf_params.tx_power_dbm,
         })
@@ -469,5 +520,7 @@ def run_rf_planning_for_point(
         ob = _osm_buildings_for_client_from_map_provider(map_provider)
         if ob is not None:
             result["osm_buildings_for_client"] = ob
+
+    progress("complete", "RF planning complete")
 
     return result
