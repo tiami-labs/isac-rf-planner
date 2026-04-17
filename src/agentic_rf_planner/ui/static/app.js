@@ -75,9 +75,104 @@ let isPlanningQueue = false;
 let currentTxLocation = null; // {lat, lon} - set when TX is selected/typed
 let polygonDrawingMode = null; // {sectorId, points: [[lat, lon], ...], polygonLayer: L.polygon}
 let polygonMarkers = []; // Markers for polygon points
+let restorePromptState = null; // { data, ageMinutes }
 
 function setStatus(msg) {
   statusEl.textContent = msg;
+}
+
+function getSavedPlanSnapshot() {
+  try {
+    const savedData = localStorage.getItem('rf_planning_last_result');
+    const savedTimestamp = localStorage.getItem('rf_planning_timestamp');
+    if (!savedData || !savedTimestamp) return null;
+    const data = JSON.parse(savedData);
+    const ageMinutes = (Date.now() - parseInt(savedTimestamp, 10)) / (1000 * 60);
+    if (!Number.isFinite(ageMinutes) || ageMinutes < 0) return null;
+    return { data, ageMinutes };
+  } catch (e) {
+    console.warn("[RF Planner] Failed to inspect saved session:", e);
+    return null;
+  }
+}
+
+function removeRestorePrompt() {
+  const existing = document.getElementById("restore-session-prompt");
+  if (existing) existing.remove();
+}
+
+function restoreSavedPlan(data, ageMinutes) {
+  removeLegacyCurrentLayerCircles();
+  removeRestorePrompt();
+
+  heatmapLayerGroups.forEach(layerGroup => map.removeLayer(layerGroup));
+  heatmapLayerGroups = [];
+
+  const restoredHeatmapLayerGroup = L.layerGroup().addTo(map);
+  heatmapLayerGroups.push(restoredHeatmapLayerGroup);
+  window.currentHeatmapLayerGroup = restoredHeatmapLayerGroup;
+
+  renderHeatmap(data);
+
+  if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
+    try {
+      window.rf2dIngestPlannerOsm(data.osm_buildings_for_client);
+    } catch (e) {
+      console.warn("[RF Planner] rf2dIngestPlannerOsm (restore):", e);
+    }
+  }
+
+  if (data.clutter_type || data.world_model_source) {
+    displayMetadata(data);
+  }
+
+  if (data.panorama_image) {
+    displayPanorama(data.panorama_image, data.panorama_location);
+  }
+
+  if (data.snapped_tx) {
+    const tx = data.snapped_tx;
+    L.marker([tx.lat, tx.lon], {
+      icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] })
+    })
+      .addTo(currentLayerGroup)
+      .bindPopup(`TX: ${tx.lat}, ${tx.lon}`);
+  }
+
+  setStatus(`Restored previous RF plan (${ageMinutes.toFixed(1)} min old). Click map or paste TX coordinates to queue another plan.`);
+}
+
+function showRestorePrompt(snapshot) {
+  removeRestorePrompt();
+  restorePromptState = snapshot;
+  if (!snapshot) return;
+
+  const sidebar = document.getElementById("sidebar");
+  const anchor = document.getElementById("status");
+  if (!sidebar || !anchor) return;
+
+  const prompt = document.createElement("div");
+  prompt.id = "restore-session-prompt";
+  prompt.style.cssText = "margin-top:8px; padding:8px; background:#1f2937; border:1px solid #374151; border-radius:4px; font-size:11px; color:#e5e7eb;";
+  prompt.innerHTML = `
+    <div style="margin-bottom:6px;"><strong>Restore last session?</strong> Saved ${snapshot.ageMinutes.toFixed(1)} min ago.</div>
+    <div style="display:flex; gap:6px;">
+      <button type="button" id="restore-session-yes" style="flex:1; padding:6px; background:#2563eb; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px;">Restore</button>
+      <button type="button" id="restore-session-no" style="flex:1; padding:6px; background:#4b5563; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px;">Dismiss</button>
+    </div>
+  `;
+  anchor.insertAdjacentElement("afterend", prompt);
+
+  document.getElementById("restore-session-yes")?.addEventListener("click", () => {
+    if (!restorePromptState) return;
+    restoreSavedPlan(restorePromptState.data, restorePromptState.ageMinutes);
+    restorePromptState = null;
+  });
+  document.getElementById("restore-session-no")?.addEventListener("click", () => {
+    restorePromptState = null;
+    removeRestorePrompt();
+    setStatus("Click on the map or enter coordinates to run RF planning.");
+  });
 }
 
 function sleep(ms) {
@@ -256,64 +351,15 @@ function removeLegacyCurrentLayerCircles() {
     .forEach(layer => currentLayerGroup.removeLayer(layer));
 }
 
-// Load and restore last results from localStorage on page load
+// Inspect saved results on page load, but never auto-restore them.
 function loadLastResults() {
   removeLegacyCurrentLayerCircles();
-  try {
-    const savedData = localStorage.getItem('rf_planning_last_result');
-    const savedTimestamp = localStorage.getItem('rf_planning_timestamp');
-    
-    if (savedData && savedTimestamp) {
-      const data = JSON.parse(savedData);
-      const ageMinutes = (Date.now() - parseInt(savedTimestamp)) / (1000 * 60);
-      
-      console.log(`[RF Planner] Found saved results (${ageMinutes.toFixed(1)} minutes old)`);
-      
-      heatmapLayerGroups.forEach(layerGroup => map.removeLayer(layerGroup));
-      heatmapLayerGroups = [];
-
-      const restoredHeatmapLayerGroup = L.layerGroup().addTo(map);
-      heatmapLayerGroups.push(restoredHeatmapLayerGroup);
-      window.currentHeatmapLayerGroup = restoredHeatmapLayerGroup;
-
-      // Restore the heatmap
-      renderHeatmap(data);
-
-      if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
-        try {
-          window.rf2dIngestPlannerOsm(data.osm_buildings_for_client);
-        } catch (e) {
-          console.warn("[RF Planner] rf2dIngestPlannerOsm (restore):", e);
-        }
-      }
-      
-      // Restore metadata if available
-      if (data.clutter_type || data.world_model_source) {
-        displayMetadata(data);
-      }
-      
-      // Restore panorama if available
-      if (data.panorama_image) {
-        displayPanorama(data.panorama_image, data.panorama_location);
-      }
-      
-      // Show clicked point marker
-      if (data.snapped_tx) {
-        const tx = data.snapped_tx;
-        L.marker([tx.lat, tx.lon], { 
-          icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] }) 
-        })
-          .addTo(currentLayerGroup)
-          .bindPopup(`TX: ${tx.lat}, ${tx.lon}`);
-      }
-      
-      setStatus(`Restored previous RF plan (${ageMinutes.toFixed(1)} min ago). Click map or paste TX coordinates to queue another plan.`);
-      return true;
-    }
-  } catch (e) {
-    console.warn("[RF Planner] Failed to load from localStorage:", e);
-  }
-  return false;
+  const snapshot = getSavedPlanSnapshot();
+  if (!snapshot) return false;
+  console.log(`[RF Planner] Found saved results (${snapshot.ageMinutes.toFixed(1)} minutes old)`);
+  showRestorePrompt(snapshot);
+  setStatus(`Saved RF plan found (${snapshot.ageMinutes.toFixed(1)} min old). Choose whether to restore it.`);
+  return true;
 }
 
 // Initialize Ray Mode selector on page load (loadLastResults is called once in the main DOMContentLoaded below)
@@ -359,6 +405,15 @@ async function runRFPlanning(lat, lng, source = "click") {
   console.log(`[RF Planner] TX location set: ${lat}, ${lng} (origin for polygon sectors)`);
   
   setStatus(`Selected: ${lat}, ${lng}. Processing... (this may take 20-30 minutes for full analysis with LOS detection)`);
+  let plannerProgressStopped = true;
+  let plannerProgressTimer = null;
+  const stopPlannerProgressPolling = () => {
+    plannerProgressStopped = true;
+    if (plannerProgressTimer != null) {
+      window.clearInterval(plannerProgressTimer);
+      plannerProgressTimer = null;
+    }
+  };
   
   // Only clear markers/overlays from currentLayerGroup (keep heatmaps from previous plans in batch)
   if (window.txMarker) {
@@ -534,6 +589,39 @@ async function runRFPlanning(lat, lng, source = "click") {
 
     console.log(`[RF Planner] Sending POST /api/plan...`);
     console.log(`[RF Planner] Request body:`, JSON.stringify(rfParams, null, 2));
+
+    let plannerDiagBaselineSeq = 0;
+    try {
+      const plannerStateResp = await fetch("/api/debug/planner-state");
+      if (plannerStateResp.ok) {
+        const plannerState = await plannerStateResp.json();
+        plannerDiagBaselineSeq = Number(plannerState?.seq) || 0;
+      }
+    } catch (e) {
+      console.warn("[RF Planner] Failed to read planner-state baseline:", e);
+    }
+
+    plannerProgressStopped = false;
+    const pollPlannerProgress = async () => {
+      if (plannerProgressStopped) return;
+      try {
+        const resp = await fetch("/api/debug/planner-state");
+        if (!resp.ok) return;
+        const diag = await resp.json();
+        const seq = Number(diag?.seq) || 0;
+        const last = diag?.last || null;
+        if (seq <= plannerDiagBaselineSeq || !last) return;
+        const phase = String(last.phase || "processing");
+        const detail = String(last.detail || "working");
+        setStatus(`Planning… ${phase}${detail ? ` — ${detail}` : ""}`);
+      } catch {
+        // Ignore polling failures; the main plan request remains authoritative.
+      }
+    };
+    plannerProgressTimer = window.setInterval(() => {
+      void pollPlannerProgress();
+    }, 1500);
+    void pollPlannerProgress();
     
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1800000); // 30 minute timeout (backend can take 20-30 min for 7200 cells with Phase 1 LOS detection)
@@ -546,6 +634,7 @@ async function runRFPlanning(lat, lng, source = "click") {
     });
     
     clearTimeout(timeoutId);
+    stopPlannerProgressPolling();
     
     console.log(`[RF Planner] Response status: ${resp.status}`);
     console.log(`[RF Planner] Response headers:`, Object.fromEntries(resp.headers.entries()));
@@ -647,6 +736,7 @@ async function runRFPlanning(lat, lng, source = "click") {
       : { lat, lon: lng };
     return { ok: true, data, cacheCenter };
   } catch (err) {
+    try { stopPlannerProgressPolling(); } catch {}
     console.error("[RF Planner] Error:", err);
     console.error("[RF Planner] Error details:", {
       name: err.name,
@@ -674,6 +764,8 @@ async function clearMap() {
   console.log("[RF Planner] clearMap() called");
 
   if (typeof window.rf2dClearAll === "function") window.rf2dClearAll();
+  removeRestorePrompt();
+  restorePromptState = null;
   
   // Remove and recreate the layer groups to ensure everything is cleared
   map.removeLayer(currentLayerGroup);
@@ -1787,11 +1879,10 @@ function drawSectorVisualization(sectors, txPoint, grid) {
   sectors.forEach((sector, index) => {
     const sectorType = sector.sector_type || "angle"; // Default to angle for backward compatibility
     const color = sectorColors[index % sectorColors.length];
-    const opacity = 0.15;
+    const opacity = 0.12;
     
     if (sectorType === "polygon") {
-      // Draw polygon sector
-      // Minimum 2 points required (TX origin is the third point)
+      // Draw polygon planning shape. This is a design aid, not an RF cutoff.
       if (sector.polygon_points && sector.polygon_points.length >= 2) {
         // Construct full polygon with TX as origin
         const polygonPoints = [[txLat, txLon], ...sector.polygon_points];
@@ -1804,82 +1895,43 @@ function drawSectorVisualization(sectors, txPoint, grid) {
           dashArray: '5, 5',
         }).addTo(sectorLayerGroup).bindPopup(
           `Sector: ${sector.sector_id}<br>` +
-          `Type: Polygon (${sector.polygon_points.length} points + TX origin)<br>` +
+          `Type: Planning polygon (${sector.polygon_points.length} points + TX origin)<br>` +
+          `RF semantics: antenna pattern remains continuous beyond this shape<br>` +
           `Frequency: ${sector.freq_mhz} MHz<br>` +
           `TX Power: ${sector.tx_power_dbm} dBm`
         );
       }
     } else if (sectorType === "360") {
-      // Draw circle for omnidirectional (360°)
-      L.circle([txLat, txLon], {
-        radius: maxRange,
-        color: color,
-        fillColor: color,
-        fillOpacity: opacity,
-        weight: 2,
-        dashArray: '5, 5',
-      }).addTo(sectorLayerGroup).bindPopup(
-        `Sector: ${sector.sector_id}<br>` +
-        `Coverage: 360° (Omnidirectional)<br>` +
-        `Frequency: ${sector.freq_mhz} MHz<br>` +
-        `TX Power: ${sector.tx_power_dbm} dBm`
-      );
+      // Do not draw an omnidirectional footprint overlay.
     } else {
-      // Draw cone for angle-based sector
-      const startAngle = sector.start_angle_deg;
-      const endAngle = sector.end_angle_deg;
-      const points = [];
-      points.push([txLat, txLon]); // Center point
-      
-      // Handle wrap-around case (e.g., 350° to 10°)
-      if (endAngle > startAngle) {
-        // Normal case: no wrap-around (e.g., 0° to 120°)
-        const sectorSpan = endAngle - startAngle;
-        const numPoints = Math.max(20, Math.ceil(sectorSpan / 5)); // At least 20 points, or one per 5 degrees
-        
-        for (let i = 0; i <= numPoints; i++) {
-          const currentAngle = startAngle + (i / numPoints) * sectorSpan;
-          const point = calculateDestinationPoint(txLat, txLon, currentAngle, maxRange);
-          points.push([point.lat, point.lon]);
-        }
-      } else {
-        // Wrap-around case: e.g., 350° to 10° (covers 350-360 and 0-10)
-        // First arc: from startAngle to 360°
-        const firstSpan = 360 - startAngle;
-        const firstNumPoints = Math.max(10, Math.ceil(firstSpan / 5));
-        for (let i = 0; i <= firstNumPoints; i++) {
-          const currentAngle = startAngle + (i / firstNumPoints) * firstSpan;
-          const point = calculateDestinationPoint(txLat, txLon, currentAngle, maxRange);
-          points.push([point.lat, point.lon]);
-        }
-        
-        // Second arc: from 0° to endAngle
-        const secondSpan = endAngle;
-        const secondNumPoints = Math.max(10, Math.ceil(secondSpan / 5));
-        for (let i = 0; i <= secondNumPoints; i++) {
-          const currentAngle = (i / secondNumPoints) * secondSpan;
-          const point = calculateDestinationPoint(txLat, txLon, currentAngle, maxRange);
-          points.push([point.lat, point.lon]);
-        }
-      }
-      
-      // Close the polygon
-      points.push([txLat, txLon]);
-      
-      // Calculate sector span for popup
-      const sectorSpan = endAngle > startAngle 
-        ? (endAngle - startAngle) 
+      const startAngle = Number.isFinite(sector.start_angle_deg) ? sector.start_angle_deg : 0.0;
+      const endAngle = Number.isFinite(sector.end_angle_deg) ? sector.end_angle_deg : 360.0;
+      const derivedSpan = endAngle > startAngle
+        ? (endAngle - startAngle)
         : (360 - startAngle + endAngle);
-      
-      L.polygon(points, {
+      const beamwidthH = Number.isFinite(sector.beamwidth_h_deg) ? sector.beamwidth_h_deg : derivedSpan;
+      const azimuth = Number.isFinite(sector.azimuth_deg)
+        ? sector.azimuth_deg
+        : ((startAngle + derivedSpan / 2.0) % 360.0);
+      // Use a short local tick so the overlay does not imply sector size/footprint.
+      const markerLength = Math.min(60.0, Math.max(20.0, maxRange * 0.06));
+      const centerPoint = calculateDestinationPoint(txLat, txLon, azimuth, markerLength);
+
+      L.polyline([[txLat, txLon], [centerPoint.lat, centerPoint.lon]], {
         color: color,
-        fillColor: color,
-        fillOpacity: opacity,
-        weight: 2,
-        dashArray: '5, 5',
+        weight: 3,
+        opacity: 0.9,
+      }).addTo(sectorLayerGroup);
+
+      L.polyline([[txLat, txLon], [centerPoint.lat, centerPoint.lon]], {
+        color: color,
+        weight: 10,
+        opacity: 0.0,
       }).addTo(sectorLayerGroup).bindPopup(
         `Sector: ${sector.sector_id}<br>` +
-        `Coverage: ${startAngle.toFixed(1)}° to ${endAngle.toFixed(1)}° (${sectorSpan.toFixed(1)}° span)<br>` +
+        `Antenna orientation: azimuth ${azimuth.toFixed(1)}°<br>` +
+        `Nominal horizontal beamwidth: ${beamwidthH.toFixed(1)}°<br>` +
+        `Overlay intentionally does not show sector size or footprint<br>` +
         `Frequency: ${sector.freq_mhz} MHz<br>` +
         `TX Power: ${sector.tx_power_dbm} dBm`
       );
@@ -2042,4 +2094,3 @@ function displayPanorama(imgData, panoLocation) {
     <img src="${imgData}" style="width: 100%; display: block;" alt="360° Panorama" />
   `;
 }
-
