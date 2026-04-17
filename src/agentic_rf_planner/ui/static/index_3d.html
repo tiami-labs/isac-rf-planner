@@ -28,8 +28,8 @@
         <select id="ray-mode"
           style="width: 100%; padding: 6px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;">
           <option value="2d">2D (OSM geometry)</option>
-                    <option value="3d_osm">3D (OSM only)</option>
-          <option value="3d" selected>3D (Google mesh + OSM semantics)</option>
+          <option value="3d_osm" selected>3D (OSM only)</option>
+          <option value="3d">3D (Google mesh + OSM semantics)</option>
           <option value="3d_rt">3D RT (multipath reflections)</option>
         </select>
       </div>
@@ -58,12 +58,11 @@
         <button type="button" id="rt-place-rx-btn" style="padding: 6px; background: #0f3558; color: #d7f0ff; border: 1px solid #236aa3; border-radius: 4px; cursor: pointer; font-size: 11px;">Place RX</button>
         <button type="button" id="rt-steer-btn" style="padding: 6px; background: #2d2d2d; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; font-size: 11px;">Steer TX</button>
       </div>
-      <div style="margin-top: 6px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+      <div style="margin-top: 6px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;">
         <button type="button" id="rt-launch-btn" style="padding: 6px; background: #1f5f2a; color: white; border: 1px solid #3a8b4b; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold;">Launch rays</button>
-        <button type="button" id="rt-aim-rx-btn" style="padding: 6px; background: #3f235d; color: #f2dcff; border: 1px solid #7e4bb2; border-radius: 4px; cursor: pointer; font-size: 11px;">Aim at RX</button>
         <button type="button" id="rt-clear-btn" style="padding: 6px; background: #4b1f1f; color: white; border: 1px solid #8a3838; border-radius: 4px; cursor: pointer; font-size: 11px;">Clear rays</button>
       </div>
-      <div style="margin-top: 6px; font-size: 10px; color: #aaa;">Steer with yaw/pitch, Aim at RX, or click Steer TX and pick a target on the 3D mesh. Launch still happens instantly whenever rays are enabled.</div>
+      <div style="margin-top: 6px; font-size: 10px; color: #aaa;">Click mode sets TX, RX, or steering target directly on the 3D scene. Steer uses the picked point to solve TX yaw/pitch.</div>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
         <div>
