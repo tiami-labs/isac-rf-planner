@@ -1,5 +1,7 @@
 """FastAPI REST API for RF planning."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -51,6 +53,18 @@ _ui_remote_plan: Dict[str, Any] = {
     "error": None,
     "requested_utc": None,
     "completed_utc": None,
+}
+REMOTE_3D_RT_QUEUE_BOOT_UTC = datetime.now(timezone.utc).isoformat()
+_ui_remote_3d_rt_lock = threading.Lock()
+_ui_remote_3d_rt: Dict[str, Any] = {
+    "seq": 0,
+    "status": "idle",
+    "command": None,
+    "error": None,
+    "requested_utc": None,
+    "completed_utc": None,
+    "started_utc": None,
+    "result": None,
 }
 
 
@@ -1078,6 +1092,36 @@ class RemotePlanRFRequest(PlanRequest):
     rx_lon: Optional[float] = None
 
 
+class Remote3DRTRequest(BaseModel):
+    tx_lat: float
+    tx_lon: float
+    rx_lat: float
+    rx_lon: float
+    ray_mode: str = "3d_rt"
+    tx_height_m: float = 10.0
+    rx_height_m: float = 1.5
+    yaw_deg: Optional[float] = None
+    pitch_deg: Optional[float] = None
+    steer_lat: Optional[float] = None
+    steer_lon: Optional[float] = None
+    steer_height_m: Optional[float] = 0.0
+    h_spread_deg: float = 30.0
+    v_spread_deg: float = 18.0
+    ray_count: int = 240
+    max_bounces: int = 3
+    rx_radius_m: float = 10.0
+    max_distance_m: float = 800.0
+    show_rays: bool = True
+
+
+class Remote3DRTReportRequest(BaseModel):
+    seq: int
+    status: str
+    detail: Optional[str] = None
+    duration_ms: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+
+
 def _resolved_grid_for_mesh_profile_key(req: PlanRequest) -> tuple[float, float, float]:
     try:
         rf_cfg = load_rf_config("configs/rf.params.yaml") or {}
@@ -1444,6 +1488,112 @@ async def api_ui_remote_plan_rf_poll(since_seq: int = 0) -> Dict[str, Any]:
         elif st == "error" and err is not None:
             out["error"] = err
     return out
+
+
+@app.post("/api/ui/remote-3d-rt")
+async def api_ui_remote_3d_rt(req: Remote3DRTRequest) -> Dict[str, Any]:
+    logger = logging.getLogger(__name__)
+    utc_req = datetime.now(timezone.utc).isoformat()
+    command = req.model_dump()
+    command["mode"] = "3d_rt_remote"
+    ray_mode = str(command.get("ray_mode") or "3d_rt").strip().lower()
+    if ray_mode not in ("3d_rt", "3d_rt_google", "3d_rt_osm"):
+        raise HTTPException(
+            status_code=400,
+            detail="ray_mode must be one of: 3d_rt, 3d_rt_google, 3d_rt_osm",
+        )
+    command["ray_mode"] = ray_mode
+    if command.get("yaw_deg") is None and (command.get("steer_lat") is None or command.get("steer_lon") is None):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either yaw_deg/pitch_deg or steer_lat/steer_lon for remote 3D RT steering.",
+        )
+    with _ui_remote_3d_rt_lock:
+        _ui_remote_3d_rt["seq"] = int(_ui_remote_3d_rt.get("seq") or 0) + 1
+        new_seq = int(_ui_remote_3d_rt["seq"])
+        _ui_remote_3d_rt["status"] = "ready"
+        _ui_remote_3d_rt["command"] = command
+        _ui_remote_3d_rt["error"] = None
+        _ui_remote_3d_rt["result"] = None
+        _ui_remote_3d_rt["requested_utc"] = utc_req
+        _ui_remote_3d_rt["started_utc"] = None
+        _ui_remote_3d_rt["completed_utc"] = None
+    logger.info("Remote 3D RT published for UI poll: seq=%s mode=%s tx=(%.6f,%.6f) rx=(%.6f,%.6f)", new_seq, ray_mode, req.tx_lat, req.tx_lon, req.rx_lat, req.rx_lon)
+    return {
+        "ok": True,
+        "seq": new_seq,
+        "message": "3D RT command published. Open /3d tabs will pick this up via poll and launch rays.",
+    }
+
+
+@app.get("/api/ui/remote-3d-rt/poll")
+async def api_ui_remote_3d_rt_poll(since_seq: int = 0) -> Dict[str, Any]:
+    with _ui_remote_3d_rt_lock:
+        seq = int(_ui_remote_3d_rt.get("seq") or 0)
+        st = str(_ui_remote_3d_rt.get("status") or "idle")
+        req_utc = _ui_remote_3d_rt.get("requested_utc")
+        start_utc = _ui_remote_3d_rt.get("started_utc")
+        done_utc = _ui_remote_3d_rt.get("completed_utc")
+        command = _ui_remote_3d_rt.get("command")
+        err = _ui_remote_3d_rt.get("error")
+        result = _ui_remote_3d_rt.get("result")
+    is_new = seq > int(since_seq)
+    out: Dict[str, Any] = {
+        "seq": seq,
+        "new": bool(is_new),
+        "status": st,
+        "requested_utc": req_utc,
+        "started_utc": start_utc,
+        "completed_utc": done_utc,
+        "server_boot_utc": REMOTE_3D_RT_QUEUE_BOOT_UTC,
+    }
+    if is_new:
+        if st == "ready" and command is not None:
+            out["command"] = command
+        elif st == "error" and err is not None:
+            out["error"] = err
+    if st == "completed" and result is not None:
+        out["result"] = result
+    elif st == "error" and err is not None:
+        out["error"] = err
+    return out
+
+
+@app.post("/api/ui/remote-3d-rt/report")
+async def api_ui_remote_3d_rt_report(req: Remote3DRTReportRequest) -> Dict[str, Any]:
+    logger = logging.getLogger(__name__)
+    utc_now = datetime.now(timezone.utc).isoformat()
+    status = str(req.status or "").strip().lower()
+    if status not in ("started", "completed", "error"):
+        raise HTTPException(status_code=400, detail="status must be one of: started, completed, error")
+    with _ui_remote_3d_rt_lock:
+        seq = int(_ui_remote_3d_rt.get("seq") or 0)
+        if int(req.seq) != seq:
+            raise HTTPException(status_code=409, detail=f"report seq {req.seq} does not match active seq {seq}")
+        if status == "started":
+            _ui_remote_3d_rt["status"] = "started"
+            _ui_remote_3d_rt["started_utc"] = utc_now
+            _ui_remote_3d_rt["error"] = None
+        elif status == "completed":
+            _ui_remote_3d_rt["status"] = "completed"
+            _ui_remote_3d_rt["completed_utc"] = utc_now
+            _ui_remote_3d_rt["error"] = None
+            _ui_remote_3d_rt["result"] = {
+                "detail": req.detail,
+                "duration_ms": req.duration_ms,
+                "result": req.result or {},
+            }
+        else:
+            _ui_remote_3d_rt["status"] = "error"
+            _ui_remote_3d_rt["completed_utc"] = utc_now
+            _ui_remote_3d_rt["result"] = None
+            _ui_remote_3d_rt["error"] = {
+                "status_code": 500,
+                "detail": req.detail or "remote 3D RT execution failed",
+                "duration_ms": req.duration_ms,
+            }
+    logger.info("Remote 3D RT report: seq=%s status=%s duration_ms=%s", req.seq, status, req.duration_ms)
+    return {"ok": True, "seq": req.seq, "status": status}
 
 
 @app.post("/api/3d/plan-and-trace")
@@ -1985,5 +2135,13 @@ if static_dir.exists():
         file_path = static_dir / "mesh_profiler_core.js"
         if file_path.exists():
             return FileResponse(str(file_path))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/raytrace_3d_osm.js")
+    async def serve_raytrace_3d_osm_js():
+        file_path = static_dir / "raytrace_3d_osm.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
