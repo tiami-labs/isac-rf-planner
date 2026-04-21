@@ -6,13 +6,13 @@ freq_mhz: 3500.0  # 5G mid-band frequency
 tx_power_dbm: 30.0  # Transmitter power in dBm
 noise_floor_dbm: -100.0  # Receiver noise floor (optional; if null, computed from bandwidth + noise_figure_db)
 noise_figure_db: 7.0  # Receiver noise figure (typical 5–10 dB), used when noise_floor_dbm not set
-max_range_m: 2000.0  # Maximum simulation range in meters
+max_range_m: 2500.0  # Maximum simulation range in meters
 step_m: 5.0  # Grid resolution in meters
 dtheta_deg: 5.0  # Bearing step (deg); must match 3D mesh-profile discretization
 
 # --- Ray / 3D geometry (for 3D mesh mode) ---
 ray_mode: "2d"  # "2d" = polygon OSM; "3d" = persisted Google mesh + OSM
-tx_height_m: 0.0  # TX height above ground (m)
+tx_height_m: 10.0  # TX height above ground (m); align with /3d planner default (tx-height-m)
 rx_height_m: 1.5  # RX height above ground (m)
 
 # --- Macro 5G NR RSRP calibration ---
