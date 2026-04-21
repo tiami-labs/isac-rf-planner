@@ -30,19 +30,12 @@
           <option value="2d">2D (OSM geometry)</option>
           <option value="3d_osm" selected>3D (OSM only)</option>
           <option value="3d">3D (Google mesh + OSM semantics)</option>
-          <option value="3d_rt">3D RT (multipath reflections)</option>
+          <option value="3d_rt">3D RT (Google mesh)</option>
+          <option value="3d_rt_osm">3D RT (OSM collision)</option>
         </select>
       </div>
 
-      <div style="margin-top: 8px;">
-        <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
-          <input type="checkbox" id="show-raytrace-toggle" style="cursor:pointer;" />
-          <span>Show multipath rays</span>
-        </label>
-        <div style="margin-top: 4px; font-size: 10px; color: #aaa;">Client-side 3D specular tracing against Google photorealistic mesh. Camera pan/tilt/zoom never changes ray physics.</div>
-      </div>
-
-      <div style="margin-top: 8px;">
+      <div id="rt-controls-section" style="margin-top: 8px; display: none;">
         <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;">
           <input type="checkbox" id="show-osm-rt-buildings-toggle" style="cursor:pointer;" />
           <span>Enable optional OSM preview shells</span>
@@ -51,8 +44,7 @@
           <button type="button" id="rt-load-osm-layout-btn" style="padding: 6px 8px; background: #3d3d1a; color: #f5f5c8; border: 1px solid #6b6b2a; border-radius: 4px; cursor: pointer; font-size: 11px;">Load OSM preview</button>
         </div>
         <div style="margin-top: 4px; font-size: 10px; color: #888;">Fetches OSM footprints only for optional preview. Ray bounces still use Google mesh directly, never OSM.</div>
-      </div>
-
+      
       <div style="margin-top: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
         <button type="button" id="rt-place-tx-btn" style="padding: 6px; background: #4a3416; color: #fff4d6; border: 1px solid #8b5e1a; border-radius: 4px; cursor: pointer; font-size: 11px;">Place TX</button>
         <button type="button" id="rt-place-rx-btn" style="padding: 6px; background: #0f3558; color: #d7f0ff; border: 1px solid #236aa3; border-radius: 4px; cursor: pointer; font-size: 11px;">Place RX</button>
@@ -138,6 +130,7 @@
 
       <div id="mesh-profile-status"></div>
       <div id="rt-status" style="margin-top: 8px; font-size: 11px; color: #b7f3c9; white-space: pre-wrap;"></div>
+      </div>
     </div>
 
     <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
