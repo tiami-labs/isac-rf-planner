@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Geometric utilities for equirectangular panoramas."""
 
 import numpy as np
@@ -80,4 +82,3 @@ def get_direction_label(azimuth: float) -> str:
         return "behind"
     else:  # 225 <= azimuth < 315
         return "left"
-
