@@ -52,7 +52,8 @@ def build_coverage_grid(
     tx: LatLon, 
     rf_params: RFParams,
     map_provider: Optional[MapProvider] = None,
-    sectors: Optional[List] = None  # List of SectorConfig objects
+    sectors: Optional[List] = None,  # List of SectorConfig objects
+    terrain_provider: Optional[Any] = None,
 ) -> List[WorldCell]:
     """
     Create a ring/grid of cells around TX with adaptive ray termination.
@@ -101,6 +102,12 @@ def build_coverage_grid(
         # No sectors specified - use omnidirectional
         logger.info("No sectors specified - using omnidirectional coverage (360°)")
         sector_configs = [create_omnidirectional_sector(rf_params)]
+
+    # Validated sector_id -> full parameter dict. MUST be passed to _resolve_sector_params: an empty
+    # lookup + missing getattr() on the live object used to default beamwidth_h_deg to 360, which
+    # disables horizontal pattern loss (omni) for that sector. API clients often send only start/end
+    # angles; SectorConfig backfills HPBW, but the raw rf_params.sectors dict does not.
+    sector_lookup: dict[str, dict] = {str(s.sector_id): s.model_dump() for s in sector_configs}
     
     # Signal strength threshold for ray termination
     # Calculate noise floor from bandwidth + NF if not explicitly set
@@ -236,6 +243,30 @@ def build_coverage_grid(
     else:
         dtheta = dtheta_user
 
+    terrain_on = bool(getattr(rf_params, "terrain_enabled", True)) and terrain_provider is not None
+    terrain_profile_step_m = max(
+        float(dr),
+        float(getattr(rf_params, "terrain_resolution_m", 30.0) or 30.0),
+    )
+    if terrain_on:
+        try:
+            terrain_provider.prefetch_for_polar_grid(tx, max_r, terrain_profile_step_m, dtheta)
+            logger.info(
+                "Terrain DEM loaded via %s (%d cached elevations, profile_step=%.0fm)",
+                getattr(terrain_provider, "provider_used", "?"),
+                len(getattr(terrain_provider, "_cache", {}) or {}),
+                terrain_profile_step_m,
+            )
+        except Exception as exc:
+            logger.warning("Terrain prefetch failed: %s", exc)
+            terrain_on = False
+
+    z_tx_ground_m = 0.0
+    z_tx_abs_m = float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
+    if terrain_on:
+        z_tx_ground_m = float(terrain_provider.elevation_m(tx.lat, tx.lon))
+        z_tx_abs_m = z_tx_ground_m + float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
+
     store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
 
     # Generate cells for each sector.
@@ -254,14 +285,19 @@ def build_coverage_grid(
         else:
             logger.debug(
                 f"Generating full-field candidates for sector {sector.sector_id} "
-                f"(nominal orientation {getattr(sector, 'azimuth_deg', 0.0):.1f}°, "
-                f"HPBW {getattr(sector, 'beamwidth_h_deg', 360.0):.1f}°)"
+                f"(nominal orientation {float(sector.azimuth_deg or 0.0):.1f}°, "
+                f"HPBW {float(sector.beamwidth_h_deg or 0.0):.1f}°)"
             )
         
         # Use sector-specific frequency and power for this sector
         sector_freq_mhz = sector.freq_mhz
         sector_tx_power_dbm = sector.tx_power_dbm
-        sector_rs_eirp_dbm = _reference_signal_eirp_dbm(rf_params, tx_power_dbm_override=sector_tx_power_dbm)
+        g_sector = getattr(sector, "tx_antenna_gain_dbi", None)
+        sector_rs_eirp_dbm = _reference_signal_eirp_dbm(
+            rf_params,
+            tx_power_dbm_override=sector_tx_power_dbm,
+            tx_antenna_gain_dbi=(float(g_sector) if g_sector is not None else None),
+        )
         
         # All sectors share the same 360° sample lattice. The antenna pattern later
         # determines the relative strength of each sector candidate at each point.
@@ -448,19 +484,39 @@ def build_coverage_grid(
                             "sector_freq_mhz": sector_freq_mhz,
                             "sector_tx_power_dbm": sector_tx_power_dbm,
                             "sector_channel_bandwidth_mhz": sector.channel_bandwidth_mhz,
-                            "sector_azimuth_deg": getattr(sector, "azimuth_deg", None),
-                            "sector_beamwidth_h_deg": getattr(sector, "beamwidth_h_deg", None),
-                            "sector_beamwidth_v_deg": getattr(sector, "beamwidth_v_deg", None),
-                            "sector_electrical_tilt_deg": getattr(sector, "electrical_tilt_deg", None),
-                            "sector_mechanical_tilt_deg": getattr(sector, "mechanical_tilt_deg", None),
-                            "sector_max_horizontal_attenuation_db": getattr(sector, "max_horizontal_attenuation_db", None),
-                            "sector_front_to_back_attenuation_db": getattr(sector, "front_to_back_attenuation_db", None),
-                            "sector_max_vertical_attenuation_db": getattr(sector, "max_vertical_attenuation_db", None),
+                            "sector_tx_antenna_gain_dbi": sector.tx_antenna_gain_dbi,
+                            "sector_azimuth_deg": sector.azimuth_deg,
+                            "sector_beamwidth_h_deg": sector.beamwidth_h_deg,
+                            "sector_beamwidth_v_deg": sector.beamwidth_v_deg,
+                            "sector_electrical_tilt_deg": sector.electrical_tilt_deg,
+                            "sector_mechanical_tilt_deg": sector.mechanical_tilt_deg,
+                            "sector_max_horizontal_attenuation_db": sector.max_horizontal_attenuation_db,
+                            "sector_front_to_back_attenuation_db": sector.front_to_back_attenuation_db,
+                            "sector_max_vertical_attenuation_db": sector.max_vertical_attenuation_db,
                         },
                     )(),
                     rf_params,
-                    {},
+                    sector_lookup,
                 )
+
+                bearing_profile_u: list[float] = []
+                bearing_profile_z: list[float] = []
+                if terrain_on:
+                    from .terrain_propagation import compute_terrain_at_sample
+
+                    bearing_profile_u, bearing_profile_z = terrain_provider.profile_along_bearing(
+                        tx, theta, max_r, terrain_profile_step_m
+                    )
+
+                rx_height_agl = float(getattr(rf_params, "rx_height_m", 1.5) or 1.5)
+                terrain_k = float(getattr(rf_params, "earth_curvature_k", 4.0 / 3.0) or 4.0 / 3.0)
+                fresnel_eta = float(getattr(rf_params, "fresnel_min_clearance", 0.6) or 0.6)
+                clutter_h = float(getattr(rf_params, "terrain_clutter_height_m", 0.0) or 0.0)
+                if bool(getattr(rf_params, "landcover_clutter_enabled", True)):
+                    clutter_h = max(clutter_h, 0.0)
+                else:
+                    clutter_h = 0.0
+                terrain_cap = float(getattr(rf_params, "terrain_loss_cap_db", 40.0) or 40.0)
 
                 while r <= max_r:
                     lat, lon = _project_from_tx(tx.lat, tx.lon, r, theta)
@@ -569,7 +625,48 @@ def build_coverage_grid(
                         0.0,
                         penetration_loss_db + shadow_loss_db + diffraction_loss_db - canyon_recovery_db,
                     )
-                    d3 = math.sqrt(r * r + dz2)
+
+                    terrain_loss_db = 0.0
+                    los_terrain = True
+                    fresnel_clearance = None
+                    terrain_state = "los"
+                    z_ground_m = 0.0
+                    z_rx_abs_m = rx_height_agl
+                    if terrain_on and bearing_profile_u:
+                        z_rx_ground = float(terrain_provider.elevation_m(lat, lon))
+                        z_rx_abs_m = z_rx_ground + rx_height_agl
+                        use_real_dem = str(getattr(terrain_provider, "provider_used", "") or "").lower() not in (
+                            "flat",
+                            "none",
+                        )
+                        if use_real_dem:
+                            t_res = compute_terrain_at_sample(
+                                profile_u_m=bearing_profile_u,
+                                profile_z_dem_m=bearing_profile_z,
+                                sample_distance_m=r,
+                                z_tx_abs_m=z_tx_abs_m,
+                                z_rx_abs_m=z_rx_abs_m,
+                                freq_mhz=sector_freq_mhz,
+                                clutter_height_m=clutter_h,
+                                k_factor=terrain_k,
+                                fresnel_min_clearance=fresnel_eta,
+                                loss_cap_db=terrain_cap,
+                            )
+                            terrain_loss_db = float(t_res.terrain_loss_db)
+                            los_terrain = bool(t_res.los_terrain)
+                            fresnel_clearance = float(t_res.fresnel_clearance)
+                            terrain_state = str(t_res.terrain_state)
+                            z_ground_m = float(t_res.z_ground_m)
+                        else:
+                            terrain_loss_db = 0.0
+                            los_terrain = True
+                            fresnel_clearance = 1.0
+                            terrain_state = "flat"
+                            z_ground_m = z_rx_ground
+                        extra_loss_db += terrain_loss_db
+
+                    dz_terrain = float(z_rx_abs_m) - float(z_tx_abs_m)
+                    d3 = math.sqrt(r * r + dz_terrain * dz_terrain)
                     scenario_path_loss_db = _scenario_path_loss_db(
                         distance_2d_m=r,
                         distance_3d_m=d3,
@@ -705,6 +802,8 @@ def build_coverage_grid(
                             sector_max_horizontal_attenuation_db=getattr(sector, "max_horizontal_attenuation_db", None),
                             sector_front_to_back_attenuation_db=getattr(sector, "front_to_back_attenuation_db", None),
                             sector_max_vertical_attenuation_db=getattr(sector, "max_vertical_attenuation_db", None),
+                            sector_tx_antenna_gain_dbi=getattr(sector, "tx_antenna_gain_dbi", None),
+                            sector_pci=getattr(sector, "pci", None),
                             is_los=is_los,
                             actual_path_length_m=r,
                             num_buildings=sum(1 for interval in building_intervals if interval["start_m"] <= (r + 1e-6)),
@@ -733,6 +832,12 @@ def build_coverage_grid(
                             buildings_along_path=(list(encountered_buildings) if encountered_buildings is not None else []),
 
                             precomputed_rsrp_dbm=(estimated_rsrp_total if multipath_enabled else None),
+                            z_ground_m=z_ground_m,
+                            z_rx_abs_m=z_rx_abs_m,
+                            terrain_loss_db=terrain_loss_db,
+                            los_terrain=los_terrain,
+                            fresnel_clearance=fresnel_clearance,
+                            terrain_state=terrain_state,
                         )
                     )
 
