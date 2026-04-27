@@ -9,7 +9,7 @@ Performance notes:
 import base64
 import io
 import logging
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
 
@@ -83,6 +83,7 @@ def attenuation_grid_to_png_ellipse(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     alpha: float = 0.70,
+    rsrp_values: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     """
     Create a pre-colored PNG (base64 data URL) for map-aligned draping.
@@ -104,7 +105,8 @@ def attenuation_grid_to_png_ellipse(
         "actual_max": actual_max,
       }
     """
-    if not grid.cell_lat or not grid.cell_lon or not grid.rsrp_dbm:
+    rsrp_src = rsrp_values if rsrp_values is not None else grid.rsrp_dbm
+    if not grid.cell_lat or not grid.cell_lon or not rsrp_src:
         raise ValueError("Empty attenuation grid")
 
     radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
@@ -116,7 +118,11 @@ def attenuation_grid_to_png_ellipse(
 
     lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
     lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
-    val_arr = np.asarray(grid.rsrp_dbm, dtype=np.float32)
+    if len(rsrp_src) != len(grid.cell_lat) or len(rsrp_src) != len(grid.cell_lon):
+        raise ValueError("rsrp_values length must match cell_lat / cell_lon")
+    val_arr = np.asarray(rsrp_src, dtype=np.float32)
+    # Propagate non-finite samples as NaF so they do not color wrong bins.
+    val_arr = np.where(np.isfinite(val_arr), val_arr, np.nan)
 
     # Local EN (meters) via equirectangular approximation.
     earth_m = 6371000.0

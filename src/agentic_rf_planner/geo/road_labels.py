@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -14,8 +15,48 @@ from ..pipeline.schemas import LatLon
 
 logger = logging.getLogger(__name__)
 
-# OSM Overpass API endpoint (free, no API key required)
-OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
+# OSM Overpass API endpoints (tried in order)
+OVERPASS_API_URLS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
+
+OVERPASS_HEADERS = {
+    "User-Agent": "agentic-rf-planner/1.0 (+local)",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _post_overpass(query: str, *, timeout: int, context: str) -> dict:
+    last_exc: Optional[Exception] = None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        for url in OVERPASS_API_URLS:
+            try:
+                response = requests.post(
+                    url,
+                    data={"data": query},
+                    headers=OVERPASS_HEADERS,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "%s failed via %s (attempt %s/%s): %s",
+                    context,
+                    url,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                last_exc = exc
+        if attempt < max_attempts:
+            time.sleep(0.6)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"{context} failed without an exception")
 
 MAJOR_HIGHWAY_TYPES = {
     "motorway",
@@ -288,9 +329,7 @@ def fetch_road_labels(
     """
 
     try:
-        response = requests.post(OVERPASS_API_URL, data={"data": query}, timeout=20)
-        response.raise_for_status()
-        data = response.json()
+        data = _post_overpass(query, timeout=20, context="road label fetch")
         elements = data.get("elements") or []
         save_cached_osm_data(center, radius_m, cache_type, elements)
         candidates = build_road_label_candidates(elements)
@@ -300,7 +339,11 @@ def fetch_road_labels(
             minor_limit=minor_limit,
         )
     except requests.exceptions.RequestException as exc:
-        logger.warning("Failed to fetch road labels from Overpass: %s", exc)
+        logger.warning(
+            "Failed to fetch road labels from Overpass endpoints %s: %s",
+            OVERPASS_API_URLS,
+            exc,
+        )
         return []
     except Exception as exc:  # pragma: no cover - defensive fallback
         logger.warning("Failed to build road labels: %s", exc)

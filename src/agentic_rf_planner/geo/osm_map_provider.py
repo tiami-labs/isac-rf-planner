@@ -2,6 +2,7 @@
 
 import logging
 import math
+import time
 from typing import List, Optional, Tuple, Dict
 
 import requests
@@ -13,8 +14,49 @@ from .osm_cache import load_cached_osm_data, save_cached_osm_data
 
 logger = logging.getLogger(__name__)
 
-# Overpass API endpoint (public instance)
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Overpass API endpoints (public instances; tried in order)
+OVERPASS_URLS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
+
+OVERPASS_HEADERS = {
+    "User-Agent": "agentic-rf-planner/1.0 (+local)",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _post_overpass(query: str, *, timeout: int, context: str) -> dict:
+    """Post an Overpass query with endpoint fallback + a short retry."""
+    last_exc: Optional[Exception] = None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        for url in OVERPASS_URLS:
+            try:
+                response = requests.post(
+                    url,
+                    data={"data": query},
+                    headers=OVERPASS_HEADERS,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "%s failed via %s (attempt %s/%s): %s",
+                    context,
+                    url,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                last_exc = exc
+        if attempt < max_attempts:
+            time.sleep(0.6)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"{context} failed without an exception")
 
 
 def _estimate_osm_height_m(tags: dict) -> Optional[float]:
@@ -287,13 +329,11 @@ class OSMMapProvider(MapProvider):
         """
         
         logger.debug(f"OSM query bbox: {bbox}")
-        logger.debug(f"OSM query URL: {OVERPASS_URL}")
+        logger.debug(f"OSM query URLs: {OVERPASS_URLS}")
         
         try:
             logger.info(f"Fetching buildings from OSM Overpass API (bbox: {bbox})...")
-            response = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            data = _post_overpass(query, timeout=30, context="building fetch")
             
             logger.debug(f"OSM API response: {len(data.get('elements', []))} elements")
             
@@ -320,7 +360,7 @@ class OSMMapProvider(MapProvider):
             
         except requests.exceptions.RequestException as e:
             logger.error(f"✗ Network error fetching buildings from OSM: {e}")
-            logger.error(f"  URL: {OVERPASS_URL}")
+            logger.error(f"  URLs tried: {OVERPASS_URLS}")
             logger.error(f"  Query bbox: {bbox}")
             return None
         except Exception as e:
@@ -342,9 +382,7 @@ class OSMMapProvider(MapProvider):
         """
         
         try:
-            response = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            data = _post_overpass(query, timeout=30, context="landuse fetch")
             
             areas = []
             for element in data.get("elements", []):
@@ -698,9 +736,7 @@ class OSMMapProvider(MapProvider):
         """
         
         try:
-            response = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            data = _post_overpass(query, timeout=30, context="building near-point fetch")
             
             buildings = []
             for element in data.get("elements", []):
@@ -758,9 +794,7 @@ class OSMMapProvider(MapProvider):
         """
         
         try:
-            response = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            data = _post_overpass(query, timeout=30, context="landuse near-point fetch")
             
             areas = []
             for element in data.get("elements", []):
