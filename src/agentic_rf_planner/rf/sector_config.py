@@ -1,7 +1,7 @@
 """Sector configuration for directional antenna patterns."""
 
 import logging
-from typing import List, Optional, Literal
+from typing import Any, List, Optional, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,14 @@ class SectorConfig(BaseModel):
     freq_mhz: float = Field(..., gt=0.0, description="Frequency in MHz for this sector")
     tx_power_dbm: float = Field(..., description="Transmit power in dBm for this sector")
     channel_bandwidth_mhz: float = Field(..., gt=0.0, description="Channel bandwidth in MHz")
+    # When omitted, RF planning uses `RFParams.tx_antenna_gain_dbi` for this sector.
+    tx_antenna_gain_dbi: Optional[float] = Field(
+        default=None, description="TX antenna boresight gain (dBi) for this sector; omit to use global RF default"
+    )
+    # When omitted, UIs do not show a cell PCI label (0 is a valid PCI and must be shown if set).
+    pci: Optional[int] = Field(
+        default=None, description="NR/LTE physical cell id (0–1007). Omit in API/UI when unknown."
+    )
     
     # Antenna pattern parameters.
     azimuth_deg: Optional[float] = Field(None, ge=0.0, le=360.0, description="Boresight azimuth in degrees (center of sector)")
@@ -48,6 +56,22 @@ class SectorConfig(BaseModel):
     max_horizontal_attenuation_db: Optional[float] = Field(None, ge=0.0, le=60.0, description="Maximum horizontal attenuation")
     front_to_back_attenuation_db: Optional[float] = Field(None, ge=0.0, le=60.0, description="Back-lobe/front-to-back attenuation")
     max_vertical_attenuation_db: Optional[float] = Field(None, ge=0.0, le=60.0, description="Maximum vertical attenuation")
+
+    @field_validator("pci", mode="before")
+    @classmethod
+    def _empty_pci_to_none(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return None
+        return v
+
+    @field_validator("pci", mode="after")
+    @classmethod
+    def _pci_in_range(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if v < 0 or v > 1007:
+            raise ValueError("pci must be between 0 and 1007 (inclusive) when set")
+        return int(v)
     
     @model_validator(mode='after')
     def validate_sector_type(self):

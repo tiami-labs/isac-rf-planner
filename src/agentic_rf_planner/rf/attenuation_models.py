@@ -63,12 +63,20 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
     for cell in world.cells:
         d2 = max(cell.distance_m, 1.0)
         d3 = _three_dimensional_distance_m(d2, tx_h, rx_h)
+        if (
+            bool(getattr(world.rf_params, "terrain_enabled", True))
+            and getattr(cell, "z_rx_abs_m", None) is not None
+            and getattr(world, "z_tx_abs_m", None) is not None
+        ):
+            dz_abs = float(cell.z_rx_abs_m) - float(world.z_tx_abs_m)
+            d3 = math.sqrt(d2 * d2 + dz_abs * dz_abs)
         sector_params = _resolve_sector_params(cell, world.rf_params, sector_lookup)
         sector_freq_mhz = float(sector_params["freq_mhz"])
         sector_bandwidth_mhz = float(sector_params["channel_bandwidth_mhz"])
         rs_eirp_dbm = _reference_signal_eirp_dbm(
             world.rf_params,
             tx_power_dbm_override=float(sector_params["tx_power_dbm"]),
+            tx_antenna_gain_dbi=float(sector_params["tx_antenna_gain_dbi"]),
         )
         scenario_path_loss_db = _scenario_path_loss_db(
             distance_2d_m=d2,
@@ -84,6 +92,7 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         shadow_loss_db = float(getattr(cell, "shadow_loss_db", 0.0) or 0.0)
         diffraction_loss_db = float(getattr(cell, "diffraction_loss_db", 0.0) or 0.0)
         canyon_recovery_db = float(getattr(cell, "canyon_recovery_db", 0.0) or 0.0)
+        terrain_loss_db = float(getattr(cell, "terrain_loss_db", 0.0) or 0.0)
 
         # Fallback path for legacy cells that still only expose obstacle/material counts.
         if penetration_loss_db == shadow_loss_db == diffraction_loss_db == canyon_recovery_db == 0.0:
@@ -108,7 +117,11 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
 
         extra_loss_db = max(
             0.0,
-            penetration_loss_db + shadow_loss_db + diffraction_loss_db - canyon_recovery_db,
+            penetration_loss_db
+            + shadow_loss_db
+            + diffraction_loss_db
+            + terrain_loss_db
+            - canyon_recovery_db,
         )
         precomputed = getattr(cell, "precomputed_rsrp_dbm", None)
         if precomputed is not None:
@@ -158,6 +171,28 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
     top_interferer_rsrp_dbm: list[float] = []
     pilot_pollution_metric_db: list[float] = []
     modulation_counts: Dict[str, int] = {}
+
+    sector_id_order: list[str] = [
+        str(s.get("sector_id", "")).strip()
+        for s in (getattr(world.rf_params, "sectors", None) or [])
+        if str(s.get("sector_id", "")).strip()
+    ]
+    rsrp_by_sector_lists: dict[str, list[float]] | None
+    if sector_id_order:
+        rsrp_by_sector_lists = {sid: [] for sid in sector_id_order}
+    else:
+        rsrp_by_sector_lists = None
+
+    terrain_by_key: dict[tuple[float, float], WorldCell] = {}
+    for cell in world.cells:
+        key = (round(cell.lat, 8), round(cell.lon, 8))
+        if key not in terrain_by_key:
+            terrain_by_key[key] = cell
+
+    terrain_loss_out: list[float] = []
+    los_terrain_out: list[bool] = []
+    terrain_state_out: list[str] = []
+    z_ground_out: list[float] = []
 
     for samples in sample_groups.values():
         samples_sorted = sorted(samples, key=lambda sample: sample["rsrp_dbm"], reverse=True)
@@ -212,6 +247,19 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         top_interferer_rsrp_dbm.append(top_interferer_dbm)
         pilot_pollution_metric_db.append(pollution_metric_db)
         modulation_counts[mod_scheme.name.value] = modulation_counts.get(mod_scheme.name.value, 0) + 1
+
+        if rsrp_by_sector_lists is not None:
+            by_sid = {str(s["sector_id"]): float(s["rsrp_dbm"]) for s in samples}
+            for sid in sector_id_order:
+                v = by_sid.get(sid)
+                rsrp_by_sector_lists[sid].append(float("nan") if v is None else v)
+
+        tkey = (round(float(serving["lat"]), 8), round(float(serving["lon"]), 8))
+        tcell = terrain_by_key.get(tkey)
+        terrain_loss_out.append(float(getattr(tcell, "terrain_loss_db", 0.0) or 0.0))
+        los_terrain_out.append(bool(getattr(tcell, "los_terrain", True)))
+        terrain_state_out.append(str(getattr(tcell, "terrain_state", "los") or "los"))
+        z_ground_out.append(float(getattr(tcell, "z_ground_m", 0.0) or 0.0))
 
     logger.info(
         "Reference-signal source: total_tx=%.2f dBm, model=%s/%s "
@@ -268,6 +316,11 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         interferer_count=interferer_count,
         top_interferer_rsrp_dbm=top_interferer_rsrp_dbm,
         pilot_pollution_metric_db=pilot_pollution_metric_db,
+        rsrp_by_sector=rsrp_by_sector_lists,
+        terrain_loss_db=terrain_loss_out if terrain_loss_out else None,
+        los_terrain=los_terrain_out if los_terrain_out else None,
+        terrain_state=terrain_state_out if terrain_state_out else None,
+        z_ground_m=z_ground_out if z_ground_out else None,
     )
 
 
@@ -367,10 +420,25 @@ def _resolve_sector_params(cell: Any, rf_params: RFParams, sector_lookup: dict[s
             if getattr(cell, "sector_max_vertical_attenuation_db", None) is not None
             else sector_cfg.get("max_vertical_attenuation_db", getattr(rf_params, "max_vertical_attenuation_db", 30.0))
         ),
+        "tx_antenna_gain_dbi": _resolve_sector_tx_gain_db(cell, sector_cfg, rf_params),
     }
 
 
-def _reference_signal_eirp_dbm(rf_params: RFParams, tx_power_dbm_override: float | None = None) -> float:
+def _resolve_sector_tx_gain_db(cell: Any, sector_cfg: dict[str, Any], rf_params: RFParams) -> float:
+    g_cell = getattr(cell, "sector_tx_antenna_gain_dbi", None)
+    if g_cell is not None:
+        return float(g_cell)
+    g_cfg = sector_cfg.get("tx_antenna_gain_dbi") if sector_cfg else None
+    if g_cfg is not None:
+        return float(g_cfg)
+    return float(getattr(rf_params, "tx_antenna_gain_dbi", 0.0) or 0.0)
+
+
+def _reference_signal_eirp_dbm(
+    rf_params: RFParams,
+    tx_power_dbm_override: float | None = None,
+    tx_antenna_gain_dbi: float | None = None,
+) -> float:
     """Convert total carrier TX power into a conservative reference-signal EIRP.
 
     Vendor radios are usually specified in total conducted/output power, while RSRP is
@@ -388,7 +456,10 @@ def _reference_signal_eirp_dbm(rf_params: RFParams, tx_power_dbm_override: float
     occupied_re = max(1, num_rb * 12)
     epre_dbm = total_tx_dbm - 10.0 * math.log10(occupied_re)
 
-    tx_gain_db = float(getattr(rf_params, "tx_antenna_gain_dbi", 0.0) or 0.0)
+    if tx_antenna_gain_dbi is not None:
+        tx_gain_db = float(tx_antenna_gain_dbi)
+    else:
+        tx_gain_db = float(getattr(rf_params, "tx_antenna_gain_dbi", 0.0) or 0.0)
     feeder_loss_db = float(getattr(rf_params, "tx_feeder_loss_db", 0.0) or 0.0)
     ref_offset_db = float(getattr(rf_params, "reference_signal_offset_db", 0.0) or 0.0)
     return epre_dbm + tx_gain_db - feeder_loss_db + ref_offset_db
