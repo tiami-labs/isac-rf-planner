@@ -27,6 +27,7 @@ from ..agents.rf_planning_agent import run_rf_planning_for_point
 from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
 from ..geo.google_mesh.provider import MissingMeshProfiles
 from ..geo.road_labels import fetch_road_labels
+from ..geo.geocode import geocode_query
 
 
 # FastAPI application must be created before route decorators are evaluated.
@@ -54,6 +55,23 @@ _ui_remote_plan: Dict[str, Any] = {
     "requested_utc": None,
     "completed_utc": None,
 }
+
+
+def _rf_remote_ui_publish_plan_result(result: Dict[str, Any], log: Optional[logging.Logger] = None) -> int:
+    """Push a completed plan to the queue consumed by GET /api/ui/remote-plan-rf/poll (open /3d and / tabs)."""
+    utc_done = datetime.now(timezone.utc).isoformat()
+    with _ui_remote_plan_lock:
+        _ui_remote_plan["seq"] = int(_ui_remote_plan.get("seq") or 0) + 1
+        new_seq = int(_ui_remote_plan["seq"])
+        _ui_remote_plan["status"] = "ready"
+        _ui_remote_plan["plan"] = result
+        _ui_remote_plan["error"] = None
+        _ui_remote_plan["completed_utc"] = utc_done
+    if log:
+        log.info("Published plan to remote UI queue: seq=%s", new_seq)
+    return new_seq
+
+
 REMOTE_3D_RT_QUEUE_BOOT_UTC = datetime.now(timezone.utc).isoformat()
 _ui_remote_3d_rt_lock = threading.Lock()
 _ui_remote_3d_rt: Dict[str, Any] = {
@@ -1008,7 +1026,12 @@ app.add_middleware(
 
 
 class PlanRequest(BaseModel):
-    """Request model for RF planning."""
+    """Request model for RF planning.
+
+    Primitive defaults below match ``/3d`` on first paint: ``planner_3d.js``
+    ``buildPlanRequestBody`` fallbacks (cross-check ``index_3d.html`` input defaults).
+    Clients that omit optional keys get the same baseline as the dashboard before user edits.
+    """
 
     lat: float
     lon: float
@@ -1020,15 +1043,15 @@ class PlanRequest(BaseModel):
     # Sector configuration (optional - if None, uses omnidirectional)
     sectors: Optional[List[Dict[str, Any]]] = None  # List of sector configs
     
-    # OFDM parameters
-    subcarrier_spacing_khz: float = 15.0
+    # OFDM parameters (scs-khz / bw-mhz defaults from index_3d.html)
+    subcarrier_spacing_khz: float = 30.0
     num_resource_blocks: int = 100
-    channel_bandwidth_mhz: float = 20.0
+    channel_bandwidth_mhz: float = 40.0
     
-    # MIMO parameters
+    # MIMO parameters (mimo-mode default selected option in index_3d.html)
     num_tx_antennas: int = 1
     num_rx_antennas: int = 1
-    mimo_mode: str = "SISO"  # SISO, SIMO, MISO, MIMO
+    mimo_mode: str = "MIMO"  # SISO, SIMO, MISO, MIMO
     
     # Link adaptation
     enable_link_adaptation: bool = True
@@ -1037,7 +1060,8 @@ class PlanRequest(BaseModel):
     # Ray propagation mode selection
     # If omitted, defaults to "2d". UI controls this via the ray-mode selector.
     ray_mode: Optional[str] = None  # "2d" or "3d"
-    tx_height_m: float = 0.0
+    # Must match planner_3d.js / index_3d defaults (input id tx-height-m fallback 10.0).
+    tx_height_m: float = 10.0
     rx_height_m: float = 1.5
     tx_antenna_gain_dbi: Optional[float] = None
     tx_feeder_loss_db: Optional[float] = None
@@ -1076,6 +1100,28 @@ class PlanRequest(BaseModel):
     max_range_m: Optional[float] = None
     step_m: Optional[float] = None
     dtheta_deg: Optional[float] = None
+
+    # Terrain / environment (Phase 1)
+    terrain_enabled: bool = True
+    dem_source: Optional[str] = None
+    terrain_resolution_m: Optional[float] = None
+    earth_curvature_k: Optional[float] = None
+    fresnel_min_clearance: Optional[float] = None
+    terrain_clutter_height_m: Optional[float] = None
+    terrain_loss_cap_db: Optional[float] = None
+    buildings_on_terrain: Optional[bool] = None
+    landcover_clutter_enabled: Optional[bool] = None
+    coverage_display_layer: Optional[str] = None
+
+    # Optional RX markers for the 3D dashboard (per-TX measurement sites). Each item:
+    # {"id": "rx1_1", "lat": ..., "lon": ..., "name": "optional label"}
+    rx_sites: Optional[List[Dict[str, Any]]] = None
+
+    # When True (default), successful plans are also published to the in-memory
+    # queue that open /3d and / (2D) tabs consume via GET /api/ui/remote-plan-rf/poll
+    # so API-driven runs draw on the live planner without a second click.
+    # In-browser “Plan” buttons should set publish_ui=False to avoid double-apply.
+    publish_ui: bool = True
 
 
 class PlanAndTrace3DRequest(PlanRequest):
@@ -1251,6 +1297,12 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
     """
     Run RF planning for a given point.
 
+    On success, when ``publish_ui`` is True (the default), the result is also pushed to the
+    in-memory queue that open ``/`` and ``/3d`` tabs read via
+    ``GET /api/ui/remote-plan-rf/poll``, so an external script calling this endpoint can
+    update the live map without a second action. UIs that already consume the response body
+    should set ``publish_ui: false`` to avoid drawing the same plan twice (response + poll).
+
     Args:
         req: Planning request with lat/lon and RF parameters
 
@@ -1337,6 +1389,17 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             rt_max_wall_candidates=(req.rt_max_wall_candidates if req.rt_max_wall_candidates is not None else RFParams.model_fields["rt_max_wall_candidates"].default),
             rt_reflection_loss_db=(req.rt_reflection_loss_db if req.rt_reflection_loss_db is not None else RFParams.model_fields["rt_reflection_loss_db"].default),
             rt_debug_sample_stride=(req.rt_debug_sample_stride if req.rt_debug_sample_stride is not None else RFParams.model_fields["rt_debug_sample_stride"].default),
+
+            terrain_enabled=req.terrain_enabled,
+            dem_source=(req.dem_source if req.dem_source is not None else rf_cfg.get("dem_source", RFParams.model_fields["dem_source"].default)),
+            terrain_resolution_m=(req.terrain_resolution_m if req.terrain_resolution_m is not None else rf_cfg.get("terrain_resolution_m")),
+            earth_curvature_k=(req.earth_curvature_k if req.earth_curvature_k is not None else rf_cfg.get("earth_curvature_k", RFParams.model_fields["earth_curvature_k"].default)),
+            fresnel_min_clearance=(req.fresnel_min_clearance if req.fresnel_min_clearance is not None else rf_cfg.get("fresnel_min_clearance", RFParams.model_fields["fresnel_min_clearance"].default)),
+            terrain_clutter_height_m=(req.terrain_clutter_height_m if req.terrain_clutter_height_m is not None else rf_cfg.get("terrain_clutter_height_m", RFParams.model_fields["terrain_clutter_height_m"].default)),
+            terrain_loss_cap_db=(req.terrain_loss_cap_db if req.terrain_loss_cap_db is not None else rf_cfg.get("terrain_loss_cap_db", RFParams.model_fields["terrain_loss_cap_db"].default)),
+            buildings_on_terrain=(req.buildings_on_terrain if req.buildings_on_terrain is not None else rf_cfg.get("buildings_on_terrain", RFParams.model_fields["buildings_on_terrain"].default)),
+            landcover_clutter_enabled=(req.landcover_clutter_enabled if req.landcover_clutter_enabled is not None else rf_cfg.get("landcover_clutter_enabled", RFParams.model_fields["landcover_clutter_enabled"].default)),
+            coverage_display_layer=(req.coverage_display_layer if req.coverage_display_layer is not None else rf_cfg.get("coverage_display_layer", RFParams.model_fields["coverage_display_layer"].default)),
         )
         logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
         if req.sectors:
@@ -1369,6 +1432,10 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         logger.info("Step 3: RF planning completed successfully")
         _record_planner_phase("response_ready", "RF planning result ready for response", None)
         logger.info(f"  Result keys: {list(result.keys())}")
+        if req.rx_sites:
+            result["rx_sites"] = list(req.rx_sites)
+        if req.publish_ui:
+            _rf_remote_ui_publish_plan_result(result, logger)
         return result
     except MissingMeshProfiles as e:
         # 3D mode requires persisted mesh ray profiles; UI will auto-generate.
@@ -1399,7 +1466,9 @@ async def api_ui_remote_plan_rf(req: RemotePlanRFRequest) -> Dict[str, Any]:
         _ui_remote_plan["status"] = "computing"
         _ui_remote_plan["requested_utc"] = utc_req
 
-    plan_only = PlanRequest(**req.model_dump(exclude={"rx_lat", "rx_lon"}))
+    plan_body = req.model_dump(exclude={"rx_lat", "rx_lon"})
+    plan_body["publish_ui"] = False
+    plan_only = PlanRequest(**plan_body)
     ray_mode_eff = (plan_only.ray_mode or "2d").strip().lower()
 
     try:
@@ -1423,6 +1492,8 @@ async def api_ui_remote_plan_rf(req: RemotePlanRFRequest) -> Dict[str, Any]:
                 "rx_point": {"lat": float(req.rx_lat), "lon": float(req.rx_lon)},
                 "raytrace": ray_result,
             }
+            if plan_only.rx_sites:
+                result["rx_sites"] = list(plan_only.rx_sites)
         else:
             result = await api_plan(plan_only)
     except HTTPException as e:
@@ -1601,6 +1672,7 @@ async def api_3d_plan_and_trace(req: PlanAndTrace3DRequest) -> Dict[str, Any]:
     stages: List[Dict[str, Any]] = []
     plan_payload = req.model_dump(exclude={"rx_lat", "rx_lon"})
     plan_payload["ray_mode"] = "3d_rt"
+    plan_payload["publish_ui"] = False
     plan_req = PlanRequest(**plan_payload)
 
     max_r, step_m, dth = _resolved_grid_for_mesh_profile_key(plan_req)
@@ -1699,10 +1771,25 @@ def api_config() -> Dict[str, Any]:
     return {
         "google_maps_api_key": key or "",
         "google_maps_api_key_present": bool(key),
+        "geocode_available": True,
         "mesh_profile_version": PROFILE_VERSION,
         "default_ray_mode": default_ray_mode,
         "rf_params": rf_cfg,
     }
+
+
+@app.get("/api/geocode")
+def api_geocode(q: str, limit: int = 5) -> Dict[str, Any]:
+    """Resolve a free-text address or ``lat,lon`` to coordinates."""
+    try:
+        out = geocode_query(q, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if out.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=f"No results for {q!r}")
+    return out
 
 
 @app.get("/api/rf-params")
@@ -1898,9 +1985,9 @@ async def mesh_profiles_put(profile_set: RayProfileSet, enrich_osm: bool = True)
 def mesh_profiles_has(
     tx_lat: float,
     tx_lon: float,
-    tx_height_m: float = 0.0,
+    tx_height_m: float = 10.0,
     rx_height_m: float = 1.5,
-    max_range_m: float = 2000.0,
+    max_range_m: float = 2500.0,
     dr_m: float = 5.0,
     dtheta_deg: float = 5.0,
     version: str = PROFILE_VERSION,
@@ -1923,9 +2010,9 @@ def mesh_profiles_has(
 def mesh_profiles_get(
     tx_lat: float,
     tx_lon: float,
-    tx_height_m: float = 0.0,
+    tx_height_m: float = 10.0,
     rx_height_m: float = 1.5,
-    max_range_m: float = 2000.0,
+    max_range_m: float = 2500.0,
     dr_m: float = 5.0,
     dtheta_deg: float = 5.0,
     version: str = PROFILE_VERSION,
@@ -2130,6 +2217,22 @@ if static_dir.exists():
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
+    @app.get("/geocode_nav.js")
+    async def serve_geocode_nav_js():
+        file_path = static_dir / "geocode_nav.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/terrain_params.js")
+    async def serve_terrain_params_js():
+        file_path = static_dir / "terrain_params.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
     @app.get("/mesh_profiler_core.js")
     async def serve_mesh_profiler_core_js():
         file_path = static_dir / "mesh_profiler_core.js"
@@ -2141,6 +2244,22 @@ if static_dir.exists():
     @app.get("/raytrace_3d_osm.js")
     async def serve_raytrace_3d_osm_js():
         file_path = static_dir / "raytrace_3d_osm.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/rt_autolock.js")
+    async def serve_rt_autolock_js():
+        file_path = static_dir / "rt_autolock.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
+    @app.get("/rt_autolock_worker.js")
+    async def serve_rt_autolock_worker_js():
+        file_path = static_dir / "rt_autolock_worker.js"
         if file_path.exists():
             return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
