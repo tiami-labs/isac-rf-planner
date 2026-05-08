@@ -3,7 +3,7 @@
 import base64
 import io
 import logging
-from typing import Dict, Any, Optional, Callable, cast
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
 from PIL import Image
@@ -19,6 +19,7 @@ from ..vision.materials_extraction import return_static_material
 from ..vision.models.base_vlm import BaseVLM
 from ..pipeline.world_builder import build_world_model
 from ..rf.attenuation_models import compute_attenuation_grid
+from ..rf.sector_config import SectorConfig, create_omnidirectional_sector
 from ..geo.heatmap import attenuation_grid_to_png_ellipse
 
 logger = logging.getLogger(__name__)
@@ -348,11 +349,19 @@ def run_rf_planning_for_point(
     # 5) Build world model (PRIMARY: geometry, SECONDARY: VLM refinement if available)
     progress("world_model", "Building world model and coverage candidates")
     logger.debug("Building world model from geometry...")
+    terrain_provider = None
+    if bool(getattr(rf_params, "terrain_enabled", True)):
+        from ..geo.terrain_provider import create_terrain_provider
+
+        terrain_provider = create_terrain_provider(rf_params)
+        if terrain_provider is not None:
+            progress("terrain", "Loading DEM for terrain-aware propagation")
     world = build_world_model(
         tx=snapped.latlon,
         rf_params=rf_params,
-        views=views,  # Empty list if no VLM/pano - geometry will be used
+        views=views,
         map_provider=map_provider,
+        terrain_provider=terrain_provider,
     )
     logger.info(f"Built world model with {len(world.cells)} cells")
     progress("world_model", f"World model built ({len(world.cells)} candidate cells)")
@@ -381,60 +390,45 @@ def run_rf_planning_for_point(
     logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
     progress("heatmap", "Heatmap rendering complete")
 
+    # Per-sector PNGs: true beam RSRP for each sector (not best-server / max across sectors at a point).
+    heatmap_by_sector: Dict[str, Any] = {}
+    if grid.rsrp_by_sector:
+        for sid, rlist in grid.rsrp_by_sector.items():
+            try:
+                heatmap_by_sector[str(sid)] = attenuation_grid_to_png_ellipse(
+                    grid,
+                    size=tex_size,
+                    vmin=-140.0,
+                    vmax=-60.0,
+                    rsrp_values=list(rlist),
+                )
+            except Exception as e:
+                logger.warning("Per-sector heatmap failed for %s: %s", sid, e)
+    progress("heatmap", f"Per-sector rasters: {len(heatmap_by_sector)}")
 
-    # Prepare sector information for visualization
-    sectors_info = []
+
+    # Sectors: use validated SectorConfig (same as coverage/physics) so API/UI see resolved HPBW, azimuth, etc.
+    sectors_info: List[Dict[str, Any]] = []
     if rf_params.sectors:
         for sector_dict in rf_params.sectors:
-            sectors_info.append({
-                "sector_id": sector_dict.get("sector_id", "unknown"),
-                "sector_type": sector_dict.get("sector_type", "angle"),
-                "start_angle_deg": sector_dict.get("start_angle_deg", 0.0),
-                "end_angle_deg": sector_dict.get("end_angle_deg", 360.0),
-                "polygon_points": sector_dict.get("polygon_points"),
-                "azimuth_deg": sector_dict.get("azimuth_deg"),
-                "beamwidth_h_deg": sector_dict.get("beamwidth_h_deg"),
-                "beamwidth_v_deg": sector_dict.get("beamwidth_v_deg"),
-                "electrical_tilt_deg": sector_dict.get("electrical_tilt_deg"),
-                "mechanical_tilt_deg": sector_dict.get("mechanical_tilt_deg"),
-                "max_horizontal_attenuation_db": sector_dict.get("max_horizontal_attenuation_db"),
-                "front_to_back_attenuation_db": sector_dict.get("front_to_back_attenuation_db"),
-                "max_vertical_attenuation_db": sector_dict.get("max_vertical_attenuation_db"),
-                "freq_mhz": sector_dict.get("freq_mhz", rf_params.freq_mhz),
-                "tx_power_dbm": sector_dict.get("tx_power_dbm", rf_params.tx_power_dbm),
-            })
+            sc = SectorConfig(**sector_dict)
+            sectors_info.append(sc.model_dump())
     else:
-        # Omnidirectional (360°)
-        sectors_info.append({
-            "sector_id": "omnidirectional",
-            "sector_type": "360",
-            "start_angle_deg": 0.0,
-            "end_angle_deg": 360.0,
-            "polygon_points": None,
-            "azimuth_deg": 0.0,
-            "beamwidth_h_deg": 360.0,
-            "beamwidth_v_deg": rf_params.vertical_beamwidth_deg,
-            "electrical_tilt_deg": rf_params.electrical_tilt_deg,
-            "mechanical_tilt_deg": rf_params.mechanical_tilt_deg,
-            "max_horizontal_attenuation_db": rf_params.max_horizontal_attenuation_db,
-            "front_to_back_attenuation_db": rf_params.front_to_back_attenuation_db,
-            "max_vertical_attenuation_db": rf_params.max_vertical_attenuation_db,
-            "freq_mhz": rf_params.freq_mhz,
-            "tx_power_dbm": rf_params.tx_power_dbm,
-        })
+        sectors_info.append(create_omnidirectional_sector(rf_params).model_dump())
     
     # Prepare response
     
-    # Reduce payload size for 3D OSM-only mode (front-end uses heatmap PNG, not per-point arrays).
+    # Reduce payload size for 3D OSM-only mode unless terrain metadata is needed.
     grid_payload = grid.model_dump()
-    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d"):
+    terrain_on = bool(getattr(rf_params, "terrain_enabled", True))
+    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d") and not terrain_on:
         try:
             grid_payload["num_points"] = len(grid.cell_lat)
         except Exception:
             pass
-        for k in ("cell_lat", "cell_lon", "rsrp_dbm", "sinr_db", "modulation", "throughput_mbps"):
+        for k in ("cell_lat", "cell_lon", "rsrp_dbm", "sinr_db", "modulation", "throughput_mbps", "rsrp_by_sector"):
             if k in grid_payload:
-                grid_payload[k] = []
+                grid_payload[k] = [] if k != "rsrp_by_sector" else {}
 
     # Use the effective mode after provider init/fallbacks.
     effective_ray_mode = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode)
@@ -443,7 +437,7 @@ def run_rf_planning_for_point(
     if map_provider is not None and hasattr(map_provider, "get_building_area_sqm"):
         try:
             building_area_sqm = map_provider.get_building_area_sqm(
-                snapped.latlon, float(getattr(rf_params, "max_range_m", 2000.0) or 2000.0)
+                snapped.latlon, float(getattr(rf_params, "max_range_m", 2500.0) or 2500.0)
             )
         except Exception as e:
             logger.warning(f"Failed to compute building area: {e}")
@@ -460,11 +454,21 @@ def run_rf_planning_for_point(
         "world_model_source": "geometry_only" if not vlm_used else "geometry_vlm_refined",
         "streetview_available": streetview_available,
         "vlm_used": vlm_used,
-        "sectors": sectors_info,  # Sector information for visualization
+        "sectors": sectors_info,  # Validated per-sector parameters (same model as simulation)
+        "rf_config_used": rf_params.model_dump(),
         "grid": grid_payload,
         "heatmap": heatmap_payload,
+        "heatmap_by_sector": heatmap_by_sector if heatmap_by_sector else None,
         "building_area_sqm": building_area_sqm,
     }
+
+    if bool(getattr(rf_params, "terrain_enabled", True)):
+        result["terrain"] = {
+            "enabled": True,
+            "dem_provider": getattr(terrain_provider, "provider_used", None) if terrain_provider else None,
+            "z_tx_ground_m": getattr(world, "z_tx_ground_m", None),
+            "z_tx_abs_m": getattr(world, "z_tx_abs_m", None),
+        }
 
     # Surface 3D mesh profile key (if applicable) so the frontend can diagnose/cache.
     try:
