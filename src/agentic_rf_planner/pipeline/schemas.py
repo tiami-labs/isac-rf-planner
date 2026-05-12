@@ -71,7 +71,7 @@ class RFParams(BaseModel):
     # Default: -100 dBm (equivalent to ~20 MHz, NF=7 dB)
     noise_floor_dbm: Optional[float] = None  # If None, calculated from bandwidth + NF
     noise_figure_db: float = 7.0  # Receiver noise figure (typical: 5-10 dB)
-    max_range_m: float = 2000.0
+    max_range_m: float = 2500.0
     step_m: float = 5.0  # grid resolution
     dtheta_deg: float = 5.0  # bearing step (deg); must match 3D mesh-profile discretization
     
@@ -98,7 +98,8 @@ class RFParams(BaseModel):
     ray_mode: str = "2d"
 
     # Heights above ground (meters), used only by 3D ray geometry.
-    tx_height_m: float = 0.0
+    # Default aligns with /3d planner (tx-height-m) and PlanRequest.
+    tx_height_m: float = 10.0
     rx_height_m: float = 1.5
 
     # Macro-cell power model:
@@ -146,6 +147,18 @@ class RFParams(BaseModel):
     rt_reflection_loss_db: float = 8.0  # base reflection loss (dB), material adds on top
     rt_debug_sample_stride: int = 25  # debug rendering: take every N-th range sample
 
+    # Terrain / environment (Phase 1 terrain core)
+    terrain_enabled: bool = True
+    dem_source: str = "auto"  # auto | google | opentopodata | flat
+    terrain_resolution_m: Optional[float] = None
+    earth_curvature_k: float = 4.0 / 3.0
+    fresnel_min_clearance: float = 0.6
+    terrain_clutter_height_m: float = 0.0
+    terrain_loss_cap_db: float = 40.0
+    buildings_on_terrain: bool = True
+    landcover_clutter_enabled: bool = True
+    coverage_display_layer: str = "rsrp"  # rsrp | sinr | terrain_shadow
+
 
 class WorldCell(BaseModel):
     """
@@ -176,6 +189,10 @@ class WorldCell(BaseModel):
     sector_max_horizontal_attenuation_db: Optional[float] = None
     sector_front_to_back_attenuation_db: Optional[float] = None
     sector_max_vertical_attenuation_db: Optional[float] = None
+    # When set, overrides `RFParams.tx_antenna_gain_dbi` for this sector/candidate; None = use global default.
+    sector_tx_antenna_gain_dbi: Optional[float] = None
+    # NR/LTE physical cell id; None = not specified (UIs should not show a placeholder; 0 is valid when set).
+    sector_pci: Optional[int] = None
 
     # LOS / obstruction-state model.
     is_los: bool = True
@@ -205,6 +222,14 @@ class WorldCell(BaseModel):
     # "extra loss" scalars.
     precomputed_rsrp_dbm: Optional[float] = None
 
+    # Terrain-aware sample metadata
+    z_ground_m: float = 0.0
+    z_rx_abs_m: Optional[float] = None
+    terrain_loss_db: float = 0.0
+    los_terrain: bool = True
+    fresnel_clearance: Optional[float] = None
+    terrain_state: str = "los"
+
 
 class WorldModel(BaseModel):
     """Complete world model for RF simulation."""
@@ -212,11 +237,17 @@ class WorldModel(BaseModel):
     tx: LatLon
     rf_params: RFParams
     cells: List[WorldCell]
+    z_tx_ground_m: Optional[float] = None
+    z_tx_abs_m: Optional[float] = None
 
 
 class AttenuationGrid(BaseModel):
     """
     Final RF result. You can map this directly to a heatmap.
+
+    `rsrp_dbm` is the best-server (max) RSRP per map point for SINR/interference math.
+    `rsrp_by_sector` (when present) repeats the same point order as `cell_lat`/`cell_lon`
+    with that sector's RSRP only—use for per-sector heatmaps (true beam shape, not max-composite).
     """
 
     tx: LatLon
@@ -232,5 +263,10 @@ class AttenuationGrid(BaseModel):
     interferer_count: List[int]
     top_interferer_rsrp_dbm: List[float]
     pilot_pollution_metric_db: List[float]
+    rsrp_by_sector: Optional[Dict[str, List[float]]] = None
+    terrain_loss_db: Optional[List[float]] = None
+    los_terrain: Optional[List[bool]] = None
+    terrain_state: Optional[List[str]] = None
+    z_ground_m: Optional[List[float]] = None
 
 

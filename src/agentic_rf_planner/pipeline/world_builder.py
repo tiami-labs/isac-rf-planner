@@ -2,7 +2,7 @@
 
 import math
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .schemas import (
     LatLon,
@@ -24,6 +24,7 @@ def build_world_model(
     rf_params: RFParams,
     views: List[ViewTileDescription],
     map_provider: Optional[MapProvider] = None,
+    terrain_provider: Optional[Any] = None,
 ) -> WorldModel:
     """
     Build world model from geometry (primary) and optional VLM views (refinement).
@@ -85,7 +86,9 @@ def build_world_model(
     # Pass map_provider so rays can stop when signal is too weak or metal blocks
     # Pass sectors if configured (from rf_params.sectors)
     sectors = rf_params.sectors if hasattr(rf_params, 'sectors') and rf_params.sectors else None
-    cells = build_coverage_grid(tx, rf_params, map_provider=map_provider, sectors=sectors)
+    cells = build_coverage_grid(
+        tx, rf_params, map_provider=map_provider, sectors=sectors, terrain_provider=terrain_provider
+    )
     logger.info(f"Created {len(cells)} cells in coverage grid (with adaptive termination)")
     
     # Performance fast-path: 3D OSM-only mode renders from a raster/PNG overlay and only
@@ -94,7 +97,18 @@ def build_world_model(
     ray_mode_eff = str(getattr(rf_params, "ray_mode", "") or "").strip().lower()
     if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
         logger.info("3D OSM-only mode: skipping per-cell world refinement (using coverage-grid propagation state)")
-        return WorldModel(tx=tx, rf_params=rf_params, cells=cells)
+        z_tx_ground_m = None
+        z_tx_abs_m = None
+        if terrain_provider is not None:
+            z_tx_ground_m = float(terrain_provider.elevation_m(tx.lat, tx.lon))
+            z_tx_abs_m = z_tx_ground_m + float(rf_params.tx_height_m)
+        return WorldModel(
+            tx=tx,
+            rf_params=rf_params,
+            cells=cells,
+            z_tx_ground_m=z_tx_ground_m,
+            z_tx_abs_m=z_tx_abs_m,
+        )
     
     # Process cells with cached data (much faster now)
     logger.info("Processing cells with cached OSM data...")
@@ -225,7 +239,19 @@ def build_world_model(
     logger.info(f"  LOS cells: {los_count} ({100*los_count/len(cells):.1f}%)")
     logger.info(f"  NLOS cells: {nlos_count} ({100*nlos_count/len(cells):.1f}%)")
     
-    return WorldModel(tx=tx, rf_params=rf_params, cells=cells)
+    return WorldModel(
+        tx=tx,
+        rf_params=rf_params,
+        cells=cells,
+        z_tx_ground_m=(
+            float(terrain_provider.elevation_m(tx.lat, tx.lon)) if terrain_provider is not None else None
+        ),
+        z_tx_abs_m=(
+            float(terrain_provider.elevation_m(tx.lat, tx.lon)) + float(rf_params.tx_height_m)
+            if terrain_provider is not None
+            else None
+        ),
+    )
 
 
 def _estimate_material_from_geometry(
