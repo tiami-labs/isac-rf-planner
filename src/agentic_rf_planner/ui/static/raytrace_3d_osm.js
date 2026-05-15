@@ -191,7 +191,67 @@ export function rayAabbFirst(origin, dir, box) {
   return { t, point: p, normal: n, box, isEdgeOrCorner: cornerHits >= 2 };
 }
 
-export function traceOneRay(origin, dir, boxes, maxBounces, maxDistance, rxCenter, rxRadius) {
+function pointInPolygonXZ(pt, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i].x;
+    const zi = ring[i].z;
+    const xj = ring[j].x;
+    const zj = ring[j].z;
+    const hit = ((zi > pt.z) !== (zj > pt.z))
+      && (pt.x < ((xj - xi) * (pt.z - zi)) / ((zj - zi) || 1e-12) + xi);
+    if (hit) inside = !inside;
+  }
+  return inside;
+}
+
+function rayWallFirst(origin, dir, wall) {
+  const n = wall.normal;
+  const denom = V.dot(dir, n);
+  if (Math.abs(denom) < 1e-9) return null;
+  const rel = V.sub(origin, wall.a);
+  const t = -V.dot(rel, n) / denom;
+  if (!(t > 1e-5)) return null;
+  const p = V.add(origin, V.mul(dir, t));
+  if (p.y < wall.base + 1e-5 || p.y > wall.roof - 1e-5) return null;
+  const edge = V.sub(wall.b, wall.a);
+  const edgeLen2 = edge.x * edge.x + edge.z * edge.z;
+  if (!(edgeLen2 > 1e-9)) return null;
+  const ap = V.sub(p, wall.a);
+  const s = (ap.x * edge.x + ap.z * edge.z) / edgeLen2;
+  if (s <= 1e-5 || s >= 1.0 - 1e-5) return null;
+  const normal = V.dot(dir, n) < 0 ? n : V.mul(n, -1);
+  return { t, point: p, normal, kind: "wall", wall };
+}
+
+function rayRoofFirst(origin, dir, prism) {
+  if (Math.abs(dir.y) < 1e-9) return null;
+  const t = (prism.roof - origin.y) / dir.y;
+  if (!(t > 1e-5)) return null;
+  const p = V.add(origin, V.mul(dir, t));
+  if (!pointInPolygonXZ(p, prism.ring)) return null;
+  return {
+    t,
+    point: p,
+    normal: dir.y > 0 ? { x: 0, y: -1, z: 0 } : { x: 0, y: 1, z: 0 },
+    kind: "roof",
+    prism,
+  };
+}
+
+function rayPrismFirst(origin, dir, prism) {
+  let best = null;
+  for (const wall of prism.walls || []) {
+    const hit = rayWallFirst(origin, dir, wall);
+    if (!hit) continue;
+    if (!best || hit.t < best.t) best = hit;
+  }
+  const roofHit = rayRoofFirst(origin, dir, prism);
+  if (roofHit && (!best || roofHit.t < best.t)) best = roofHit;
+  return best;
+}
+
+export function traceOneRay(origin, dir, boxes, maxBounces, maxDistance, rxCenter, rxRadius, prisms = null) {
   const pts = [origin];
   const segments = [];
   let pos = origin;
@@ -201,18 +261,26 @@ export function traceOneRay(origin, dir, boxes, maxBounces, maxDistance, rxCente
   let hitRx = false;
 
   for (let iter = 0; iter <= maxBounces; iter++) {
-    let nearestBoxHit = null;
-    for (const box of boxes) {
-      const hit = rayAabbFirst(pos, d, box);
-      if (!hit) continue;
-      if (hit.t <= 1e-5) continue;
-      if (!nearestBoxHit || hit.t < nearestBoxHit.t) nearestBoxHit = hit;
+    let nearestHit = null;
+    if (Array.isArray(prisms) && prisms.length) {
+      for (const prism of prisms) {
+        const hit = rayPrismFirst(pos, d, prism);
+        if (!hit) continue;
+        if (!nearestHit || hit.t < nearestHit.t) nearestHit = hit;
+      }
+    } else {
+      for (const box of boxes) {
+        const hit = rayAabbFirst(pos, d, box);
+        if (!hit) continue;
+        if (hit.t <= 1e-5) continue;
+        if (!nearestHit || hit.t < nearestHit.t) nearestHit = hit;
+      }
     }
 
     const tRx = raySphereFirst(pos, d, rxCenter, rxRadius);
     const boundaryT = maxDistance - traveled;
 
-    if (tRx !== null && tRx <= boundaryT && (!nearestBoxHit || tRx < nearestBoxHit.t)) {
+    if (tRx !== null && tRx <= boundaryT && (!nearestHit || tRx < nearestHit.t)) {
       const p = V.add(pos, V.mul(d, tRx));
       pts.push(p);
       segments.push({ a: pos, b: p, kind: "hit" });
@@ -220,21 +288,21 @@ export function traceOneRay(origin, dir, boxes, maxBounces, maxDistance, rxCente
       break;
     }
 
-    if (!nearestBoxHit || nearestBoxHit.t > boundaryT) {
+    if (!nearestHit || nearestHit.t > boundaryT) {
       const p = V.add(pos, V.mul(d, boundaryT));
       pts.push(p);
       segments.push({ a: pos, b: p, kind: "miss" });
       break;
     }
 
-    if (nearestBoxHit.isEdgeOrCorner) {
-      const p = nearestBoxHit.point;
+    if (nearestHit.isEdgeOrCorner) {
+      const p = nearestHit.point;
       pts.push(p);
       segments.push({ a: pos, b: p, kind: "corner-reject" });
       break;
     }
 
-    const hit = nearestBoxHit;
+    const hit = nearestHit;
     traveled += hit.t;
     pts.push(hit.point);
     segments.push({ a: pos, b: hit.point, kind: "bounce" });
@@ -254,6 +322,7 @@ export function launchRayBatch({
   tx,
   rx,
   boxes,
+  prisms,
   numRays,
   yawDeg,
   pitchDeg,
@@ -265,7 +334,7 @@ export function launchRayBatch({
 }) {
   const forward = dirFromYawPitch(yawDeg, pitchDeg);
   const dirs = sampleBeamDirections(numRays, forward, hSpreadDeg, vSpreadDeg);
-  const rays = dirs.map((d) => traceOneRay(tx, d, boxes, maxBounces, maxDistance, rx, rxRadius));
+  const rays = dirs.map((d) => traceOneRay(tx, d, boxes || [], maxBounces, maxDistance, rx, rxRadius, Array.isArray(prisms) ? prisms : null));
   let hits = 0;
   let best = Infinity;
   let maxHitBounces = -1;

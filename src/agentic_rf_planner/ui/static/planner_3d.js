@@ -8,6 +8,7 @@
 import * as Cesium from "/Cesium/index.js";
 import { buildAndUploadProfiles } from "/mesh_profiler_core.js";
 import { launchRayBatch as launchOsmRayBatch } from "/raytrace_3d_osm.js";
+import { buildAutoLockSearch, chooseAutoLockAngles, scoreAutoLockCandidate, yawPitchDegTowardLocalVector } from "/rt_autolock.js";
 
 window.__RFP_3D_BUILD = "rt-google-mesh-fastpath-2";
 window.__RF_RT_TRACE = [];
@@ -23,9 +24,21 @@ let planPrimitives = []; // Cesium.Primitive[] / collections
 let rfEntities = []; // RF-only entities (heatmap drapes)
 let rfPrimitives = []; // RF-only primitives (point heatmaps)
 let planCounter = 0;
+/** Dedupe keys for persistent batch/remote TX and RX site markers (id or "lat,lon"). */
+const plannedTxSiteKeys = new Set();
+const plannedRxSiteKeys = new Set();
 
 let sectorEntities = []; // visualization overlays (entities)
 let planResults = []; // { lat, lon, out, cacheCenter } per successful plan (for export)
+
+function recordPlanResultForExport(out, requestLat, requestLon) {
+  if (!out || typeof out !== "object") return;
+  if (out.raytrace_queue_launch) return;
+  const slat = out.snapped_tx && Number.isFinite(out.snapped_tx.lat) ? out.snapped_tx.lat : requestLat;
+  const slon = out.snapped_tx && Number.isFinite(out.snapped_tx.lon) ? out.snapped_tx.lon : requestLon;
+  const cacheCenter = Number.isFinite(slat) && Number.isFinite(slon) ? { lat: slat, lon: slon } : { lat: requestLat, lon: requestLon };
+  planResults.push({ lat: slat, lon: slon, out, cacheCenter });
+}
 let googleTileset = null;
 let googleMeshTileset = null;
 const googleTileInspectState = {
@@ -88,6 +101,7 @@ const LOCAL_MESH_EXPORT_GROUND_MARGIN_M = 2.5;
 const LOCAL_MESH_EXPORT_MIN_HEIGHT_M = 3.0;
 const LOCAL_MESH_EXPORT_DEFAULT_HEIGHT_M = 10.0;
 let isPlanningQueue = false;
+let rtAutoLockWorker = null;
 
 function resetGoogleTileInspectionState() {
   googleTileInspectState.entries = [];
@@ -633,6 +647,7 @@ function buildRaytraceExclusionList() {
   if (txEntity) vals.push(txEntity);
   if (rxEntity) vals.push(rxEntity);
   if (rxCaptureEntity) vals.push(rxCaptureEntity);
+  for (const e of planEntities) vals.push(e);
   for (const e of raytraceAuxEntities) vals.push(e);
   return vals;
 }
@@ -664,6 +679,43 @@ async function pickGoogleMeshSurfaceHit(origin, dir, maxDist, excludeList) {
 }
 
 function estimateGoogleMeshNormalFast(dir, hitPoint) {
+  if (viewer) {
+    try {
+      const screen = Cesium.SceneTransforms.wgs84ToWindowCoordinates(viewer.scene, hitPoint);
+      if (Cesium.defined(screen)) {
+        const sx = Number(screen.x);
+        const sy = Number(screen.y);
+        if (Number.isFinite(sx) && Number.isFinite(sy)) {
+          const offsets = [
+            new Cesium.Cartesian2(sx - 2, sy),
+            new Cesium.Cartesian2(sx + 2, sy),
+            new Cesium.Cartesian2(sx, sy - 2),
+            new Cesium.Cartesian2(sx, sy + 2),
+          ];
+          const picks = offsets.map((p) => {
+            try {
+              return viewer.scene.pickPosition(p);
+            } catch {
+              return null;
+            }
+          });
+          const [left, right, upPt, downPt] = picks;
+          if (Cesium.defined(left) && Cesium.defined(right) && Cesium.defined(upPt) && Cesium.defined(downPt)) {
+            const dx = Cesium.Cartesian3.subtract(right, left, new Cesium.Cartesian3());
+            const dy = Cesium.Cartesian3.subtract(downPt, upPt, new Cesium.Cartesian3());
+            const depthNormal = Cesium.Cartesian3.cross(dx, dy, new Cesium.Cartesian3());
+            if (Cesium.Cartesian3.magnitudeSquared(depthNormal) > 1e-8) {
+              Cesium.Cartesian3.normalize(depthNormal, depthNormal);
+              if (Cesium.Cartesian3.dot(depthNormal, dir) > 0.0) {
+                Cesium.Cartesian3.negate(depthNormal, depthNormal);
+              }
+              return depthNormal;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
   const carto = Cesium.Cartographic.fromCartesian(hitPoint);
   const up = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormalCartographic(carto, new Cesium.Cartesian3());
   const refUp = (Cesium.defined(up) && Cesium.Cartesian3.magnitudeSquared(up) >= 1e-10)
@@ -729,6 +781,12 @@ function rtDirectionFromYawPitchDeg(yawDeg, pitchDeg) {
   return RT3.norm({ x: Math.sin(yaw) * cp, y: Math.sin(pitch), z: Math.cos(yaw) * cp });
 }
 
+function rtYawPitchDegTowardWorldTarget(txWorld, targetWorld) {
+  const worldVec = Cesium.Cartesian3.subtract(targetWorld, txWorld, new Cesium.Cartesian3());
+  const localDir = rtLocalDirectionFromWorld(txWorld, worldVec);
+  return yawPitchDegTowardLocalVector(localDir);
+}
+
 function rtHammersley(index, count) {
   let bits = index;
   let rev = 0;
@@ -764,6 +822,39 @@ async function terrainHeightAtLatLon(lat, lon) {
   } catch {
     return 0.0;
   }
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => window.requestAnimationFrame(resolve));
+}
+
+function getRtAutoLockWorker() {
+  if (rtAutoLockWorker) return rtAutoLockWorker;
+  rtAutoLockWorker = new Worker("/rt_autolock_worker.js", { type: "module" });
+  return rtAutoLockWorker;
+}
+
+function runOsmAutoLockInWorker(payload) {
+  return new Promise((resolve, reject) => {
+    const worker = getRtAutoLockWorker();
+    const onMessage = (event) => {
+      const msg = event?.data || {};
+      cleanup();
+      if (msg.ok) resolve(msg.result || null);
+      else reject(new Error(String(msg.error || "autolock worker failed")));
+    };
+    const onError = (event) => {
+      cleanup();
+      reject(new Error(String(event?.message || event || "autolock worker error")));
+    };
+    const cleanup = () => {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+    };
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    worker.postMessage({ type: "evaluate_osm_autolock", payload });
+  });
 }
 
 /**
@@ -1011,6 +1102,218 @@ async function loadOsmRtBuildingsLayoutOnly() {
   }
 }
 
+async function simulateLocal3dRaytraceForAngles({
+  yawDeg,
+  pitchDeg,
+  rayCount,
+  maxBounces,
+  maxDist,
+  rxRadius,
+  hSpreadDeg,
+  vSpreadDeg,
+}) {
+  if (!viewer) return null;
+  const rayMode = getString("ray-mode", "3d_osm").toLowerCase();
+  const isGoogleRt = rayMode === "3d_rt" || rayMode === "3d_rt_google";
+  const isOsmRt = rayMode === "3d_rt_osm";
+  if (!isGoogleRt && !isOsmRt) return null;
+  const tx = getCurrentTxWorldPoint();
+  const rx = getCurrentRxWorldPoint();
+  if (!tx || !rx) return null;
+
+  if (isOsmRt) {
+    const sceneData = await get3dRtBuildings(tx.lat, tx.lon, maxDist);
+    const boxes = buildRtCollisionBoxesFromPrisms(sceneData.prisms);
+    const rxLocalOffset = localEnuFromOrigin(tx.lat, tx.lon, rx.lat, rx.lon);
+    const txLocal = { x: 0.0, y: tx.h, z: 0.0 };
+    const rxLocal = { x: rxLocalOffset.east_m, y: rx.h, z: rxLocalOffset.north_m };
+    const batch = launchOsmRayBatch({
+      tx: txLocal,
+      rx: rxLocal,
+      boxes,
+      prisms: sceneData.prisms,
+      numRays: rayCount,
+      yawDeg,
+      pitchDeg,
+      hSpreadDeg,
+      vSpreadDeg,
+      maxBounces,
+      maxDistance: maxDist,
+      rxRadius,
+    });
+    let hits = 0;
+    let minBounce = Infinity;
+    let maxHitBounce = -Infinity;
+    for (const ray of batch.rays) {
+      if (!ray.hitRx) continue;
+      hits += 1;
+      minBounce = Math.min(minBounce, ray.bounces);
+      maxHitBounce = Math.max(maxHitBounce, ray.bounces);
+    }
+    return {
+      hits,
+      minBounce: Number.isFinite(minBounce) ? minBounce : null,
+      maxHitBounce: Number.isFinite(maxHitBounce) ? maxHitBounce : null,
+      bounceSurface: "osm_collision",
+      collisionBoxes: boxes.length,
+    };
+  }
+
+  const dirsLocal = rtGenerateDirections(rayCount, yawDeg, pitchDeg, hSpreadDeg, vSpreadDeg);
+  const originCartesian = rtWorldFromGeo(tx);
+  const rxCenter = rtWorldFromGeo(rx);
+  const excludeList = buildRaytraceExclusionList();
+  let hits = 0;
+  let minBounce = Infinity;
+  let maxHitBounce = -Infinity;
+  const BATCH = 24;
+  for (let start = 0; start < dirsLocal.length; start += BATCH) {
+    const slice = dirsLocal.slice(start, start + BATCH);
+    const results = await Promise.all(slice.map(async (localDir) => {
+      const dirWorld = rtWorldDirectionFromLocal(originCartesian, localDir);
+      return await rtTraceSingleRayOnGoogleMesh(originCartesian, dirWorld, rxCenter, rxRadius, maxBounces, maxDist, excludeList);
+    }));
+    for (const result of results) {
+      if (!result.hitRx) continue;
+      hits += 1;
+      minBounce = Math.min(minBounce, result.bounces);
+      maxHitBounce = Math.max(maxHitBounce, result.bounces);
+    }
+  }
+  return {
+    hits,
+    minBounce: Number.isFinite(minBounce) ? minBounce : null,
+    maxHitBounce: Number.isFinite(maxHitBounce) ? maxHitBounce : null,
+    bounceSurface: "google_mesh",
+  };
+}
+
+async function autoLockGoogleMeshSteering({
+  base,
+  hSpreadDeg,
+  vSpreadDeg,
+  searchRayCount,
+  maxBounces,
+  maxDist,
+  rxRadius,
+}) {
+  const search = buildAutoLockSearch(base.yawDeg, base.pitchDeg, hSpreadDeg, vSpreadDeg);
+  const total = search.coarse.length + search.fineOffsets.length;
+  let best = null;
+  let checked = 0;
+
+  for (const candidate of search.coarse) {
+    checked += 1;
+    setRtStatus(`Auto lock: evaluating ${checked}/${total}...`);
+    const summary = await simulateLocal3dRaytraceForAngles({
+      yawDeg: candidate.yawDeg,
+      pitchDeg: candidate.pitchDeg,
+      rayCount: searchRayCount,
+      maxBounces,
+      maxDist,
+      rxRadius,
+      hSpreadDeg,
+      vSpreadDeg,
+    });
+    const score = scoreAutoLockCandidate(candidate, summary);
+    if (!best || score > best.score) best = { candidate, summary, score };
+    await nextAnimationFrame();
+  }
+
+  for (const [dyaw, dpitch] of search.fineOffsets) {
+    checked += 1;
+    setRtStatus(`Auto lock: refining ${checked}/${total}...`);
+    const candidate = {
+      yawDeg: best.candidate.yawDeg + dyaw,
+      pitchDeg: best.candidate.pitchDeg + dpitch,
+      dyaw: best.candidate.dyaw + dyaw,
+      dpitch: best.candidate.dpitch + dpitch,
+    };
+    const summary = await simulateLocal3dRaytraceForAngles({
+      yawDeg: candidate.yawDeg,
+      pitchDeg: candidate.pitchDeg,
+      rayCount: searchRayCount,
+      maxBounces,
+      maxDist,
+      rxRadius,
+      hSpreadDeg,
+      vSpreadDeg,
+    });
+    const score = scoreAutoLockCandidate(candidate, summary);
+    if (score > best.score) best = { candidate, summary, score };
+    await nextAnimationFrame();
+  }
+
+  return { best, chosen: chooseAutoLockAngles(base, best), checked: total };
+}
+
+async function autoLockRtSteering() {
+  const tx = getCurrentTxWorldPoint();
+  const rx = getCurrentRxWorldPoint();
+  if (!tx || !rx) {
+    setRtStatus("Place both TX and RX before Auto lock.");
+    return null;
+  }
+  const rayMode = getString("ray-mode", "3d_osm").toLowerCase();
+  if (!isRtRayMode(rayMode)) {
+    setRtStatus("Auto lock is only available for 3D RT modes.");
+    return null;
+  }
+  const txWorld = rtWorldFromGeo(tx);
+  const rxWorld = rtWorldFromGeo(rx);
+  const base = rtYawPitchDegTowardWorldTarget(txWorld, rxWorld);
+  const hSpreadDeg = getRtNumber("rt-h-spread-deg", 30.0);
+  const vSpreadDeg = getRtNumber("rt-v-spread-deg", 18.0);
+  const searchRayCount = Math.max(24, Math.min(96, Math.round(getRtNumber("rt-ray-count", 240) * 0.35)));
+  const maxBounces = Math.max(0, Math.min(20, Math.round(getRtNumber("rt-max-bounces", 3))));
+  const maxDist = Math.max(10.0, getRtNumber("rt-max-distance-m", getNumber("max-range", 800.0)));
+  const rxRadius = Math.max(0.2, getRtNumber("rt-rx-radius-m", 10.0));
+  let evaluation = null;
+
+  if (rayMode === "3d_rt_osm") {
+    const sceneData = await get3dRtBuildings(tx.lat, tx.lon, maxDist);
+    const boxes = buildRtCollisionBoxesFromPrisms(sceneData.prisms);
+    const rxLocalOffset = localEnuFromOrigin(tx.lat, tx.lon, rx.lat, rx.lon);
+    setRtStatus("Auto lock: evaluating OSM collision search...");
+    evaluation = await runOsmAutoLockInWorker({
+      txLocal: { x: 0.0, y: tx.h, z: 0.0 },
+      rxLocal: { x: rxLocalOffset.east_m, y: rx.h, z: rxLocalOffset.north_m },
+      boxes,
+      prisms: sceneData.prisms,
+      baseYawDeg: base.yawDeg,
+      basePitchDeg: base.pitchDeg,
+      hSpreadDeg,
+      vSpreadDeg,
+      maxBounces,
+      maxDistance: maxDist,
+      rxRadius,
+      searchRayCount,
+    });
+  } else {
+    evaluation = await autoLockGoogleMeshSteering({
+      base,
+      hSpreadDeg,
+      vSpreadDeg,
+      searchRayCount,
+      maxBounces,
+      maxDist,
+      rxRadius,
+    });
+  }
+
+  const chosen = evaluation?.chosen || base;
+  const best = evaluation?.best || null;
+  setInputValue("rt-yaw-deg", Number(chosen.yawDeg || 0).toFixed(2));
+  setInputValue("rt-pitch-deg", Number(chosen.pitchDeg || 0).toFixed(2));
+  updateRtHeadingEntity();
+  if (best && Number(best.summary?.hits || 0) > 0) {
+    setRtStatus(`Auto lock set. Yaw=${Number(chosen.yawDeg).toFixed(1)}°, pitch=${Number(chosen.pitchDeg).toFixed(1)}°. Search rays=${searchRayCount}. Hits=${best.summary.hits}.`);
+  } else {
+    setRtStatus(`Auto lock fallback to direct RX pointing. Yaw=${Number(chosen.yawDeg).toFixed(1)}°, pitch=${Number(chosen.pitchDeg).toFixed(1)}°. No evaluated candidate reached RX.`);
+  }
+  return chosen;
+}
+
 async function launchLocal3dRaytrace() {
   if (!viewer) return null;
   const rayMode = getString("ray-mode", "3d_osm").toLowerCase();
@@ -1047,6 +1350,7 @@ async function launchLocal3dRaytrace() {
       tx: txLocal,
       rx: rxLocal,
       boxes,
+      prisms: sceneData.prisms,
       numRays: rayCount,
       yawDeg,
       pitchDeg,
@@ -1212,12 +1516,28 @@ function setInputValue(id, value) {
   if (el && value != null && value !== "") el.value = String(value);
 }
 
+/** Keep sidebar “3D mesh profile params” aligned with the plan the API actually ran. */
+function syncMeshProfileInputsFromPlan(out) {
+  const rp = out?.grid?.rf_params ?? out?.rf_config_used;
+  if (!rp || typeof rp !== "object") return;
+  const mr = Number(rp.max_range_m);
+  const step = Number(rp.step_m);
+  const dth = Number(rp.dtheta_deg);
+  if (Number.isFinite(mr)) setInputValue("max-range", mr);
+  if (Number.isFinite(step)) setInputValue("dr-m", step);
+  if (Number.isFinite(dth)) setInputValue("dtheta", dth);
+}
+
 async function loadRfParamsDefaults() {
   try {
     const resp = await fetch("/api/rf-params");
     if (!resp.ok) return;
     const cfg = await resp.json();
     if (!cfg) return;
+    // Mesh profile section — keep in sync with configs/rf.params.yaml + PlanRequest defaults.
+    if (Number.isFinite(Number(cfg.max_range_m))) setInputValue("max-range", Number(cfg.max_range_m));
+    if (Number.isFinite(Number(cfg.step_m))) setInputValue("dr-m", Number(cfg.step_m));
+    if (Number.isFinite(Number(cfg.dtheta_deg))) setInputValue("dtheta", Number(cfg.dtheta_deg));
     setInputValue("shadow-loss-cap-db", cfg.shadow_loss_cap_db);
     setInputValue("diffraction-loss-cap-db", cfg.diffraction_loss_cap_db);
     setInputValue("canyon-recovery-max-db", cfg.canyon_recovery_max_db);
@@ -1396,6 +1716,21 @@ function trackRfPrimitive(prim) {
   return prim;
 }
 
+function clearCoverageOverlay() {
+  for (const p of rfPrimitives) {
+    try { viewer.scene.primitives.remove(p); } catch {}
+    const idx = planPrimitives.indexOf(p);
+    if (idx >= 0) planPrimitives.splice(idx, 1);
+  }
+  rfPrimitives = [];
+  for (const e of rfEntities) {
+    try { viewer.entities.remove(e); } catch {}
+    const idx = planEntities.indexOf(e);
+    if (idx >= 0) planEntities.splice(idx, 1);
+  }
+  rfEntities = [];
+}
+
 function isStreetLabelsEnabled() {
   return document.getElementById("show-street-labels-toggle")?.checked ?? true;
 }
@@ -1467,7 +1802,7 @@ function getCurrentViewCenterLatLon() {
 }
 
 function getStreetLabelRadiusM() {
-  const maxRangeM = getNumber("max-range", 2000.0);
+  const maxRangeM = getNumber("max-range", 2500.0);
   return Math.max(
     STREET_LABEL_RADIUS_MIN_M,
     Math.min(STREET_LABEL_RADIUS_MAX_M, maxRangeM)
@@ -1783,7 +2118,86 @@ function updateTxMarker(lat, lon, heightM = null) {
   } else {
     txEntity.position = pos;
   }
+  if (txEntity) txEntity.show = true;
   updateRtHeadingEntity();
+}
+
+function syncPlannedTxSelectionMarker() {
+  if (txEntity) txEntity.show = plannedTxSiteKeys.size === 0;
+}
+
+function plannedSiteCoordKey(lat, lon) {
+  return `${Number(lat).toFixed(6)},${Number(lon).toFixed(6)}`;
+}
+
+function inferTxSiteLabelFromPlan(out) {
+  if (!out || typeof out !== "object") return null;
+  if (out.tx_site_id != null) return String(out.tx_site_id).trim() || null;
+  if (out.site_id != null) return String(out.site_id).trim() || null;
+  if (out.tx_site && out.tx_site.id != null) return String(out.tx_site.id).trim() || null;
+  const secs = out.sectors;
+  if (Array.isArray(secs) && secs.length) {
+    const sid = String(secs[0].sector_id || "");
+    const m = sid.match(/^CATX?0*(\d{3,5})/i);
+    if (m) return `CAT${m[1]}`;
+    if (sid) return sid.replace(/[A-Z]\d*$/i, "").slice(0, 16);
+  }
+  return null;
+}
+
+/** Persistent gNB TX markers (yellow), same pattern as RX site markers. */
+function addPlannedTxSiteMarker(lat, lon, opts = {}) {
+  const la = Number(lat);
+  const lo = Number(lon);
+  if (!Number.isFinite(la) || !Number.isFinite(lo)) return;
+  const idRaw = opts.id != null ? String(opts.id).trim() : "";
+  const key = idRaw || plannedSiteCoordKey(la, lo);
+  if (plannedTxSiteKeys.has(key)) return;
+  plannedTxSiteKeys.add(key);
+
+  const id = idRaw || `TX${plannedTxSiteKeys.size}`;
+  const name = opts.name != null ? String(opts.name).trim() : "";
+  const text = name ? `${id}\n${name}` : id;
+  const heightM = Number(opts.heightM);
+  const h = Number.isFinite(heightM) ? heightM : 20.0;
+  const fill = Cesium.Color.YELLOW.withAlpha(0.96);
+  const outline = Cesium.Color.BLACK.withAlpha(0.85);
+  const ent = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(lo, la, h),
+    point: {
+      pixelSize: 10,
+      color: fill,
+      outlineColor: outline,
+      outlineWidth: 2,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    },
+    label: {
+      text,
+      font: "12px sans-serif",
+      fillColor: fill,
+      outlineColor: Cesium.Color.BLACK,
+      outlineWidth: 2,
+      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+      pixelOffset: new Cesium.Cartesian2(0, -28),
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    },
+  });
+  planEntities.push(ent);
+  syncPlannedTxSelectionMarker();
+}
+
+function registerPlannedTxFromPlan(out, lat, lon) {
+  const slat = out?.snapped_tx?.lat ?? lat;
+  const slon = out?.snapped_tx?.lon ?? lon;
+  if (!Number.isFinite(slat) || !Number.isFinite(slon)) return;
+  currentTxLocation = { lat: slat, lon: slon };
+  const id = inferTxSiteLabelFromPlan(out);
+  const txHeightM = Number(out?.tx_height_m ?? out?.rf_config?.tx_height_m);
+  addPlannedTxSiteMarker(slat, slon, {
+    id: id || undefined,
+    name: out?.tx_site_name ?? out?.site_name ?? "",
+    heightM: Number.isFinite(txHeightM) ? txHeightM : undefined,
+  });
 }
 
 function updateRxMarker(lat, lon, heightM = null) {
@@ -1834,31 +2248,42 @@ function updateRxMarker(lat, lon, heightM = null) {
   }
 }
 
-function addPlannedTxMarker(lat, lon) {
-  // Persist planned TX markers so multiple plans remain visible.
-  const n = ++planCounter;
-  const pos = Cesium.Cartesian3.fromDegrees(lon, lat, 20.0);
-  const ent = viewer.entities.add({
-    position: pos,
-    point: {
-      pixelSize: 9,
-      color: Cesium.Color.YELLOW.withAlpha(0.85),
-      outlineColor: Cesium.Color.BLACK.withAlpha(0.8),
-      outlineWidth: 2,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-    },
-    label: {
-      text: `TX${n}`,
-      font: "12px sans-serif",
-      fillColor: Cesium.Color.YELLOW,
-      outlineColor: Cesium.Color.BLACK,
-      outlineWidth: 2,
-      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-      pixelOffset: new Cesium.Cartesian2(0, -22),
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-    },
-  });
-  planEntities.push(ent);
+/** RX measurement sites from API (magenta); deduped across batch plans. */
+function addPlannedRxSiteMarkers(rxSites) {
+  const fill = Cesium.Color.fromCssColorString("#e879f9").withAlpha(0.96);
+  const outline = Cesium.Color.BLACK.withAlpha(0.85);
+  for (const s of rxSites || []) {
+    const la = Number(s.lat);
+    const lo = Number(s.lon);
+    if (!Number.isFinite(la) || !Number.isFinite(lo)) continue;
+    const id = String(s.id != null ? s.id : "RX");
+    const key = id || plannedSiteCoordKey(la, lo);
+    if (plannedRxSiteKeys.has(key)) continue;
+    plannedRxSiteKeys.add(key);
+    const name = s.name != null ? String(s.name).trim() : "";
+    const text = name ? `${id}\n${name}` : id;
+    const ent = viewer.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(lo, la, 20.0),
+      point: {
+        pixelSize: 10,
+        color: fill,
+        outlineColor: outline,
+        outlineWidth: 2,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      label: {
+        text,
+        font: "12px sans-serif",
+        fillColor: fill,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(0, -28),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    });
+    planEntities.push(ent);
+  }
 }
 
 function clearOverlay() {
@@ -1880,6 +2305,9 @@ function clearOverlay() {
   planResults = [];
 
   planCounter = 0;
+  plannedTxSiteKeys.clear();
+  plannedRxSiteKeys.clear();
+  syncPlannedTxSelectionMarker();
 
   // Hide legend when overlay is cleared.
   const legend = document.getElementById("rsrp-legend");
@@ -1955,21 +2383,28 @@ function renderGridCoverage(grid) {
   if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
   const lats = grid.cell_lat;
   const lons = grid.cell_lon;
-  const rsrp = grid.rsrp_dbm;
-  if (lats.length === 0 || lons.length !== lats.length || rsrp.length !== lats.length) return;
+  const layer = (typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getCoverageDisplayLayer() : "rsrp");
+  if (lats.length === 0 || lons.length !== lats.length) return;
 
   let vmin = Infinity;
   let vmax = -Infinity;
-  for (let i = 0; i < rsrp.length; i++) {
-    const v = rsrp[i];
+  for (let i = 0; i < lats.length; i++) {
+    const v = typeof RFTerrainParams !== "undefined"
+      ? RFTerrainParams.pickSampleMetric(grid, i, layer)
+      : grid.rsrp_dbm[i];
     if (!Number.isFinite(v)) continue;
     if (v < vmin) vmin = v;
     if (v > vmax) vmax = v;
   }
   if (!Number.isFinite(vmin) || !Number.isFinite(vmax)) return;
 
-  // Show legend with dBm scale.
-  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, vmin, vmax);
+  if (layer === "terrain_shadow") {
+    updateRSRPLegend(0, 40, vmin, vmax);
+  } else if (layer === "sinr") {
+    updateRSRPLegend(-5, 30, vmin, vmax);
+  } else {
+    updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, vmin, vmax);
+  }
 
   // Point primitives are much faster than entities at this scale.
   const points = trackRfPrimitive(viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection()));
@@ -1983,7 +2418,9 @@ function renderGridCoverage(grid) {
   for (let i = 0; i < lats.length; i++) {
     const lat = lats[i];
     const lon = lons[i];
-    const v = rsrp[i];
+    const v = typeof RFTerrainParams !== "undefined"
+      ? RFTerrainParams.pickSampleMetric(grid, i, layer)
+      : grid.rsrp_dbm[i];
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(v)) continue;
 
     points.add({
@@ -1997,13 +2434,59 @@ function renderGridCoverage(grid) {
   }
 }
 
+// 3D OSM-only rendering: one ellipse per sector when `heatmapBySector` is present (true beam RSRP each).
+async function renderHeatmapDrapesPerSectorOsm3d(heatmapBySector, grid) {
+  if (!viewer || !heatmapBySector || typeof heatmapBySector !== "object") return;
+  if (!grid || !grid.tx || !Number.isFinite(grid.tx.lat) || !Number.isFinite(grid.tx.lon)) return;
+  const txLat = grid.tx.lat;
+  const txLon = grid.tx.lon;
+  const radiusM =
+    (() => {
+      const first = Object.values(heatmapBySector)[0];
+      return (first && Number.isFinite(first.radius_m) ? Number(first.radius_m) : NaN) ||
+        (grid && grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN) ||
+        getNumber("max-range", 2500.0);
+    })();
+  if (!Number.isFinite(radiusM) || radiusM <= 0) return;
+  const entries = Object.entries(heatmapBySector);
+  if (!entries.length) return;
+  const first = entries[0][1];
+  const actualMin = (first && Number.isFinite(first.actual_min)) ? Number(first.actual_min) : FIXED_RSRP_MIN;
+  const actualMax = (first && Number.isFinite(first.actual_max)) ? Number(first.actual_max) : FIXED_RSRP_MAX;
+  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
+  for (const [sid, hm] of entries) {
+    const imgSrc = hm && hm.png_b64;
+    if (!imgSrc) continue;
+    trackRfEntity(viewer.entities.add({
+      name: `RSRP sector ${sid}`,
+      position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
+      ellipse: {
+        semiMajorAxis: radiusM,
+        semiMinorAxis: radiusM,
+        granularity: Cesium.Math.toRadians(0.25),
+        material: new Cesium.ImageMaterialProperty({ image: imgSrc, transparent: true }),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        outline: false,
+      },
+    }));
+  }
+}
+
 // 3D OSM-only rendering: map-aligned raster drape (no radial spokes).
-async function renderHeatmapDrapeOsm3d(heatmap, grid) {
+async function renderHeatmapDrapeOsm3d(heatmap, grid, heatmapBySector) {
   // Fast path for 3D OSM-only mode:
   // - Backend returns a pre-colored PNG texture (base64 data URL).
   // - We drape it as a single Cesium ellipse clamped to ground/tiles.
   // This avoids per-vertex clampToHeightMostDetailed, which is too slow for interactive use.
+  if (heatmapBySector && typeof heatmapBySector === "object" && Object.keys(heatmapBySector).length) {
+    await renderHeatmapDrapesPerSectorOsm3d(heatmapBySector, grid);
+    return;
+  }
 
+  if (!viewer) {
+    console.warn("renderHeatmapDrapeOsm3d: Cesium viewer not ready");
+    return;
+  }
   if (!grid || !grid.tx || !Number.isFinite(grid.tx.lat) || !Number.isFinite(grid.tx.lon)) return;
 
   const txLat = grid.tx.lat;
@@ -2012,7 +2495,7 @@ async function renderHeatmapDrapeOsm3d(heatmap, grid) {
   const radiusM =
     (heatmap && Number.isFinite(heatmap.radius_m) ? Number(heatmap.radius_m) : NaN) ||
     (grid && grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN) ||
-    getNumber("max-range", 2000.0);
+    getNumber("max-range", 2500.0);
 
   if (!Number.isFinite(radiusM) || radiusM <= 0) return;
 
@@ -2027,8 +2510,14 @@ async function renderHeatmapDrapeOsm3d(heatmap, grid) {
 
   if (!imgSrc) {
     // Fallback: if backend didn't provide a PNG, fall back to point grid (if available).
+    // Note: 3d_osm API responses often omit per-cell arrays to save payload; then only png_b64 can draw.
     if (grid && Array.isArray(grid.cell_lat) && grid.cell_lat.length) {
       renderGridCoverage(grid);
+    } else {
+      console.warn(
+        "renderHeatmapDrapeOsm3d: no heatmap.png_b64 and no grid.cell_lat — nothing to drape. "
+        + "Check /api/plan response or server heatmap generation.",
+      );
     }
     return;
   }
@@ -2242,6 +2731,8 @@ function addSectorUI() {
   const container = document.getElementById("sectors-container");
   if (!container) return;
 
+  const defaultBw = getNumber("bw-mhz", 40.0);
+
   const sectorId = `sector_${++sectorCounter}`;
   const sectorDiv = document.createElement("div");
   sectorDiv.id = `sector-${sectorId}`;
@@ -2306,6 +2797,23 @@ function addSectorUI() {
         <input type="number" class="sector-power" step="0.1" value="43"
           style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
       </div>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:10px; margin-top:6px;">
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">Channel BW (MHz)</label>
+        <input type="number" class="sector-bw-mhz" step="0.1" min="0.1" value="${defaultBw}"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+      <div>
+        <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">TX ant. gain (dBi, opt.)</label>
+        <input type="number" class="sector-tx-gain-dbi" step="0.1" placeholder="global default"
+          style="width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
+      </div>
+    </div>
+    <div style="margin-top:6px; font-size:10px;">
+      <label style="display:block; font-size:10px; margin-bottom:2px; color:#ccc;">PCI (optional, 0–1007)</label>
+      <input type="number" class="sector-pci" step="1" min="0" max="1007" placeholder="omit if unknown"
+        style="width:100%; max-width:100%; padding:4px; box-sizing:border-box; background:#333; color:#eee; border:1px solid #555; border-radius:2px; font-size:11px;" />
     </div>
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:10px; margin-top:6px;">
       <div>
@@ -2385,13 +2893,28 @@ function collectSectorConfigs() {
     if (!Number.isFinite(freq) || !Number.isFinite(power)) return;
 
     const sectorId = `sector_${index + 1}`;
+    const bwEl = div.querySelector(".sector-bw-mhz");
+    const bwParsed = bwEl ? parseFloat(bwEl.value) : NaN;
+    const channelBw = Number.isFinite(bwParsed) ? bwParsed : getNumber("bw-mhz", 40.0);
+
     const sectorConfig = {
       sector_id: sectorId,
       sector_type: sectorType,
       freq_mhz: freq,
       tx_power_dbm: power,
-      channel_bandwidth_mhz: getNumber("bw-mhz", 20.0),
+      channel_bandwidth_mhz: channelBw,
     };
+    const gainStr = div.querySelector(".sector-tx-gain-dbi")?.value?.trim();
+    if (gainStr) {
+      const g = parseFloat(gainStr);
+      if (Number.isFinite(g)) sectorConfig.tx_antenna_gain_dbi = g;
+    }
+    const pciStr = div.querySelector(".sector-pci")?.value?.trim();
+    if (pciStr) {
+      const pci = parseInt(pciStr, 10);
+      if (Number.isFinite(pci) && pci >= 0 && pci <= 1007) sectorConfig.pci = pci;
+    }
+
     const azimuth = parseFloat(div.querySelector(".sector-azimuth").value);
     const beamwidthH = parseFloat(div.querySelector(".sector-beamwidth-h").value);
     const beamwidthV = parseFloat(div.querySelector(".sector-beamwidth-v").value);
@@ -2569,7 +3092,7 @@ function getPreferredViewCenter() {
 }
 
 function getViewModeHeightM(mode) {
-  const radiusM = getNumber("max-range", 2000.0);
+  const radiusM = getNumber("max-range", 2500.0);
   const baseHeight = mode === "birdseye" ? radiusM * 2.2 : radiusM * 1.4;
   return Math.max(mode === "birdseye" ? 1400.0 : 1000.0, baseHeight);
 }
@@ -2735,14 +3258,34 @@ async function exportCurrentView() {
     const fullViewWithoutRf = await captureViewBlob(false);
 
     const heatmapBlobs = [];
+    const sectorHeatmapBlobs = [];
     if (window.RFExportUtils && planResults.length) {
       for (const pr of planResults) {
-        const pngB64 = pr.out?.heatmap?.png_b64;
-        if (pngB64) {
-          const blob = window.RFExportUtils.base64DataUrlToBlob(pngB64);
-          heatmapBlobs.push(blob);
+        const hbs = pr.out && pr.out.heatmap_by_sector;
+        const seclist = pr.out && Array.isArray(pr.out.sectors) ? pr.out.sectors : [];
+        const sectorBlobs = {};
+        if (hbs && typeof hbs === "object" && window.RFExportUtils.base64DataUrlToBlob) {
+          for (const [sid, hm] of Object.entries(hbs)) {
+            if (hm && hm.png_b64) {
+              const b = window.RFExportUtils.base64DataUrlToBlob(hm.png_b64);
+              if (b) sectorBlobs[sid] = b;
+            }
+          }
+        }
+        if (Object.keys(sectorBlobs).length) {
+          sectorHeatmapBlobs.push(sectorBlobs);
+          const firstId = seclist[0] && seclist[0].sector_id != null ? String(seclist[0].sector_id) : null;
+          const b0 = firstId && sectorBlobs[firstId] ? sectorBlobs[firstId] : Object.values(sectorBlobs)[0];
+          heatmapBlobs.push(b0 || null);
         } else {
-          heatmapBlobs.push(null);
+          sectorHeatmapBlobs.push(null);
+          const pngB64 = pr.out?.heatmap?.png_b64;
+          if (pngB64) {
+            const blob = window.RFExportUtils.base64DataUrlToBlob(pngB64);
+            heatmapBlobs.push(blob);
+          } else {
+            heatmapBlobs.push(null);
+          }
         }
       }
     }
@@ -2762,7 +3305,14 @@ async function exportCurrentView() {
     const extraBlobs = { "full_view_without_rf.png": fullViewWithoutRf };
 
     if (window.RFExportUtils && typeof JSZip !== "undefined") {
-      await window.RFExportUtils.createExportZip(fullViewWithRf, heatmapBlobs, metadata, filename, extraBlobs);
+      await window.RFExportUtils.createExportZip(
+        fullViewWithRf,
+        heatmapBlobs,
+        metadata,
+        filename,
+        extraBlobs,
+        sectorHeatmapBlobs,
+      );
       setStatus("Exported ZIP with full views (with/without RF), heatmap overlays, and metadata.");
     } else {
       const a = document.createElement("a");
@@ -3370,13 +3920,33 @@ function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
       },
     });
     sectorEntities.push(centerLine);
+
+    // PCI: only show when explicitly provided (0 is valid; do not use placeholder "0" when unknown).
+    if (typeof s.pci === "number" && Number.isFinite(s.pci) && s.pci >= 0 && s.pci <= 1007) {
+      const pciLabel = viewer.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(center.lon, center.lat, 12.0),
+        label: {
+          text: `PCI ${s.pci}`,
+          font: "12px system-ui, sans-serif",
+          fillColor: Cesium.Color.WHITE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          showBackground: true,
+          backgroundColor: Cesium.Color.BLACK.withAlpha(0.45),
+        },
+      });
+      sectorEntities.push(pciLabel);
+    }
   }
 }
 
 async function ensureProfiles(txLat, txLon) {
   const txHeightM = getNumber("tx-height-m", 10.0);
   const rxHeightM = getNumber("rx-height-m", 1.5);
-  const maxRangeM = getNumber("max-range", 2000.0);
+  const maxRangeM = getNumber("max-range", 2500.0);
   const drM = getNumber("dr-m", 5.0);
   const dthetaDeg = getNumber("dtheta", 5.0);
 
@@ -3421,6 +3991,7 @@ function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) 
     subcarrier_spacing_khz: getNumber("scs-khz", 30.0),
     num_resource_blocks: Math.round(getNumber("num-rb", 100)),
     channel_bandwidth_mhz: getNumber("bw-mhz", 40.0),
+    tx_antenna_gain_dbi: getNumber("tx-antenna-gain-dbi", 17.0),
     mimo_mode: getString("mimo-mode", "MIMO"),
     enable_link_adaptation: getString("link-adapt", "1") === "1",
     fixed_modulation: null,
@@ -3461,9 +4032,13 @@ function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) 
     rx_height_m: rxHeightM,
 
     // Coverage/grid overrides (must stay in sync with 3D mesh-profile params)
-    max_range_m: getNumber("max-range", 2000.0),
+    max_range_m: getNumber("max-range", 2500.0),
     step_m: getNumber("dr-m", 5.0),
     dtheta_deg: getNumber("dtheta", 5.0),
+
+    // In-browser Plan already applies the JSON response; skip server publish to avoid double-apply with poll.
+    publish_ui: false,
+    ...(typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getTerrainPlanParams() : {}),
   };
 }
 
@@ -3476,6 +4051,7 @@ async function applyPlanResponseToViewer(out, {
   attemptText = "",
 } = {}) {
   if (!out || typeof out !== "object") throw new Error("applyPlanResponseToViewer: invalid plan payload");
+  syncMeshProfileInputsFromPlan(out);
 
   if (out.mode === "3d_rt" && out.raytrace && typeof out.raytrace === "object") {
     const txLat = out.snapped_tx?.lat ?? out.original_point?.lat ?? requestLat;
@@ -3489,14 +4065,15 @@ async function applyPlanResponseToViewer(out, {
     currentRxLocation = { lat: rx.lat, lon: rx.lon };
     clearOverlay();
     clearRaytraceOverlay();
-    updateTxMarker(txLat, txLon);
     updateRxMarker(rx.lat, rx.lon);
-    addPlannedTxMarker(txLat, txLon);
+    registerPlannedTxFromPlan(out, txLat, txLon);
+    if (Array.isArray(out.rx_sites) && out.rx_sites.length) addPlannedRxSiteMarkers(out.rx_sites);
     syncRxManualFields(rx.lat, rx.lon);
     const summary = drawRaytracePathsFromPayload(out.raytrace);
     if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
     setStatus(`${statusPrefix}${attemptText}: 3D RT applied. Multipath polylines drawn: ${summary.drawnCount} (API paths: ${summary.rawCount}).`);
     console.info("RFPlanner3D apply 3d_rt", { rawCount: summary.rawCount, drawnCount: summary.drawnCount, payload: out });
+    recordPlanResultForExport(out, txLat, txLon);
     return { lat: txLat, lon: txLon };
   }
 
@@ -3516,20 +4093,19 @@ async function applyPlanResponseToViewer(out, {
   const rayMode = String(rayModeOpt || out.ray_mode || getString("ray-mode", "3d_osm")).toLowerCase();
   const isRtMode = rayMode === "3d_rt" || rayMode === "3d_rt_google" || rayMode === "3d_rt_osm";
 
-  if (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon)) {
-    currentTxLocation = { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon };
-    updateTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
-    addPlannedTxMarker(out.snapped_tx.lat, out.snapped_tx.lon);
-  } else {
-    currentTxLocation = { lat, lon };
-    updateTxMarker(lat, lon);
-    addPlannedTxMarker(lat, lon);
-  }
+  registerPlannedTxFromPlan(out, lat, lon);
+  if (Array.isArray(out.rx_sites) && out.rx_sites.length) addPlannedRxSiteMarkers(out.rx_sites);
 
   if (out.grid) {
+    const covLayer = typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getCoverageDisplayLayer() : "rsrp";
+    const hasTerrainGrid =
+      covLayer !== "rsrp" &&
+      Array.isArray(out.grid.cell_lat) &&
+      out.grid.cell_lat.length > 0 &&
+      (Array.isArray(out.grid.terrain_loss_db) || Array.isArray(out.grid.sinr_db));
     if (rayMode === "3d" || isRtMode) {
       if (out.heatmap) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid, out.heatmap_by_sector);
       } else {
         try {
           await renderDrapedSurfaceCoverage(out.grid);
@@ -3539,24 +4115,38 @@ async function applyPlanResponseToViewer(out, {
         }
       }
     } else if (rayMode === "3d_osm") {
-      if (out.heatmap) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
-      } else {
+      if (hasTerrainGrid) {
         renderGridCoverage(out.grid);
+      } else if (out.heatmap && out.heatmap.png_b64) {
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid, out.heatmap_by_sector);
+      } else if (out.heatmap_by_sector && Object.keys(out.heatmap_by_sector).length) {
+        await renderHeatmapDrapesPerSectorOsm3d(out.heatmap_by_sector, out.grid);
+      } else if (out.grid && Array.isArray(out.grid.cell_lat) && out.grid.cell_lat.length) {
+        renderGridCoverage(out.grid);
+      } else {
+        const msg = "3D OSM plan has no heatmap image (and no per-cell grid). Check server heatmap/PNG or re-run from Plan RF Queue.";
+        console.warn("RFPlanner3D:", msg, out);
+        setStatus(`${msg} See browser console.`);
       }
     } else {
       // 2D OSM: same ellipse PNG drape as 3D OSM (continuous field, not radial point grid).
       if (out.heatmap && out.heatmap.png_b64) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid);
-    } else {
-      renderGridCoverage(out.grid);
+        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid, out.heatmap_by_sector);
+      } else {
+        renderGridCoverage(out.grid);
       }
     }
   }
 
-  const radiusM = getNumber("max-range", 2000.0);
-  if (out.sectors && out.snapped_tx) {
-    drawSectorOverlays(out.sectors, out.snapped_tx.lat, out.snapped_tx.lon, radiusM);
+  const radiusM = getNumber("max-range", 2500.0);
+  const secLat = (out.snapped_tx && Number.isFinite(out.snapped_tx.lat))
+    ? out.snapped_tx.lat
+    : (out.original_point && Number.isFinite(out.original_point.lat) ? out.original_point.lat : NaN);
+  const secLon = (out.snapped_tx && Number.isFinite(out.snapped_tx.lon))
+    ? out.snapped_tx.lon
+    : (out.original_point && Number.isFinite(out.original_point.lon) ? out.original_point.lon : NaN);
+  if (out.sectors && out.sectors.length && Number.isFinite(secLat) && Number.isFinite(secLon)) {
+    drawSectorOverlays(out.sectors, secLat, secLon, radiusM);
   }
 
   if (currentTxLocation && currentRxLocation && isRtMode) {
@@ -3571,6 +4161,9 @@ async function applyPlanResponseToViewer(out, {
   if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
   setStatus(`${statusPrefix}${attemptText}: plan complete.${key}`);
   console.info("RFPlanner3D apply plan", { rayMode, payload: out });
+
+  recordPlanResultForExport(out, lat, lon);
+  window._lastPlanResult = out;
 
   return (out.snapped_tx && Number.isFinite(out.snapped_tx.lat) && Number.isFinite(out.snapped_tx.lon))
     ? { lat: out.snapped_tx.lat, lon: out.snapped_tx.lon }
@@ -3857,6 +4450,11 @@ async function runPlanForTx(lat, lon, {
   return { ok: true, out, cacheCenter };
 }
 
+function isPropagationRtLaunchMode(rayMode) {
+  const m = String(rayMode || "").toLowerCase();
+  return m === "3d_rt" || m === "3d_rt_google" || m === "3d_rt_osm";
+}
+
 async function runPlan() {
   if (isPlanningQueue) return;
   const queue = getQueuedTxPoints();
@@ -3870,61 +4468,114 @@ async function runPlan() {
 
   const successes = [];
   const failed = [];
-  const retryRadiusM = getNumber("max-range", 2000.0);
+  const retryRadiusM = getNumber("max-range", 2500.0);
+  const rayMode = getString("ray-mode", "3d_osm").toLowerCase();
+  const rtQueue = isPropagationRtLaunchMode(rayMode);
+  let rtQueueRanLaunches = false;
 
   try {
-    for (let i = 0; i < queue.length; i++) {
-      const point = queue[i];
-      const result = await runPlanForTx(point.lat, point.lon, {
-        queueIndex: i + 1,
-        total: queue.length,
-        refreshStreetLabelsOnSuccess: false,
-      });
-      if (result?.ok) {
-        successes.push(result.cacheCenter);
-        planResults.push({ lat: point.lat, lon: point.lon, out: result.out, cacheCenter: result.cacheCenter });
+    if (rtQueue) {
+      applyManualRxFromInputsIfNeeded();
+      if (!currentRxLocation || !Number.isFinite(currentRxLocation.lat) || !Number.isFinite(currentRxLocation.lon)) {
+        setStatus("Propagation is RT: set RX (SHIFT+click the mesh or enter RX lat/lon), then click Plan RF Queue.");
       } else {
-        failed.push(point);
+        rtQueueRanLaunches = true;
+        for (let i = 0; i < queue.length; i++) {
+          const point = queue[i];
+          const prefix = queue.length > 1 ? `TX ${i + 1}/${queue.length}: ` : "";
+          currentTxLocation = { lat: point.lat, lon: point.lon };
+          const txHeightM = getNumber("tx-height-m", 10.0);
+          updateTxMarker(point.lat, point.lon, Number(currentTxLocation.ground_h || 0.0) + txHeightM);
+          updateRtHeadingEntity();
+          applyManualRxFromInputsIfNeeded();
+          try {
+            const summary = await launchLocal3dRaytrace();
+            if (summary) {
+              successes.push({ lat: point.lat, lon: point.lon });
+              planResults.push({
+                lat: point.lat,
+                lon: point.lon,
+                out: { raytrace_queue_launch: true, summary },
+                cacheCenter: { lat: point.lat, lon: point.lon },
+              });
+              setStatus(`${prefix}Ray trace launched.`);
+            } else {
+              failed.push(point);
+            }
+          } catch (err) {
+            setStatus(`${prefix}Ray trace failed: ${err}`);
+            failed.push(point);
+          }
+          if (i < queue.length - 1) {
+            setStatus(`TX ${i + 1}/${queue.length}: done. Waiting ${Math.round(MULTI_TX_PULL_DELAY_MS / 1000)}s…`);
+            await sleep(MULTI_TX_PULL_DELAY_MS);
+          }
+        }
       }
-
-      if (i < queue.length - 1) {
-        setStatus(`TX ${i + 1}/${queue.length}: processed. Waiting ${Math.round(MULTI_TX_PULL_DELAY_MS / 1000)}s before next pull…`);
-        await sleep(MULTI_TX_PULL_DELAY_MS);
-      }
-    }
-
-    const retryable = failed.filter((point) =>
-      successes.some((success) => haversineDistanceM(point.lat, point.lon, success.lat, success.lon) <= retryRadiusM)
-    );
-
-    let retriedSuccesses = 0;
-    for (let i = 0; i < retryable.length; i++) {
-      const point = retryable[i];
-      setStatus(`Retrying ${i + 1}/${retryable.length} near a successful TX so cached OSM data can be reused…`);
-      await sleep(MULTI_TX_PULL_DELAY_MS);
-      const retryResult = await runPlanForTx(point.lat, point.lon, {
-        queueIndex: i + 1,
-        total: retryable.length,
-        attempt: 2,
-        refreshStreetLabelsOnSuccess: false,
-      });
-      if (retryResult?.ok) {
-        retriedSuccesses += 1;
-        successes.push(retryResult.cacheCenter);
-        planResults.push({ lat: point.lat, lon: point.lon, out: retryResult.out, cacheCenter: retryResult.cacheCenter });
-      }
-    }
-
-    if (successes.length) queueStreetLabelRefresh(true);
-
-    const totalSuccess = successes.length;
-    const totalFailed = Math.max(0, failed.length - retriedSuccesses);
-    if (totalSuccess && totalFailed) {
-      setStatus(`Batch complete: ${totalSuccess}/${queue.length} TX succeeded, ${totalFailed} failed.`);
-    } else if (totalSuccess) {
-      setStatus(`Batch complete: all ${totalSuccess} TX points succeeded.`);
     } else {
-      setStatus("Batch failed: no TX points completed successfully.");
+      for (let i = 0; i < queue.length; i++) {
+        const point = queue[i];
+        const result = await runPlanForTx(point.lat, point.lon, {
+          queueIndex: i + 1,
+          total: queue.length,
+          refreshStreetLabelsOnSuccess: false,
+        });
+        if (result?.ok) {
+          successes.push(result.cacheCenter);
+        } else {
+          failed.push(point);
+        }
+
+        if (i < queue.length - 1) {
+          setStatus(`TX ${i + 1}/${queue.length}: processed. Waiting ${Math.round(MULTI_TX_PULL_DELAY_MS / 1000)}s before next pull…`);
+          await sleep(MULTI_TX_PULL_DELAY_MS);
+        }
+      }
+
+      const retryable = failed.filter((point) =>
+        successes.some((success) => haversineDistanceM(point.lat, point.lon, success.lat, success.lon) <= retryRadiusM)
+      );
+
+      let retriedSuccesses = 0;
+      for (let i = 0; i < retryable.length; i++) {
+        const point = retryable[i];
+        setStatus(`Retrying ${i + 1}/${retryable.length} near a successful TX so cached OSM data can be reused…`);
+        await sleep(MULTI_TX_PULL_DELAY_MS);
+        const retryResult = await runPlanForTx(point.lat, point.lon, {
+          queueIndex: i + 1,
+          total: retryable.length,
+          attempt: 2,
+          refreshStreetLabelsOnSuccess: false,
+        });
+        if (retryResult?.ok) {
+          retriedSuccesses += 1;
+          successes.push(retryResult.cacheCenter);
+        }
+      }
+
+      if (successes.length) queueStreetLabelRefresh(true);
+
+      const totalSuccess = successes.length;
+      const totalFailed = Math.max(0, failed.length - retriedSuccesses);
+      if (totalSuccess && totalFailed) {
+        setStatus(`Batch complete: ${totalSuccess}/${queue.length} TX succeeded, ${totalFailed} failed.`);
+      } else if (totalSuccess) {
+        setStatus(`Batch complete: all ${totalSuccess} TX points succeeded.`);
+      } else {
+        setStatus("Batch failed: no TX points completed successfully.");
+      }
+    }
+
+    if (rtQueue && rtQueueRanLaunches) {
+      const totalSuccess = successes.length;
+      const totalFailed = failed.length;
+      if (totalSuccess && totalFailed) {
+        setStatus(`Ray queue: ${totalSuccess}/${queue.length} TX launched, ${totalFailed} failed or skipped.`);
+      } else if (totalSuccess) {
+        setStatus(`Ray queue: all ${totalSuccess} TX point(s) launched.`);
+      } else {
+        setStatus("Ray queue: no launches succeeded. Check TX/RX and RT controls.");
+      }
     }
   } finally {
     isPlanningQueue = false;
@@ -4148,6 +4799,7 @@ Click Plan RF Queue.`);
   document.getElementById("rt-place-tx-btn")?.addEventListener("click", () => setRtClickMode("tx"));
   document.getElementById("rt-place-rx-btn")?.addEventListener("click", () => setRtClickMode("rx"));
   document.getElementById("rt-steer-btn")?.addEventListener("click", () => setRtClickMode("steer"));
+  document.getElementById("rt-autolock-btn")?.addEventListener("click", () => autoLockRtSteering().catch((e) => setRtStatus(`Auto lock failed: ${e}`)));
   document.getElementById("rt-launch-btn")?.addEventListener("click", () => launchLocal3dRaytrace().catch((e) => setRtStatus(`3D RT launch failed: ${e}`)));
   document.getElementById("rt-clear-btn")?.addEventListener("click", () => {
     clearRaytraceOverlay({ clearOsmRtBuildings: false });
@@ -4181,6 +4833,14 @@ Click Plan RF Queue.`);
     clearRaytraceOverlay();
     updateRtHeadingEntity();
   });
+  document.getElementById("coverage-display-layer")?.addEventListener("change", async () => {
+    if (!window._lastPlanResult || !window._lastPlanResult.grid) return;
+    clearCoverageOverlay();
+    await applyPlanResponseToViewer(window._lastPlanResult, {
+      refreshStreetLabelsOnSuccess: false,
+      statusPrefix: "Layer",
+    });
+  });
   document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
   document.getElementById("export-local-mesh-btn")?.addEventListener("click", () => exportLocalMesh());
   document.getElementById("clear-map-btn").addEventListener("click", () => clearMap());
@@ -4192,6 +4852,20 @@ Click Plan RF Queue.`);
   queueStreetLabelRefresh(true);
   startRemotePlanRfPolling();
   startRemote3dRtPolling();
+  if (window.RFAddressLookup) {
+    window.RFAddressLookup.bindAddressLookup({
+      setStatus,
+      onNavigate(lat, lon, result, mode) {
+        flyToQueuedPoints([{ lat, lon }]);
+        if (mode === "set_tx") {
+          appendTxInputPoint(lat, lon);
+          currentTxLocation = { lat, lon };
+          updateTxMarker(lat, lon, getNumber("tx-height-m", 10.0));
+        }
+        setStatus(`At ${result.formatted_address || `${lat}, ${lon}`}`);
+      },
+    });
+  }
   setStatus("Paste one or more TX coordinates, or click on the 3D mesh to append them, then click Plan RF Queue.");
 }
 
