@@ -115,9 +115,9 @@
     return { t, point: add(origin, mul(dir, t)) };
   }
 
-  const sidebar = document.getElementById('sidebar');
   const mapContainer = document.getElementById('map-container');
-  if (!sidebar || !mapContainer) return;
+  if (!mapContainer) return;
+  if (!document.getElementById('rt-ray-count')) return;
 
   if (!document.getElementById('rt-marker-styles')) {
     const style = document.createElement('style');
@@ -131,37 +131,6 @@
     `;
     document.head.appendChild(style);
   }
-
-  const panel = document.createElement('div');
-  panel.style.marginTop = '20px';
-  panel.style.paddingTop = '20px';
-  panel.style.borderTop = '1px solid #444';
-  panel.innerHTML = `
-    <h3 style="font-size:14px; margin-bottom:10px;">2D Ray Tracer</h3>
-    <div style="font-size:11px; color:#bbb; margin-bottom:8px;">Normal click: place TX, move mouse to steer, second click anywhere confirms direction. Shift+click places RX.</div>
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; align-items:center; margin-bottom:8px;">
-      <label style="font-size:11px; color:#ccc;">Ray count <span id="rt-ray-count-val">121</span></label>
-      <input id="rt-ray-count" type="range" min="1" max="721" step="2" value="121" />
-      <label style="font-size:11px; color:#ccc;">Spread <span id="rt-spread-val">50</span>°</label>
-      <input id="rt-spread" type="range" min="0" max="180" value="50" />
-      <label style="font-size:11px; color:#ccc;">Max bounces <span id="rt-bounces-val">4</span></label>
-      <input id="rt-bounces" type="range" min="0" max="12" value="4" />
-      <label style="font-size:11px; color:#ccc;">Max range <span id="rt-range-val">500</span> m</label>
-      <input id="rt-range" type="range" min="50" max="2000" step="10" value="500" />
-      <label style="font-size:11px; color:#ccc;">RX radius <span id="rt-rx-val">8</span> m</label>
-      <input id="rt-rx" type="range" min="2" max="30" step="1" value="8" />
-    </div>
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
-      <button id="rt-launch-btn" type="button" style="padding:6px 8px; background:#0a7a2f; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px;">Launch rays</button>
-      <button id="rt-autoaim-btn" type="button" style="padding:6px 8px; background:#444; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px;">Auto-aim RX</button>
-      <button id="rt-preview-btn" type="button" style="padding:6px 8px; background:#444; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px;">Load OSM preview</button>
-      <button id="rt-clear-btn" type="button" style="padding:6px 8px; background:#663; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px;">Clear rays</button>
-    </div>
-    <div id="rt-angle" style="font-size:11px; color:#bbb; margin-bottom:6px;">Steer: <code>0.0°</code></div>
-    <div id="rt-scene" style="font-size:11px; color:#bbb; margin-bottom:6px;">Scene: <code>not loaded</code></div>
-    <div id="rt-stats" style="font-size:11px; color:#bbb;">No trace yet.</div>
-  `;
-  sidebar.appendChild(panel);
 
   const overlay = document.createElement('canvas');
   overlay.id = 'rt-overlay-canvas';
@@ -225,14 +194,18 @@
   }
   function angleDeg() { return ((rtState.steerAngle * 180 / Math.PI) + 360) % 360; }
   function updateUiLabels() {
-    ui.rayCountVal.textContent = ui.rayCount.value;
-    ui.spreadVal.textContent = ui.spread.value;
-    ui.bouncesVal.textContent = ui.bounces.value;
-    ui.rangeVal.textContent = ui.range.value;
-    ui.rxVal.textContent = ui.rx.value;
-    ui.angle.innerHTML = `Steer: <code>${angleDeg().toFixed(1)}°</code>${rtState.txPending && !rtState.steerConfirmed ? ' <span style="color:#ffb86b;">(click again to confirm)</span>' : ''}`;
-    ui.scene.innerHTML = `Scene: <code>${rtState.sceneOrigin ? `${rtState.buildings.length} buildings / ${rtState.walls.length} walls` : 'not loaded'}</code>${rtState.previewVisible ? ' <span style="color:#7ecbff;">preview on</span>' : ''}`;
-    if (rtState.rxCircle) rtState.rxCircle.setRadius(Number(ui.rx.value));
+    if (ui.rayCountVal && ui.rayCount) ui.rayCountVal.textContent = ui.rayCount.value;
+    if (ui.spreadVal && ui.spread) ui.spreadVal.textContent = ui.spread.value;
+    if (ui.bouncesVal && ui.bounces) ui.bouncesVal.textContent = ui.bounces.value;
+    if (ui.rangeVal && ui.range) ui.rangeVal.textContent = ui.range.value;
+    if (ui.rxVal && ui.rx) ui.rxVal.textContent = ui.rx.value;
+    if (ui.angle) {
+      ui.angle.innerHTML = `Steer: <code>${angleDeg().toFixed(1)}°</code>${rtState.txPending && !rtState.steerConfirmed ? ' <span style="color:#ffb86b;">(click again to confirm)</span>' : ''}`;
+    }
+    if (ui.scene) {
+      ui.scene.innerHTML = `Scene: <code>${rtState.sceneOrigin ? `${rtState.buildings.length} buildings / ${rtState.walls.length} walls` : 'not loaded'}</code>${rtState.previewVisible ? ' <span style="color:#7ecbff;">preview on</span>' : ''}`;
+    }
+    if (rtState.rxCircle && ui.rx) rtState.rxCircle.setRadius(Number(ui.rx.value));
   }
   function setStatus(msg) {
     if (typeof window.setPlannerStatus === 'function') window.setPlannerStatus(msg);
@@ -527,9 +500,14 @@
   async function launchRays() {
     if (!rtState.tx || !rtState.steerConfirmed) {
       setStatus('Place TX with first click, move mouse, then click again to confirm direction.');
-      return;
+      return { ok: false, error: 'tx_steer' };
     }
-    await ensureSceneLoaded(false);
+    try {
+      await ensureSceneLoaded(false);
+    } catch (err) {
+      setStatus(`Ray trace failed: ${String(err)}`);
+      return { ok: false, error: String(err) };
+    }
     rtState.rays = [];
     const n = Number(ui.rayCount.value);
     const spread = Number(ui.spread.value) * Math.PI / 180;
@@ -544,9 +522,14 @@
     }
     updateStats();
     draw();
+    return { ok: true };
   }
 
+  /** Called from Plan RF Queue when Propagation = 2D OSM RT (`3d_rt_osm`). */
+  window.rf2dLaunchRays = launchRays;
+
   function updateStats() {
+    if (!ui.stats) return;
     if (!rtState.rays.length) { ui.stats.innerHTML = 'No trace yet.'; return; }
     const hits = rtState.rays.filter(r => r && r.hitRx);
     const minB = hits.length ? Math.min(...hits.map(r => r.bounceCount)) : '–';
@@ -581,7 +564,7 @@
   }
 
   function drawBeamPreview() {
-    if (!rtState.tx) return;
+    if (!rtState.tx || !ui.spread) return;
     const txp = map.latLngToContainerPoint(rtState.tx);
     const spread = Number(ui.spread.value) * Math.PI / 180;
     const r = 118;
@@ -686,10 +669,19 @@
 
   window.rf2dClearAll = clearAllRt;
   window.rf2dSetTxFromPlanner = function (lat, lng) {
-    rtState.tx = L.latLng(lat, lng);
+    const next = L.latLng(lat, lng);
+    const prevSteer = rtState.steerAngle;
+    // ~11 m tolerance: same interaction TX (e.g. Plan RF sync) keeps boresight; new queue coordinates reset default.
+    const steerLocEpsDeg = 1e-4;
+    const sameLoc =
+      rtState.tx &&
+      rtState.steerConfirmed &&
+      Math.abs(rtState.tx.lat - next.lat) < steerLocEpsDeg &&
+      Math.abs(rtState.tx.lng - next.lng) < steerLocEpsDeg;
+    rtState.tx = next;
     rtState.txPending = false;
     rtState.steerConfirmed = true;
-    rtState.steerAngle = Math.PI / 2;
+    rtState.steerAngle = sameLoc ? prevSteer : Math.PI / 2;
     rtState.rays = [];
     if (!sceneIsFreshEnough()) invalidateRayScene();
     updateTxVisual();
@@ -719,13 +711,15 @@
     draw();
   });
 
-  ui.launch.addEventListener('click', () => { launchRays().catch(err => setStatus(`Ray trace failed: ${String(err)}`)); });
-  ui.autoAim.addEventListener('click', () => {
+  ui.launch?.addEventListener("click", () => {
+    launchRays().catch((err) => setStatus(`Ray trace failed: ${String(err)}`));
+  });
+  ui.autoAim?.addEventListener("click", () => {
     if (!rtState.tx || !rtState.rx) { setStatus('Place both TX and RX first.'); return; }
     rtState.txPending = false; rtState.steerConfirmed = true; setSteerToLatLng(rtState.rx); updateTxVisual(); updateUiLabels(); draw();
     setStatus(`TX auto-aimed to RX at ${angleDeg().toFixed(1)}°.`);
   });
-  ui.preview.addEventListener('click', () => {
+  ui.preview?.addEventListener("click", () => {
     rtState.previewVisible = !rtState.previewVisible;
     if (!rtState.previewVisible) {
       rtPreviewLayer.clearLayers();
@@ -734,8 +728,10 @@
     }
     ensureSceneLoaded(true).catch(err => setStatus(`OSM preview load failed: ${String(err)}`));
   });
-  ui.clear.addEventListener('click', clearRays);
-  [ui.rayCount, ui.spread, ui.bounces, ui.range, ui.rx].forEach(el => el.addEventListener('input', () => { updateUiLabels(); draw(); }));
+  ui.clear?.addEventListener("click", clearRays);
+  [ui.rayCount, ui.spread, ui.bounces, ui.range, ui.rx].forEach((el) => {
+    if (el) el.addEventListener("input", () => { updateUiLabels(); draw(); });
+  });
 
   updateUiLabels();
   syncOverlaySize();
