@@ -112,6 +112,7 @@ function restoreSavedPlan(data, ageMinutes) {
   heatmapLayerGroups.push(restoredHeatmapLayerGroup);
   window.currentHeatmapLayerGroup = restoredHeatmapLayerGroup;
 
+  window._lastPlanResult = data;
   renderHeatmap(data);
 
   if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
@@ -137,6 +138,12 @@ function restoreSavedPlan(data, ageMinutes) {
     })
       .addTo(currentLayerGroup)
       .bindPopup(`TX: ${tx.lat}, ${tx.lon}`);
+  }
+
+  const clat = data.snapped_tx?.lat ?? data.original_point?.lat;
+  const clon = data.snapped_tx?.lon ?? data.original_point?.lon;
+  if (Number.isFinite(clat) && Number.isFinite(clon)) {
+    planResults = [{ lat: clat, lon: clon, out: data, data, cacheCenter: { lat: clat, lon: clon } }];
   }
 
   setStatus(`Restored previous RF plan (${ageMinutes.toFixed(1)} min old). Click map or paste TX coordinates to queue another plan.`);
@@ -362,14 +369,42 @@ function loadLastResults() {
   return true;
 }
 
+function update2dRtPanelVisibility() {
+  const sec = document.getElementById("rt-controls-section");
+  const rm = document.getElementById("ray-mode");
+  if (!sec || !rm) return;
+  sec.style.display = rm.value === "3d_rt_osm" ? "" : "none";
+}
+
+function updateRayModeHelperText() {
+  const sel = document.getElementById("ray-mode");
+  const el = document.getElementById("mesh-profile-status");
+  if (!el) return;
+  const m = sel ? String(sel.value || "2d").toLowerCase() : "2d";
+  if (m === "3d_rt_osm") {
+    el.textContent =
+      "2D OSM RT: in-map ray fan. Plan RF Queue runs rays (not the coverage grid). Use /3d for Google mesh or 3D OSM-only modes.";
+  } else {
+    el.textContent = "2D coverage uses OSM footprints. For 3D or Google mesh, open the /3d planner.";
+  }
+  update2dRtPanelVisibility();
+}
+
 // Initialize Ray Mode selector on page load (loadLastResults is called once in the main DOMContentLoaded below)
 window.addEventListener('DOMContentLoaded', () => {
-  fetch("/api/config").then(r => r.ok ? r.json() : null).then(cfg => {
-    if (!cfg) return;
-    const mode = String(cfg.default_ray_mode || "2d").toLowerCase();
-    const sel = document.getElementById("ray-mode");
-    if (sel && (mode === "2d" || mode === "3d")) sel.value = mode;
-  }).catch(e => console.warn("[RF Planner] Failed to load /api/config for default ray mode:", e));
+  fetch("/api/config")
+    .then((r) => (r.ok ? r.json() : null))
+    .then((cfg) => {
+      if (!cfg) return;
+      const mode = String(cfg.default_ray_mode || "2d").toLowerCase();
+      const sel = document.getElementById("ray-mode");
+      if (!sel) return;
+      // This page only exposes 2D and 2D OSM RT; map legacy server defaults onto those.
+      if (mode === "3d_rt_osm") sel.value = "3d_rt_osm";
+      else sel.value = "2d";
+    })
+    .catch((e) => console.warn("[RF Planner] Failed to load /api/config for default ray mode:", e))
+    .finally(() => updateRayModeHelperText());
 });
 
 // Extract RF planning logic into reusable function
@@ -391,6 +426,88 @@ async function ensure3DMeshProfiles(lat, lng, txHeightM, rxHeightM, maxRangeM, d
     mode: "slice",
     onProgress: (msg) => setStatus(msg),
   });
+}
+
+function applyServerPlanTo2dView(data, { requestLat, requestLng, statusMessage } = {}) {
+  const fromLat = Number.isFinite(requestLat)
+    ? requestLat
+    : (data.original_point && Number.isFinite(data.original_point.lat) ? data.original_point.lat : null);
+  const fromLng = Number.isFinite(requestLng)
+    ? requestLng
+    : (data.original_point && Number.isFinite(data.original_point.lon) ? data.original_point.lon : null);
+
+  if (data.snapped_tx) {
+    const snapped = data.snapped_tx;
+    const snapDist = data.snap_distance_m || 0;
+    const svAvailable = data.streetview_available || false;
+    const vlmUsed = data.vlm_used || false;
+    const worldSource = data.world_model_source || "unknown";
+    const clutterType = data.clutter_type || "unknown";
+
+    let popupHtml = `Snapped to street<br>Distance: ${snapDist.toFixed(1)}m<br>`;
+    popupHtml += `Clutter: ${clutterType}<br>`;
+    popupHtml += `Model: ${worldSource === "geometry_vlm_refined" ? "Geometry + VLM" : "Geometry only"}<br>`;
+    popupHtml += `Street View: ${svAvailable ? "✓ Available" : "✗ Not available"}`;
+
+    L.marker([snapped.lat, snapped.lon], {
+      icon: L.divIcon({ className: "snapped-marker", html: "📍", iconSize: [24, 24] }),
+    })
+      .addTo(currentLayerGroup)
+      .bindPopup(popupHtml);
+
+    if (Number.isFinite(fromLat) && Number.isFinite(fromLng)) {
+      L.polyline([[fromLat, fromLng], [snapped.lat, snapped.lon]], {
+        color: "yellow",
+        weight: 2,
+        dashArray: "5, 5",
+      }).addTo(currentLayerGroup);
+    }
+
+    let statusMsg = `Snapped: ${snapDist.toFixed(1)}m. Clutter: ${clutterType}. `;
+    if (vlmUsed) {
+      statusMsg += "Model: Geometry + VLM. ";
+    } else {
+      statusMsg += "Model: Geometry only. ";
+    }
+    statusMsg += `Street View: ${svAvailable ? "Available" : "Not available"}. Computing RF...`;
+    setStatus(statusMsg);
+  }
+
+  displayMetadata(data);
+
+  if (data.panorama_image) {
+    displayPanorama(data.panorama_image, data.panorama_location);
+  }
+
+  renderHeatmap(data);
+  window._lastPlanResult = data;
+
+  if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
+    try {
+      window.rf2dIngestPlannerOsm(data.osm_buildings_for_client);
+      console.log("[RF Planner] Reused planner OSM footprints for 2D ray tracer (shared cache).");
+    } catch (e) {
+      console.warn("[RF Planner] rf2dIngestPlannerOsm:", e);
+    }
+  }
+
+  try {
+    const forStorage = { ...data };
+    delete forStorage.osm_buildings_for_client;
+    localStorage.setItem("rf_planning_last_result", JSON.stringify(forStorage));
+    localStorage.setItem("rf_planning_timestamp", Date.now().toString());
+    console.log("[RF Planner] Results saved to localStorage");
+  } catch (e) {
+    console.warn("[RF Planner] Failed to save to localStorage:", e);
+  }
+
+  if (statusMessage) {
+    setStatus(statusMessage);
+  } else {
+    setStatus(
+      "RF plan computed. Click another point or enter coordinates to re-run. (Results saved - will persist after refresh)"
+    );
+  }
 }
 
 async function runRFPlanning(lat, lng, source = "click") {
@@ -563,6 +680,8 @@ async function runRFPlanning(lat, lng, source = "click") {
       ray_mode: rayMode,
       tx_height_m: txHeightM,
       rx_height_m: rxHeightM,
+      publish_ui: false,
+      ...(window.RFTerrainParams ? RFTerrainParams.getTerrainPlanParams() : {}),
     };
     
     // If 3D mode is selected, ensure a persisted mesh profile exists for this TX/config.
@@ -660,80 +779,12 @@ async function runRFPlanning(lat, lng, source = "click") {
     const data = await resp.json();
     console.log("[RF Planner] Response data keys:", Object.keys(data));
     console.log("[RF Planner] Response data:", data);
-    
-    // Show snapped point (add to currentLayerGroup for markers/overlays, not heatmap layer)
-    if (data.snapped_tx) {
-      const snapped = data.snapped_tx;
-      const snapDist = data.snap_distance_m || 0;
-      const svAvailable = data.streetview_available || false;
-      const vlmUsed = data.vlm_used || false;
-      const worldSource = data.world_model_source || "unknown";
-      const clutterType = data.clutter_type || "unknown";
-      
-      // Build popup with metadata
-      let popupHtml = `Snapped to street<br>Distance: ${snapDist.toFixed(1)}m<br>`;
-      popupHtml += `Clutter: ${clutterType}<br>`;
-      popupHtml += `Model: ${worldSource === "geometry_vlm_refined" ? "Geometry + VLM" : "Geometry only"}<br>`;
-      popupHtml += `Street View: ${svAvailable ? "✓ Available" : "✗ Not available"}`;
-      
-      L.marker([snapped.lat, snapped.lon], { 
-        icon: L.divIcon({ className: "snapped-marker", html: "📍", iconSize: [24, 24] })
-      })
-        .addTo(currentLayerGroup)
-        .bindPopup(popupHtml);
-      
-      // Draw line from clicked to snapped
-      L.polyline([[lat, lng], [snapped.lat, snapped.lon]], {
-        color: "yellow",
-        weight: 2,
-        dashArray: "5, 5",
-      }).addTo(currentLayerGroup);
-      
-      // Update status with model source
-      let statusMsg = `Snapped: ${snapDist.toFixed(1)}m. Clutter: ${clutterType}. `;
-      if (vlmUsed) {
-        statusMsg += "Model: Geometry + VLM. ";
-      } else {
-        statusMsg += "Model: Geometry only. ";
-      }
-      statusMsg += `Street View: ${svAvailable ? "Available" : "Not available"}. Computing RF...`;
-      setStatus(statusMsg);
-    }
-    
-    // Display metadata in sidebar
-    displayMetadata(data);
-    
-    // Display Street View panorama if available
-    if (data.panorama_image) {
-      displayPanorama(data.panorama_image, data.panorama_location);
-    }
-    
-    renderHeatmap(data);
 
-    if (data.osm_buildings_for_client && typeof window.rf2dIngestPlannerOsm === "function") {
-      try {
-        window.rf2dIngestPlannerOsm(data.osm_buildings_for_client);
-        console.log("[RF Planner] Reused planner OSM footprints for 2D ray tracer (shared cache).");
-      } catch (e) {
-        console.warn("[RF Planner] rf2dIngestPlannerOsm:", e);
-      }
-    }
-    
-    // Save results to localStorage (omit OSM blob — ray tracer keeps `rf2d_osm_scene_v1`; avoids quota blowups)
-    try {
-      const forStorage = { ...data };
-      delete forStorage.osm_buildings_for_client;
-      localStorage.setItem('rf_planning_last_result', JSON.stringify(forStorage));
-      localStorage.setItem('rf_planning_timestamp', Date.now().toString());
-      console.log("[RF Planner] Results saved to localStorage");
-    } catch (e) {
-      console.warn("[RF Planner] Failed to save to localStorage:", e);
-    }
-    
-    setStatus("RF plan computed. Click another point or enter coordinates to re-run. (Results saved - will persist after refresh)");
+    applyServerPlanTo2dView(data, { requestLat: lat, requestLng: lng });
     const cacheCenter = (data.snapped_tx && Number.isFinite(data.snapped_tx.lat) && Number.isFinite(data.snapped_tx.lon))
       ? { lat: data.snapped_tx.lat, lon: data.snapped_tx.lon }
       : { lat, lon: lng };
+    planResults.push({ lat, lon: lng, out: data, data, cacheCenter });
     return { ok: true, data, cacheCenter };
   } catch (err) {
     try { stopPlannerProgressPolling(); } catch {}
@@ -871,11 +922,24 @@ async function exportCurrentView() {
         })
       : { plans: [], road_names: roadNames };
 
+    const heatmapBlobs = [];
+    if (window.RFExportUtils && planResults.length) {
+      for (const pr of planResults) {
+        const pngB64 = pr.out?.heatmap?.png_b64 || pr.data?.heatmap?.png_b64;
+        if (pngB64) {
+          const blob = window.RFExportUtils.base64DataUrlToBlob(pngB64);
+          heatmapBlobs.push(blob);
+        } else {
+          heatmapBlobs.push(null);
+        }
+      }
+    }
+
     const ts = new Date();
     const filename = `rf_planner_export_${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, "0")}-${String(ts.getDate()).padStart(2, "0")}_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}.zip`;
 
     if (window.RFExportUtils && typeof JSZip !== "undefined") {
-      await window.RFExportUtils.createExportZip(fullViewBlob, [], metadata, filename);
+      await window.RFExportUtils.createExportZip(fullViewBlob, heatmapBlobs, metadata, filename);
       setStatus("Exported ZIP with full view and metadata.");
     } else {
       const a = document.createElement("a");
@@ -1528,11 +1592,100 @@ function collectSectorConfigs() {
   return sectors;
 }
 
+/** When Propagation = `3d_rt_osm`, Plan RF Queue runs the Leaflet 2D OSM ray fan instead of POST /api/plan. */
+async function runPlanQueue2dOsmRays(queue) {
+  const successes = [];
+  const failed = [];
+  if (typeof window.rf2dLaunchRays !== "function") {
+    setStatus("2D OSM ray tracer is not loaded.");
+    return;
+  }
+  for (let i = 0; i < queue.length; i++) {
+    const point = queue[i];
+    const prefix = queue.length > 1 ? `TX ${i + 1}/${queue.length}: ` : "";
+    if (typeof window.rf2dSetTxFromPlanner === "function") {
+      window.rf2dSetTxFromPlanner(point.lat, point.lon);
+    }
+    let res;
+    try {
+      res = await window.rf2dLaunchRays();
+    } catch (err) {
+      setStatus(`${prefix}Ray trace failed: ${String(err)}`);
+      failed.push(point);
+      continue;
+    }
+    if (res && res.ok) {
+      successes.push(point);
+      setStatus(`${prefix}Launched OSM multipath rays.`);
+    } else {
+      failed.push(point);
+      const hint = res && res.error === "tx_steer"
+        ? "Confirm TX direction on the map (second click), then try Plan RF Queue again."
+        : (res && res.error) || "Ray launch did not complete.";
+      setStatus(`${prefix}${hint}`);
+    }
+    if (i < queue.length - 1) {
+      setStatus(`TX ${i + 1}/${queue.length}: done. Waiting ${Math.round(MULTI_TX_PULL_DELAY_MS / 1000)}s before next…`);
+      await sleep(MULTI_TX_PULL_DELAY_MS);
+    }
+  }
+  const totalSuccess = successes.length;
+  const totalFailed = failed.length;
+  if (totalSuccess && totalFailed) {
+    setStatus(`Ray queue complete: ${totalSuccess}/${queue.length} TX launched, ${totalFailed} skipped or failed.`);
+  } else if (totalSuccess) {
+    setStatus(`Ray queue complete: all ${totalSuccess} TX point(s) launched.`);
+  } else {
+    setStatus("Ray queue: no TX completed. Check TX direction, RX placement, and OSM scene.");
+  }
+}
+
 // Try to restore last results on page load
 window.addEventListener('DOMContentLoaded', () => {
   loadRfParamsDefaults();
+  if (window.RFAddressLookup) {
+    window.RFAddressLookup.bindAddressLookup({
+      setStatus,
+      onNavigate(lat, lon, result, mode) {
+        map.setView([lat, lon], 15);
+        if (mode === "set_tx") {
+          if (typeof appendTxInputPoint === "function") {
+            appendTxInputPoint(lat, lon);
+          } else {
+            const el = document.getElementById("tx-input");
+            if (el) {
+              const line = `${lat},${lon}`;
+              el.value = el.value.trim() ? `${el.value.trim()}\n${line}` : line;
+            }
+          }
+          if (typeof window.rf2dSetTxFromPlanner === "function") {
+            window.rf2dSetTxFromPlanner(lat, lon);
+          } else {
+            if (window.txMarker) currentLayerGroup.removeLayer(window.txMarker);
+            window.txMarker = L.marker([lat, lon], { icon: L.divIcon({ className: "click-marker", html: "📍", iconSize: [20, 20] }) })
+              .addTo(currentLayerGroup)
+              .bindPopup(result.formatted_address || "TX Location");
+          }
+        }
+        setStatus(`At ${result.formatted_address || `${lat}, ${lon}`}`);
+      },
+    });
+  }
   if (!loadLastResults()) {
     setStatus("Click on the map or enter coordinates to run RF planning.");
+  }
+
+  const coverageLayerEl = document.getElementById("coverage-display-layer");
+  if (coverageLayerEl) {
+    coverageLayerEl.addEventListener("change", () => {
+      if (!window._lastPlanResult) return;
+      heatmapLayerGroups.forEach((layerGroup) => map.removeLayer(layerGroup));
+      heatmapLayerGroups = [];
+      const g = L.layerGroup().addTo(map);
+      heatmapLayerGroups.push(g);
+      window.currentHeatmapLayerGroup = g;
+      renderHeatmap(window._lastPlanResult);
+    });
   }
   
   // Handle add sector button
@@ -1551,6 +1704,9 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
   
+  document.getElementById("ray-mode")?.addEventListener("change", updateRayModeHelperText);
+  updateRayModeHelperText();
+
   // Handle coordinate form submission ("Plan RF" button)
   const coordForm = document.getElementById("coord-form");
   coordForm.addEventListener("submit", async (e) => {
@@ -1559,6 +1715,21 @@ window.addEventListener('DOMContentLoaded', () => {
     if (isPlanningQueue) return;
     const queue = getQueuedTxPoints();
     if (!queue || !queue.length) return;
+
+    const rayMode = String(document.getElementById("ray-mode")?.value || "2d").toLowerCase();
+    if (rayMode === "3d_rt_osm") {
+      planResults = [];
+      flyToQueuedPoints(queue);
+      isPlanningQueue = true;
+      setPlanButtonBusy(true);
+      try {
+        await runPlanQueue2dOsmRays(queue);
+      } finally {
+        isPlanningQueue = false;
+        setPlanButtonBusy(false);
+      }
+      return;
+    }
 
     planResults = [];
     flyToQueuedPoints(queue);
@@ -1576,7 +1747,6 @@ window.addEventListener('DOMContentLoaded', () => {
         const result = await runRFPlanning(point.lat, point.lon, "form");
         if (result?.ok) {
           successes.push(result.cacheCenter);
-          planResults.push({ lat: point.lat, lon: point.lon, out: result.data, data: result.data, cacheCenter: result.cacheCenter });
         } else {
           failed.push(point);
         }
@@ -1600,7 +1770,6 @@ window.addEventListener('DOMContentLoaded', () => {
         if (retryResult?.ok) {
           retriedSuccesses += 1;
           successes.push(retryResult.cacheCenter);
-          planResults.push({ lat: point.lat, lon: point.lon, out: retryResult.data, data: retryResult.data, cacheCenter: retryResult.cacheCenter });
         }
       }
 
@@ -1718,13 +1887,30 @@ function offsetEnuToLatLon(latDeg, lonDeg, eastM, northM) {
 }
 
 function renderHeatmap(result) {
-  const grid = result.grid;
+  const grid = (result && result.grid) || {};
   const lats = grid.cell_lat;
   const lons = grid.cell_lon;
   const rsrp = grid.rsrp_dbm;
+  const layer = (window.RFTerrainParams && RFTerrainParams.getCoverageDisplayLayer()) || "rsrp";
+  const h = result.heatmap;
+  const pngSrc = h && h.png_b64 ? h.png_b64 : null;
+  const tx = result.snapped_tx || grid.tx || result.original_point;
+  const txLat = tx && Number.isFinite(tx.lat) ? tx.lat : null;
+  const txLon = tx && Number.isFinite(tx.lon) ? tx.lon : null;
+  let radiusM =
+    (h && Number.isFinite(h.radius_m) ? Number(h.radius_m) : NaN) ||
+    (grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN);
+  const hasCells = !!(lats && lats.length > 0 && lons && lons.length > 0 && rsrp && rsrp.length > 0);
+  const hasLayerCells =
+    hasCells &&
+    (layer === "rsrp" ||
+      (layer === "sinr" && Array.isArray(grid.sinr_db)) ||
+      (layer === "terrain_shadow" && (Array.isArray(grid.terrain_loss_db) || Array.isArray(grid.los_terrain))));
+  const hasPngDrape =
+    !!(pngSrc && Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(radiusM) && radiusM > 0 && layer === "rsrp");
 
-  if (!lats || lats.length === 0) {
-    setStatus("No grid cells returned.");
+  if (!hasPngDrape && !hasLayerCells) {
+    setStatus("No grid cells and no heatmap image returned.");
     return;
   }
 
@@ -1736,26 +1922,40 @@ function renderHeatmap(result) {
 
   let actualMin = Infinity;
   let actualMax = -Infinity;
-  for (const v of rsrp) {
-    if (v < actualMin) actualMin = v;
-    if (v > actualMax) actualMax = v;
+  if (hasLayerCells) {
+    for (let i = 0; i < lats.length; i++) {
+      const v = window.RFTerrainParams
+        ? RFTerrainParams.pickSampleMetric(grid, i, layer)
+        : rsrp[i];
+      if (!Number.isFinite(v)) continue;
+      if (v < actualMin) actualMin = v;
+      if (v > actualMax) actualMax = v;
+    }
+  }
+  if (h && Number.isFinite(h.actual_min) && layer === "rsrp") actualMin = Number(h.actual_min);
+  if (h && Number.isFinite(h.actual_max) && layer === "rsrp") actualMax = Number(h.actual_max);
+  if (!Number.isFinite(actualMin) || !Number.isFinite(actualMax) || (hasLayerCells && actualMin === Infinity)) {
+    if (layer === "terrain_shadow") {
+      actualMin = 0;
+      actualMax = 40;
+    } else if (layer === "sinr") {
+      actualMin = -5;
+      actualMax = 30;
+    } else {
+      actualMin = FIXED_RSRP_MIN;
+      actualMax = FIXED_RSRP_MAX;
+    }
   }
 
-  const h = result.heatmap;
-  if (h && Number.isFinite(h.actual_min)) actualMin = Number(h.actual_min);
-  if (h && Number.isFinite(h.actual_max)) actualMax = Number(h.actual_max);
+  if (layer === "terrain_shadow") {
+    updateRSRPLegend(0, 40, actualMin, actualMax);
+  } else if (layer === "sinr") {
+    updateRSRPLegend(-5, 30, actualMin, actualMax);
+  } else {
+    updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
+  }
 
-  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
-
-  const pngSrc = h && h.png_b64 ? h.png_b64 : null;
-  const tx = result.snapped_tx || grid.tx;
-  const txLat = tx && Number.isFinite(tx.lat) ? tx.lat : null;
-  const txLon = tx && Number.isFinite(tx.lon) ? tx.lon : null;
-  let radiusM =
-    (h && Number.isFinite(h.radius_m) ? Number(h.radius_m) : NaN) ||
-    (grid.rf_params && Number.isFinite(grid.rf_params.max_range_m) ? Number(grid.rf_params.max_range_m) : NaN);
-
-  if (pngSrc && Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(radiusM) && radiusM > 0) {
+  if (hasPngDrape) {
     const sw = offsetEnuToLatLon(txLat, txLon, -radiusM, -radiusM);
     const ne = offsetEnuToLatLon(txLat, txLon, radiusM, radiusM);
     const bounds = L.latLngBounds([sw.lat, sw.lon], [ne.lat, ne.lon]);
@@ -1768,7 +1968,10 @@ function renderHeatmap(result) {
     const min = actualMin;
     const max = actualMax;
     for (let i = 0; i < lats.length; i++) {
-      const v = rsrp[i];
+      const v = window.RFTerrainParams
+        ? RFTerrainParams.pickSampleMetric(grid, i, layer)
+        : rsrp[i];
+      if (!Number.isFinite(v)) continue;
       const color = rsrpToColor(v, min, max);
       L.circle([lats[i], lons[i]], {
         radius: 10,
@@ -1780,12 +1983,13 @@ function renderHeatmap(result) {
     }
   }
 
-  if (result.snapped_tx) {
-    map.setView([result.snapped_tx.lat, result.snapped_tx.lon], map.getZoom());
+  const viewTx = result.snapped_tx || result.original_point;
+  if (viewTx && Number.isFinite(viewTx.lat) && Number.isFinite(viewTx.lon)) {
+    map.setView([viewTx.lat, viewTx.lon], map.getZoom());
   }
 
-  if (result.sectors && result.sectors.length > 0 && result.snapped_tx) {
-    drawSectorVisualization(result.sectors, result.snapped_tx, result.grid);
+  if (result.sectors && result.sectors.length > 0 && viewTx) {
+    drawSectorVisualization(result.sectors, viewTx, result.grid);
   }
 }
 
@@ -2094,3 +2298,86 @@ function displayPanorama(imgData, panoLocation) {
     <img src="${imgData}" style="width: 100%; display: block;" alt="360° Panorama" />
   `;
 }
+
+// Same session keys as /3d (planner_3d.js): one queue for open tabs.
+const REMOTE_PLAN_POLL_MS = 1500;
+const REMOTE_PLAN_SEQ_STORAGE_KEY = "rfplanner3d_remote_plan_seq";
+const REMOTE_PLAN_BOOT_STORAGE_KEY = "rfplanner3d_remote_plan_boot_utc";
+
+function startRemotePlanRfPolling2d() {
+  let lastSeq = 0;
+  try {
+    const raw = sessionStorage.getItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
+    if (raw) lastSeq = Math.max(0, Number(raw) || 0);
+  } catch { /* ignore */ }
+
+  const tick = async () => {
+    try {
+      const r = await fetch(
+        `/api/ui/remote-plan-rf/poll?since_seq=${encodeURIComponent(String(lastSeq))}`
+      );
+      if (!r.ok) return;
+      const j = await r.json();
+      let storedBoot = "";
+      const boot = String(j.server_boot_utc || "");
+      try {
+        storedBoot = sessionStorage.getItem(REMOTE_PLAN_BOOT_STORAGE_KEY) || "";
+      } catch { /* ignore */ }
+      if (storedBoot && boot && storedBoot !== boot) {
+        try {
+          sessionStorage.setItem(REMOTE_PLAN_BOOT_STORAGE_KEY, boot);
+          lastSeq = 0;
+          sessionStorage.removeItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
+        } catch { /* ignore */ }
+        return;
+      }
+      if (boot && !storedBoot) {
+        try {
+          sessionStorage.setItem(REMOTE_PLAN_BOOT_STORAGE_KEY, boot);
+          lastSeq = 0;
+          sessionStorage.removeItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
+        } catch { /* ignore */ }
+        return;
+      }
+      const seq = Number(j.seq) || 0;
+      if (!j.new || seq <= lastSeq) return;
+      lastSeq = seq;
+      try {
+        sessionStorage.setItem(REMOTE_PLAN_SEQ_STORAGE_KEY, String(lastSeq));
+      } catch { /* ignore */ }
+      if (j.status === "ready" && j.plan && typeof j.plan === "object") {
+        const plan = j.plan;
+        if (String(plan.mode || "") === "3d_rt") {
+          setStatus("Remote result is 3d_rt (path trace). Open /3d to view. Use POST /api/plan (coverage) for 2D heatmap here.");
+          return;
+        }
+        console.info("RFPlanner2D remote poll apply", { seq, plan });
+        const newHeatmapLayerGroup = L.layerGroup().addTo(map);
+        heatmapLayerGroups.push(newHeatmapLayerGroup);
+        window.currentHeatmapLayerGroup = newHeatmapLayerGroup;
+        const olat = plan.original_point?.lat ?? plan.snapped_tx?.lat;
+        const olon = plan.original_point?.lon ?? plan.snapped_tx?.lon;
+        if (Number.isFinite(olat) && Number.isFinite(olon)) {
+          map.setView([olat, olon], map.getZoom() || 15);
+        }
+        applyServerPlanTo2dView(plan, { statusMessage: "Remote plan applied to 2D map (from API / poll)." });
+        const ola = plan.original_point?.lat ?? plan.snapped_tx?.lat;
+        const olo = plan.original_point?.lon ?? plan.snapped_tx?.lon;
+        const cacheCenter = Number.isFinite(ola) && Number.isFinite(olo) ? { lat: ola, lon: olo } : { lat: 0, lon: 0 };
+        planResults.push({ lat: ola, lon: olo, out: plan, data: plan, cacheCenter });
+      } else if (j.status === "error" && j.error) {
+        const er = j.error;
+        const detail =
+          er.detail != null
+            ? (typeof er.detail === "object" ? JSON.stringify(er.detail) : String(er.detail))
+            : JSON.stringify(er);
+        setStatus(`Remote Plan RF failed (HTTP ${er.status_code ?? "?"}): ${detail}`);
+      }
+    } catch { /* transient */ }
+  };
+
+  setInterval(tick, REMOTE_PLAN_POLL_MS);
+  tick();
+}
+
+startRemotePlanRfPolling2d();

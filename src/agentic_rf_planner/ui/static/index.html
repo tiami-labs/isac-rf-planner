@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Agentic RF Planner</title>
   <link
     rel="stylesheet"
@@ -13,77 +14,145 @@
   <div id="sidebar">
     <h2>RF Planner</h2>
     <div id="status">Click on the map to start.</div>
-    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #444;">
-      <h3 style="font-size: 14px; margin-bottom: 10px;">Ray Mode</h3>
 
-      <div style="margin-bottom: 10px;">
-        <label for="ray-mode" style="display: block; font-size: 11px; margin-bottom: 3px;">Propagation:</label>
-        <select
-          id="ray-mode"
-          style="width: 100%; padding: 6px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
-        >
-          <option value="2d">2D (OSM geometry)</option>
-          <option value="3d" selected>3D (Google mesh + OSM semantics)</option>
-          <option value="3d_osm">3D (OSM only)</option>
-          <option value="3d_rt">3D RT (Google mesh)</option>
-          <option value="3d_rt_osm">3D RT (OSM collision)</option>
+    <div class="rf-sidebar-section rf-address-lookup-section">
+      <h3 class="rf-sidebar-h3">Go to address</h3>
+      <div class="rf-field-block">
+        <label class="rf-label" for="address-lookup-input">Address or lat,lon</label>
+        <input id="address-lookup-input" class="rf-input" type="search" enterkeyhint="search"
+          placeholder="Sacramento CA or 38.63,-121.51" autocomplete="off" />
+      </div>
+      <div class="rf-address-row">
+        <button type="button" id="address-lookup-go" class="rf-btn rf-btn-primary">Go</button>
+        <select id="address-lookup-mode" class="rf-select rf-address-mode-select" aria-label="Lookup action">
+          <option value="navigate" selected>Navigate</option>
+          <option value="set_tx">Navigate + set TX</option>
         </select>
       </div>
+      <div id="address-lookup-results" class="rf-address-results" hidden></div>
+    </div>
 
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+    <div class="rf-sidebar-section">
+      <h3 class="rf-sidebar-h3">Propagation</h3>
+      <div class="rf-field-block">
+        <label class="rf-label" for="ray-mode">Mode</label>
+        <select id="ray-mode" class="rf-select">
+          <option value="2d" selected>2D (OSM geometry)</option>
+          <option value="3d_rt_osm">2D RT (OSM multipath)</option>
+        </select>
+      </div>
+      <div class="rf-field-grid">
         <div>
-          <label for="tx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">TX height (m)</label>
-          <input
-            type="number"
-            id="tx-height-m"
-            step="0.5"
-            value="10.0"
-            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
-          />
+          <label class="rf-label" for="tx-height-m">TX height (m)</label>
+          <input type="number" id="tx-height-m" class="rf-input" step="0.5" value="10.0" />
         </div>
         <div>
-          <label for="rx-height-m" style="display: block; font-size: 11px; margin-bottom: 3px;">RX height (m)</label>
-          <input
-            type="number"
-            id="rx-height-m"
-            step="0.1"
-            value="1.5"
-            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px;"
-          />
+          <label class="rf-label" for="rx-height-m">RX height (m)</label>
+          <input type="number" id="rx-height-m" class="rf-input" step="0.1" value="1.5" />
         </div>
       </div>
+      <div id="mesh-profile-status" class="rf-mesh-hint"></div>
+    </div>
 
-      <div id="mesh-profile-status" style="margin-top: 10px; font-size: 11px; color: #bbb;">
-        3D requires a cached mesh ray-profile for this TX/height/range.
+    <div class="rf-sidebar-section" id="terrain-environment-section">
+      <h3 class="rf-sidebar-h3">Terrain and Environment</h3>
+      <label class="rf-check-row">
+        <input type="checkbox" id="terrain-enabled" checked />
+        Terrain-aware propagation
+      </label>
+      <div class="rf-field-block">
+        <label class="rf-label" for="dem-source">DEM source</label>
+        <select id="dem-source" class="rf-select">
+          <option value="auto" selected>Auto</option>
+          <option value="google">Google elevation</option>
+          <option value="opentopodata">SRTM / NASADEM (OpenTopoData)</option>
+          <option value="flat">Flat (disabled)</option>
+        </select>
+      </div>
+      <div class="rf-field-grid">
+        <div>
+          <label class="rf-label" for="terrain-resolution-m">Terrain resolution (m)</label>
+          <input type="number" id="terrain-resolution-m" class="rf-input" step="1" value="30" />
+        </div>
+        <div>
+          <label class="rf-label" for="fresnel-min-clearance">Fresnel clearance</label>
+          <input type="number" id="fresnel-min-clearance" class="rf-input" step="0.1" value="0.6" />
+        </div>
+        <div>
+          <label class="rf-label" for="earth-curvature-k">Earth k-factor</label>
+          <input type="number" id="earth-curvature-k" class="rf-input" step="0.01" value="1.333" />
+        </div>
+        <div>
+          <label class="rf-label" for="terrain-loss-cap-db">Terrain loss cap (dB)</label>
+          <input type="number" id="terrain-loss-cap-db" class="rf-input" step="1" value="40" />
+        </div>
+      </div>
+      <label class="rf-check-row">
+        <input type="checkbox" id="buildings-on-terrain" checked />
+        Buildings on terrain
+      </label>
+      <label class="rf-check-row">
+        <input type="checkbox" id="landcover-clutter-enabled" checked />
+        Land-cover clutter
+      </label>
+    </div>
+
+    <div class="rf-sidebar-section">
+      <h3 class="rf-sidebar-h3">Coverage rendering</h3>
+      <div class="rf-field-block">
+        <label class="rf-label" for="coverage-display-layer">Display layer</label>
+        <select id="coverage-display-layer" class="rf-select">
+          <option value="rsrp" selected>RSRP</option>
+          <option value="sinr">SINR</option>
+          <option value="terrain_shadow">Terrain shadow / loss</option>
+        </select>
       </div>
     </div>
 
-    
-    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
-      <h3 style="font-size: 14px; margin-bottom: 10px;">TX Coordinates</h3>
+    <div id="rt-controls-section" class="rf-sidebar-section" style="display: none;" aria-label="2D multipath ray trace">
+      <h3 class="rf-sidebar-h3">Multipath ray trace</h3>
+      <p class="rf-sidebar-sub">Map plane (OSM)</p>
+      <p class="rf-sidebar-muted">Click: place TX → move mouse to steer → second click confirms direction. Shift+click places RX.</p>
+      <div class="rf-rt-range-grid">
+        <label>Ray count <span id="rt-ray-count-val">121</span></label>
+        <input id="rt-ray-count" type="range" min="1" max="721" step="2" value="121" />
+        <label>Spread <span id="rt-spread-val">50</span>°</label>
+        <input id="rt-spread" type="range" min="0" max="180" value="50" />
+        <label>Max bounces <span id="rt-bounces-val">4</span></label>
+        <input id="rt-bounces" type="range" min="0" max="12" value="4" />
+        <label>Max range <span id="rt-range-val">500</span> m</label>
+        <input id="rt-range" type="range" min="50" max="2000" step="10" value="500" />
+        <label>RX radius <span id="rt-rx-val">8</span> m</label>
+        <input id="rt-rx" type="range" min="2" max="30" step="1" value="8" />
+      </div>
+      <div class="rf-btn-row">
+        <button id="rt-launch-btn" type="button" class="rf-btn rf-btn-primary">Launch rays</button>
+        <button id="rt-autoaim-btn" type="button" class="rf-btn rf-btn-secondary">Auto-aim RX</button>
+        <button id="rt-preview-btn" type="button" class="rf-btn rf-btn-secondary">Load OSM preview</button>
+        <button id="rt-clear-btn" type="button" class="rf-btn rf-btn-muted">Clear rays</button>
+      </div>
+      <div id="rt-angle" class="rf-rt-meta">Steer: <code>0.0°</code></div>
+      <div id="rt-scene" class="rf-rt-meta">Scene: <code>not loaded</code></div>
+      <div id="rt-stats" class="rf-rt-meta">No trace yet.</div>
+    </div>
+
+    <div class="rf-sidebar-section">
+      <h3 class="rf-sidebar-h3">TX queue</h3>
       <form id="coord-form" style="display: flex; flex-direction: column; gap: 8px;">
         <div>
-          <label for="tx-input" style="display: block; font-size: 11px; margin-bottom: 3px;">One `lat,lon` per line</label>
+          <label class="rf-label" for="tx-input">One `lat,lon` per line</label>
           <textarea
             id="tx-input"
+            class="rf-input"
             rows="7"
             spellcheck="false"
             placeholder="32.756017,-97.083172&#10;32.752995,-97.081749"
-            style="width: 100%; padding: 5px; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; font-size: 12px; resize: vertical; font-family: monospace;"
+            style="resize: vertical; font-family: monospace;"
           ></textarea>
-          <div style="margin-top: 5px; font-size: 10px; color: #aaa;">
-            Paste multiple TX points here. Clicking the map appends another line.
-          </div>
-          <div id="tx-input-summary" style="margin-top: 5px; font-size: 10px; color: #bbb;"></div>
+          <p class="rf-sidebar-muted-sm">Paste multiple TX points here. Clicking the map appends another line.</p>
+          <div id="tx-input-summary" class="rf-sidebar-muted-sm"></div>
         </div>
-        <button 
-          type="submit" 
-          style="padding: 8px; background: #0066cc; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; font-weight: bold;"
-          onmouseover="this.style.background='#0052a3'"
-          onmouseout="this.style.background='#0066cc'"
-        >
-          Plan RF Queue
-        </button>
+        <button type="submit" class="rf-plan-submit">Plan RF Queue</button>
       </form>
 
       <details open style="margin-top: 10px;">
@@ -243,8 +312,8 @@
       </details>
     </div>
     
-    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
-      <h3 style="font-size: 14px; margin-bottom: 10px;">Sector Configuration</h3>
+    <div class="rf-sidebar-section">
+      <h3 class="rf-sidebar-h3">Sector configuration</h3>
       <div id="sectors-container" style="display: flex; flex-direction: column; gap: 10px;">
         <!-- Sectors will be added here dynamically -->
       </div>
@@ -262,7 +331,7 @@
       </div>
     </div>
     
-    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
+    <div class="rf-sidebar-section">
       <div style="margin-bottom: 10px;">
         <label style="display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer;">
           <input 
@@ -322,6 +391,8 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="/export_utils.js"></script>
+  <script src="/geocode_nav.js"></script>
+  <script src="/terrain_params.js"></script>
   <script src="./app.js"></script>
   <script src="/integrated_2d_raytrace.js"></script>
 </body>
