@@ -76,14 +76,14 @@ def main() -> None:
     # Load RF params (all knobs from rf.params.yaml; CLI args override where provided)
     rf_cfg = cfg.get("rf", {})
     ray_mode = args.ray_mode if args.ray_mode is not None else rf_cfg.get("ray_mode", "2d")
-    tx_height_m = args.tx_height_m if args.tx_height_m is not None else rf_cfg.get("tx_height_m", 0.0)
+    tx_height_m = args.tx_height_m if args.tx_height_m is not None else rf_cfg.get("tx_height_m", 10.0)
     rx_height_m = args.rx_height_m if args.rx_height_m is not None else rf_cfg.get("rx_height_m", 1.5)
     rf_params = RFParams(
         freq_mhz=rf_cfg.get("freq_mhz", 3500.0),
         tx_power_dbm=rf_cfg.get("tx_power_dbm", 30.0),
         noise_floor_dbm=rf_cfg.get("noise_floor_dbm"),
         noise_figure_db=rf_cfg.get("noise_figure_db", 7.0),
-        max_range_m=rf_cfg.get("max_range_m", 2000.0),
+        max_range_m=rf_cfg.get("max_range_m", 2500.0),
         step_m=rf_cfg.get("step_m", 5.0),
         dtheta_deg=rf_cfg.get("dtheta_deg", 5.0),
         subcarrier_spacing_khz=rf_cfg.get("subcarrier_spacing_khz", 15.0),
