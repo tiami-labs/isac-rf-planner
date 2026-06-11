@@ -18,6 +18,7 @@ rx_height_m: 1.5  # RX height above ground (m)
 # --- Macro 5G NR RSRP calibration ---
 # tx_power_dbm is total carrier power, not direct RSRP source power.
 # These convert total carrier power into a conservative reference-signal source term.
+tx_chain_gain_db: 0.0
 tx_antenna_gain_dbi: 17.0
 tx_feeder_loss_db: 2.0
 reference_signal_offset_db: -18.0
