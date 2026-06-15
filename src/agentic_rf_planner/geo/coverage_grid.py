@@ -128,7 +128,7 @@ def build_coverage_grid(
     from ..rf.material_penetration import get_penetration_loss_for_material, is_material_blocking
     from ..rf.attenuation_models import (
         _horizontal_pattern_attenuation_db,
-        _reference_signal_eirp_dbm,
+        _transmit_source_eirp_dbm,
         _resolve_sector_params,
         _scenario_path_loss_db,
         _vertical_pattern_attenuation_db,
@@ -261,13 +261,19 @@ def build_coverage_grid(
             logger.warning("Terrain prefetch failed: %s", exc)
             terrain_on = False
 
-    z_tx_ground_m = 0.0
-    z_tx_abs_m = float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
-    if terrain_on:
+    configured_site_altitude_m = getattr(rf_params, "site_altitude_m", None)
+    z_tx_ground_m = (
+        float(configured_site_altitude_m) if configured_site_altitude_m is not None else 0.0
+    )
+    z_tx_abs_m = z_tx_ground_m + float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
+    if terrain_on and configured_site_altitude_m is None:
         z_tx_ground_m = float(terrain_provider.elevation_m(tx.lat, tx.lon))
         z_tx_abs_m = z_tx_ground_m + float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
 
-    store_building_lists = ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
+    store_building_lists = (
+        ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
+        and str(getattr(rf_params, "technology", "5g_nr") or "5g_nr").strip().lower() != "dvt"
+    )
 
     # Generate cells for each sector.
     #
@@ -293,7 +299,7 @@ def build_coverage_grid(
         sector_freq_mhz = sector.freq_mhz
         sector_tx_power_dbm = sector.tx_power_dbm
         g_sector = getattr(sector, "tx_antenna_gain_dbi", None)
-        sector_rs_eirp_dbm = _reference_signal_eirp_dbm(
+        sector_rs_eirp_dbm = _transmit_source_eirp_dbm(
             rf_params,
             tx_power_dbm_override=sector_tx_power_dbm,
             tx_antenna_gain_dbi=(float(g_sector) if g_sector is not None else None),
@@ -470,6 +476,8 @@ def build_coverage_grid(
                         except Exception:
                             forest_intervals = []
 
+                forest_intervals.sort(key=lambda item: item["start_m"])
+
                 # Precompute wood loss constant for active vegetation intervals.
                 wood_loss_db = (
                     get_penetration_loss_for_material("wood", sector_freq_mhz, attenuation_config=bldg_atten_cfg)
@@ -518,53 +526,62 @@ def build_coverage_grid(
                     clutter_h = 0.0
                 terrain_cap = float(getattr(rf_params, "terrain_loss_cap_db", 40.0) or 40.0)
 
+                # Exact event sweep: update only intervals that start/end at this sample
+                # instead of rescanning every polygon interval for every radial cell.
+                building_end_events = sorted(building_intervals, key=lambda item: item["end_m"])
+                forest_end_events = sorted(forest_intervals, key=lambda item: item["end_m"])
+                all_end_events = sorted(
+                    building_intervals + forest_intervals, key=lambda item: item["end_m"]
+                )
+                active_buildings: list[dict[str, Any]] = []
+                active_forest: list[dict[str, Any]] = []
+                exited_intervals: list[dict[str, Any]] = []
+                next_building_end_idx = 0
+                next_forest_start_idx = 0
+                next_forest_end_idx = 0
+                next_any_end_idx = 0
+                first_blocker_start_m = min(
+                    [float(item["start_m"]) for item in building_intervals + forest_intervals],
+                    default=None,
+                )
+                last_exit_distance_m = None
+
                 while r <= max_r:
                     lat, lon = _project_from_tx(tx.lat, tx.lon, r, theta)
+                    sample_limit_m = r + 1e-6
 
-                    while next_hit_idx < len(building_intervals) and building_intervals[next_hit_idx]["start_m"] <= (r + 1e-6):
+                    while next_hit_idx < len(building_intervals) and building_intervals[next_hit_idx]["start_m"] <= sample_limit_m:
                         interval = building_intervals[next_hit_idx]
+                        active_buildings.append(interval)
                         if interval["is_blocking"]:
                             metal_blocked = True
                         if encountered_buildings is not None:
                             encountered_buildings.append(interval["building"])
                         next_hit_idx += 1
+                    while next_building_end_idx < len(building_end_events) and building_end_events[next_building_end_idx]["end_m"] <= sample_limit_m:
+                        ended = building_end_events[next_building_end_idx]
+                        active_buildings = [item for item in active_buildings if item is not ended]
+                        next_building_end_idx += 1
 
-                    active_buildings = [
-                        interval
-                        for interval in building_intervals
-                        if interval["start_m"] <= (r + 1e-6) < interval["end_m"]
-                    ]
-                    active_forest = [
-                        interval
-                        for interval in forest_intervals
-                        if interval["start_m"] <= (r + 1e-6) < interval["end_m"]
-                    ]
-                    all_started = [
-                        interval["start_m"]
-                        for interval in building_intervals
-                        if interval["start_m"] <= (r + 1e-6)
-                    ] + [
-                        interval["start_m"]
-                        for interval in forest_intervals
-                        if interval["start_m"] <= (r + 1e-6)
-                    ]
-                    all_exited = [
-                        interval["end_m"]
-                        for interval in building_intervals
-                        if interval["end_m"] <= (r + 1e-6)
-                    ] + [
-                        interval["end_m"]
-                        for interval in forest_intervals
-                        if interval["end_m"] <= (r + 1e-6)
-                    ]
-                    exited_intervals = [
-                        interval
-                        for interval in (building_intervals + forest_intervals)
-                        if interval["end_m"] <= (r + 1e-6)
-                    ]
+                    while next_forest_start_idx < len(forest_intervals) and forest_intervals[next_forest_start_idx]["start_m"] <= sample_limit_m:
+                        active_forest.append(forest_intervals[next_forest_start_idx])
+                        next_forest_start_idx += 1
+                    while next_forest_end_idx < len(forest_end_events) and forest_end_events[next_forest_end_idx]["end_m"] <= sample_limit_m:
+                        ended = forest_end_events[next_forest_end_idx]
+                        active_forest = [item for item in active_forest if item is not ended]
+                        next_forest_end_idx += 1
 
-                    first_blocker_distance_m = min(all_started) if all_started else None
-                    last_exit_distance_m = max(all_exited) if all_exited else None
+                    while next_any_end_idx < len(all_end_events) and all_end_events[next_any_end_idx]["end_m"] <= sample_limit_m:
+                        ended = all_end_events[next_any_end_idx]
+                        exited_intervals.append(ended)
+                        last_exit_distance_m = float(ended["end_m"])
+                        next_any_end_idx += 1
+
+                    first_blocker_distance_m = (
+                        first_blocker_start_m
+                        if first_blocker_start_m is not None and first_blocker_start_m <= sample_limit_m
+                        else None
+                    )
                     penetration_loss_db = (
                         sum(float(interval["penetration_loss_db"]) for interval in active_buildings)
                         + len(active_forest) * wood_loss_db
@@ -787,8 +804,20 @@ def build_coverage_grid(
                             lon=lon,
                             distance_m=r,
                             bearing_deg=theta,
-                            dominant_material=MaterialType.UNKNOWN,
-                            obstacles_count=0,
+                            dominant_material=(
+                                MaterialType.TREES
+                                if next_forest_start_idx > 0
+                                else (
+                                    MaterialType.LARGE_STRUCTURE
+                                    if next_hit_idx >= 3
+                                    else (
+                                        MaterialType.BUILDING
+                                        if next_hit_idx >= 2
+                                        else (MaterialType.HOUSE if next_hit_idx == 1 else MaterialType.UNKNOWN)
+                                    )
+                                )
+                            ),
+                            obstacles_count=next_hit_idx + next_forest_start_idx,
                             extra_loss_db=extra_loss_db,
                             sector_id=sector.sector_id,
                             sector_freq_mhz=sector_freq_mhz,
@@ -806,8 +835,8 @@ def build_coverage_grid(
                             sector_pci=getattr(sector, "pci", None),
                             is_los=is_los,
                             actual_path_length_m=r,
-                            num_buildings=sum(1 for interval in building_intervals if interval["start_m"] <= (r + 1e-6)),
-                            num_trees=sum(1 for interval in forest_intervals if interval["start_m"] <= (r + 1e-6)),
+                            num_buildings=next_hit_idx,
+                            num_trees=next_forest_start_idx,
                             blocking_state=("los" if is_los else ("penetration" if penetration_loss_db > 0.0 else "shadow")),
                             propagation_mode=(
                                 "los"
@@ -830,6 +859,7 @@ def build_coverage_grid(
                             canyon_recovery_db=canyon_recovery_db,
                             metal_blocked=metal_blocked,
                             buildings_along_path=(list(encountered_buildings) if encountered_buildings is not None else []),
+                            coverage_precomputed=True,
 
                             precomputed_rsrp_dbm=(estimated_rsrp_total if multipath_enabled else None),
                             z_ground_m=z_ground_m,
