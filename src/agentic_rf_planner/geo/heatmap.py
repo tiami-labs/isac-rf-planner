@@ -9,6 +9,7 @@ Performance notes:
 import base64
 import io
 import logging
+import math
 from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
@@ -246,6 +247,95 @@ def attenuation_grid_to_png_ellipse(
         "vmax": vmax_used,
         "actual_min": actual_min,
         "actual_max": actual_max,
+    }
+
+
+def attenuation_grid_to_png_metric(
+    grid: AttenuationGrid,
+    size: Optional[int] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    alpha: float = 0.70,
+    rsrp_values: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Render a dense metric-grid coverage field 1:1 (step_m pixels) for map-aligned drape.
+    """
+    rsrp_src = rsrp_values if rsrp_values is not None else grid.rsrp_dbm
+    if not grid.cell_lat or not grid.cell_lon or not rsrp_src:
+        raise ValueError("Empty attenuation grid")
+
+    dr = float(getattr(grid.rf_params, "step_m", 5.0) or 5.0)
+    radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
+    if radius_m <= 0.0 or dr <= 0.0:
+        raise ValueError("max_range_m and step_m must be > 0 for metric PNG")
+
+    n = int(math.ceil(radius_m / dr))
+    if size is None:
+        size = 2 * n + 1
+    tx_lat = float(grid.tx.lat)
+    tx_lon = float(grid.tx.lon)
+    earth_m = 6371000.0
+    lat0 = math.radians(tx_lat)
+
+    rsrp = np.full((size, size), np.nan, dtype=np.float32)
+    for idx, (lat, lon) in enumerate(zip(grid.cell_lat, grid.cell_lon)):
+        east = math.radians(float(lon) - tx_lon) * math.cos(lat0) * earth_m
+        north = math.radians(float(lat) - tx_lat) * earth_m
+        j = int(round(east / dr)) + n
+        i = n - int(round(north / dr))
+        if 0 <= i < size and 0 <= j < size:
+            rsrp[i, j] = float(rsrp_src[idx])
+
+    yy, xx = np.mgrid[0:size, 0:size]
+    x_m = (xx / max(1, size - 1) - 0.5) * (2.0 * radius_m)
+    y_m = ((size - 1 - yy) / max(1, size - 1) - 0.5) * (2.0 * radius_m)
+    circle_mask = (x_m * x_m + y_m * y_m) <= (radius_m * radius_m)
+    rsrp[~circle_mask] = np.nan
+
+    finite = np.isfinite(rsrp)
+    if not np.any(finite):
+        vmin_used = float(vmin) if vmin is not None else -140.0
+        vmax_used = float(vmax) if vmax is not None else -60.0
+        actual_min, actual_max = vmin_used, vmax_used
+    else:
+        actual_min = float(np.nanmin(rsrp))
+        actual_max = float(np.nanmax(rsrp))
+        vmin_used = float(np.nanmin(rsrp)) if vmin is None else float(vmin)
+        vmax_used = float(np.nanmax(rsrp)) if vmax is None else float(vmax)
+        if not np.isfinite(vmin_used) or not np.isfinite(vmax_used) or vmax_used <= vmin_used:
+            vmin_used, vmax_used = -140.0, -60.0
+
+    rgba = _colorize_rsrp(rsrp, vmin_used, vmax_used, alpha=alpha)
+    feather_m = max(30.0, radius_m * 0.03)
+    r_pix = np.sqrt(x_m * x_m + y_m * y_m)
+    fade = np.clip((radius_m - r_pix) / feather_m, 0.0, 1.0)
+    rgba[..., 3] = np.clip(
+        np.rint(rgba[..., 3].astype(np.float64) * fade).astype(np.int32), 0, 255
+    ).astype(np.uint8)
+
+    try:
+        from PIL import Image
+        img = Image.fromarray(rgba, mode="RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        data_url = f"data:image/png;base64,{b64}"
+    except Exception as e:
+        logger.exception("Failed to encode metric heatmap PNG: %s", e)
+        raise
+
+    return {
+        "png_b64": data_url,
+        "width": int(size),
+        "height": int(size),
+        "radius_m": radius_m,
+        "vmin": vmin_used,
+        "vmax": vmax_used,
+        "actual_min": actual_min,
+        "actual_max": actual_max,
+        "grid_mode": "metric",
+        "step_m": dr,
     }
 
 

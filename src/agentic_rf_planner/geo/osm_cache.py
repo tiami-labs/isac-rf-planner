@@ -2,42 +2,22 @@
 
 import json
 import logging
-import hashlib
-import math
-import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 
 from ..pipeline.schemas import LatLon
+from .persistent_cache import OSM_NAMESPACE, haversine_m, is_path_fresh, region_cache_key
 
 logger = logging.getLogger(__name__)
 
-# Cache directory (in user's home directory to avoid permission issues)
-CACHE_DIR = Path.home() / ".rf_planning_cache" / "osm_data"
-CACHE_EXPIRY_DAYS = 30  # Cache expires after 30 days
+CACHE_DIR = OSM_NAMESPACE.root
+CACHE_EXPIRY_DAYS = OSM_NAMESPACE.expiry_days
 
 
 def _get_cache_key(center: LatLon, radius_m: float) -> str:
-    """
-    Generate a cache key for a region.
-    
-    Uses a grid-based approach: rounds coordinates to ~100m grid cells
-    and radius to nearest 50m to maximize cache hits.
-    """
-    # Round to ~100m grid (approximately 0.001 degrees at mid-latitudes)
-    grid_size_deg = 0.001
-    lat_grid = round(center.lat / grid_size_deg) * grid_size_deg
-    lon_grid = round(center.lon / grid_size_deg) * grid_size_deg
-    
-    # Round radius to nearest 50m
-    radius_grid = round(radius_m / 50.0) * 50.0
-    
-    # Create hash of the grid cell
-    key_str = f"{lat_grid:.6f}_{lon_grid:.6f}_{radius_grid:.0f}"
-    key_hash = hashlib.md5(key_str.encode()).hexdigest()
-    
-    return key_hash
+    """Generate a cache key for a region (grid-bucketed for reuse)."""
+    return region_cache_key(center.lat, center.lon, radius_m)
 
 
 def _get_cache_path(cache_key: str, data_type: str) -> Path:
@@ -48,33 +28,18 @@ def _get_cache_path(cache_key: str, data_type: str) -> Path:
 
 def _is_cache_valid(cache_path: Path) -> bool:
     """Check if cache file exists and is not expired."""
-    try:
+    if not is_path_fresh(cache_path, CACHE_EXPIRY_DAYS):
         if not cache_path.exists():
             logger.debug(f"Cache file does not exist: {cache_path}")
-            return False
-        
-        # Check file age
-        file_age = datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)
-        if file_age > timedelta(days=CACHE_EXPIRY_DAYS):
-            logger.debug(f"Cache expired: {cache_path} (age: {file_age.days} days)")
-            return False
-        
-        logger.debug(f"Cache file is valid: {cache_path} (age: {file_age.total_seconds():.1f} seconds)")
-        return True
-    except Exception as e:
-        logger.warning(f"Error checking cache validity for {cache_path}: {e}")
+        else:
+            logger.debug(f"Cache expired: {cache_path}")
         return False
+    logger.debug(f"Cache file is valid: {cache_path}")
+    return True
 
 
 def _distance_m(a: LatLon, b: LatLon) -> float:
-    """Approximate great-circle distance in meters."""
-    r = 6371000.0
-    lat1 = math.radians(a.lat)
-    lat2 = math.radians(b.lat)
-    dlat = math.radians(b.lat - a.lat)
-    dlon = math.radians(b.lon - a.lon)
-    h = math.sin(dlat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
-    return 2.0 * r * math.atan2(math.sqrt(h), math.sqrt(max(0.0, 1.0 - h)))
+    return haversine_m(a.lat, a.lon, b.lat, b.lon)
 
 
 def _load_cache_payload(cache_path: Path) -> Optional[Dict]:
@@ -158,7 +123,11 @@ def load_cached_osm_data(center: LatLon, radius_m: float, data_type: str) -> Opt
         except Exception:
             continue
         distance_m = _distance_m(center, candidate_center)
-        if distance_m > max(radius_m, candidate_radius):
+        # A nearby cache is reusable only when its covered circle fully contains
+        # the requested circle. This prevents a small (for example 2 km) cache
+        # from being silently relabelled as a much larger (for example 20 km)
+        # planning region.
+        if distance_m + float(radius_m) > candidate_radius:
             continue
         if best_distance_m is None or distance_m < best_distance_m:
             best_payload = payload

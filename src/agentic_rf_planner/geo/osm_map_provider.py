@@ -3,7 +3,7 @@
 import logging
 import math
 import time
-from typing import List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict
 
 import requests
 
@@ -20,6 +20,11 @@ OVERPASS_URLS = (
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 )
+
+# Large planning regions are partitioned into exact, non-simplified Overpass
+# bounding boxes. A 20 km radius becomes a 4x4 set of 10 km-wide boxes.
+OSM_MAX_TILE_HALF_SIZE_M = 5000.0
+OSM_TILED_PREFETCH_THRESHOLD_M = 7500.0
 
 OVERPASS_HEADERS = {
     "User-Agent": "agentic-rf-planner/1.0 (+local)",
@@ -116,6 +121,139 @@ def _estimate_osm_height_m(tags: dict) -> Optional[float]:
     return None
 
 
+def _offset_latlon(center: LatLon, east_m: float, north_m: float) -> LatLon:
+    """Offset a point in a local tangent-plane approximation."""
+
+    lat = center.lat + north_m / 111_320.0
+    lon_scale = max(1.0e-6, 111_320.0 * math.cos(math.radians(center.lat)))
+    lon = center.lon + east_m / lon_scale
+    return LatLon(lat=lat, lon=lon)
+
+
+def _tile_centers_for_square(center: LatLon, radius_m: float) -> List[Tuple[LatLon, float]]:
+    """Return square tiles whose union covers the requested radius bounding square.
+
+    The boxes are adjacent and do not simplify or resample OSM geometry. Fetching
+    the complete bounding square intentionally includes a small amount of data
+    outside the circular RF service area so no edge features are missed.
+    """
+
+    radius = max(1.0, float(radius_m))
+    tiles_per_axis = max(1, int(math.ceil(radius / OSM_MAX_TILE_HALF_SIZE_M)))
+    cell_width_m = (2.0 * radius) / tiles_per_axis
+    half_size_m = cell_width_m / 2.0
+    out: List[Tuple[LatLon, float]] = []
+    for yi in range(tiles_per_axis):
+        north_m = -radius + half_size_m + yi * cell_width_m
+        for xi in range(tiles_per_axis):
+            east_m = -radius + half_size_m + xi * cell_width_m
+            out.append((_offset_latlon(center, east_m=east_m, north_m=north_m), half_size_m))
+    return out
+
+
+def _coord_key(point: dict) -> Tuple[float, float]:
+    return (round(float(point.get("lat", 0.0)), 7), round(float(point.get("lon", 0.0)), 7))
+
+
+def _stitch_relation_rings(segments: List[List[dict]]) -> List[List[dict]]:
+    """Stitch Overpass relation-member geometry into closed outer rings."""
+
+    remaining = [list(seg) for seg in segments if len(seg) >= 2]
+    rings: List[List[dict]] = []
+    while remaining:
+        ring = remaining.pop(0)
+        progressed = True
+        while progressed and remaining and _coord_key(ring[0]) != _coord_key(ring[-1]):
+            progressed = False
+            head = _coord_key(ring[0])
+            tail = _coord_key(ring[-1])
+            for idx, seg in enumerate(remaining):
+                seg_head = _coord_key(seg[0])
+                seg_tail = _coord_key(seg[-1])
+                if tail == seg_head:
+                    ring.extend(seg[1:])
+                elif tail == seg_tail:
+                    ring.extend(list(reversed(seg[:-1])))
+                elif head == seg_tail:
+                    ring = seg[:-1] + ring
+                elif head == seg_head:
+                    ring = list(reversed(seg[1:])) + ring
+                else:
+                    continue
+                remaining.pop(idx)
+                progressed = True
+                break
+        if len(ring) >= 3:
+            if _coord_key(ring[0]) != _coord_key(ring[-1]):
+                ring.append(dict(ring[0]))
+            rings.append(ring)
+    return rings
+
+
+def _element_polygons(element: dict) -> List[Tuple[int, List[dict]]]:
+    """Extract way or multipolygon outer rings with stable integer IDs."""
+
+    element_type = str(element.get("type") or "")
+    element_id = int(element.get("id") or 0)
+    geometry = element.get("geometry")
+    if element_type == "way" and isinstance(geometry, list) and len(geometry) >= 3:
+        return [(element_id, geometry)]
+    if element_type != "relation":
+        return []
+
+    outer_segments: List[List[dict]] = []
+    for member in element.get("members", []) or []:
+        role = str(member.get("role") or "outer").strip().lower()
+        member_geometry = member.get("geometry")
+        if role in ("", "outer") and isinstance(member_geometry, list) and len(member_geometry) >= 2:
+            outer_segments.append(member_geometry)
+    rings = _stitch_relation_rings(outer_segments)
+    return [(-(element_id * 1000 + idx + 1), ring) for idx, ring in enumerate(rings)]
+
+
+def _parse_overpass_elements(data: dict) -> Tuple[List[dict], List[dict]]:
+    buildings: List[dict] = []
+    landuse: List[dict] = []
+    for element in data.get("elements", []) or []:
+        tags = element.get("tags", {}) or {}
+        polygons = _element_polygons(element)
+        for feature_id, geometry in polygons:
+            base = {
+                "id": feature_id,
+                "osm_id": element.get("id"),
+                "osm_type": element.get("type"),
+                "tags": tags,
+                "geometry": geometry,
+            }
+            if "building" in tags:
+                building = dict(base)
+                building["material"] = _extract_building_material(building)
+                building["height_m"] = _estimate_osm_height_m(tags)
+                buildings.append(building)
+            if "landuse" in tags or "natural" in tags:
+                landuse.append(dict(base))
+    return buildings, landuse
+
+
+def _dedupe_osm_features(features: List[dict]) -> List[dict]:
+    out: List[dict] = []
+    seen: set[Tuple[Any, ...]] = set()
+    for feature in features:
+        geometry = feature.get("geometry") or []
+        first = _coord_key(geometry[0]) if geometry else (0.0, 0.0)
+        key = (
+            feature.get("osm_type"),
+            feature.get("osm_id", feature.get("id")),
+            feature.get("id"),
+            first,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(feature)
+    return out
+
+
 class OSMMapProvider(MapProvider):
     """
     Real MapProvider using OSM Overpass API.
@@ -197,7 +335,18 @@ class OSMMapProvider(MapProvider):
         # Handle cache hits/misses
         cache_hit_buildings = cached_buildings is not None
         cache_hit_landuse = cached_landuse is not None
-        
+
+        if radius_m > OSM_TILED_PREFETCH_THRESHOLD_M and not (cache_hit_buildings and cache_hit_landuse):
+            logger.info(
+                "Large OSM region (%.0f m): using exact tiled prefetch instead of one giant Overpass bbox",
+                radius_m,
+            )
+            tiled = self._fetch_tiled_osm_data(center, radius_m)
+            if tiled is not None:
+                cached_buildings, cached_landuse = tiled
+                cache_hit_buildings = True
+                cache_hit_landuse = True
+
         if cache_hit_buildings and cache_hit_landuse:
             logger.info(f"✓ Cache HIT (both): Loaded from persistent cache: {len(cached_buildings)} buildings, {len(cached_landuse)} landuse areas")
             self._cached_buildings = cached_buildings
@@ -316,6 +465,73 @@ class OSMMapProvider(MapProvider):
         
         logger.info(f"  Built landuse quadtree with {len(self._landuse_bboxes)} polygons")
     
+    def _fetch_tiled_osm_data(
+        self, center: LatLon, radius_m: float
+    ) -> Optional[Tuple[List[dict], List[dict]]]:
+        """Fetch a large region as cached, exact Overpass tiles."""
+
+        all_buildings: List[dict] = []
+        all_landuse: List[dict] = []
+        tiles = _tile_centers_for_square(center, radius_m)
+        logger.info("OSM tiled prefetch: %d tiles", len(tiles))
+
+        failed_tiles = 0
+        for index, (tile_center, half_size_m) in enumerate(tiles, start=1):
+            tile_buildings = load_cached_osm_data(tile_center, half_size_m, "buildings")
+            tile_landuse = load_cached_osm_data(tile_center, half_size_m, "landuse")
+            if tile_buildings is None or tile_landuse is None:
+                fetched = self._fetch_combined_osm_tile(tile_center, half_size_m)
+                if fetched is None:
+                    failed_tiles += 1
+                    logger.error("OSM tile %d/%d failed", index, len(tiles))
+                    continue
+                fetched_buildings, fetched_landuse = fetched
+                if tile_buildings is None:
+                    tile_buildings = fetched_buildings
+                    save_cached_osm_data(tile_center, half_size_m, "buildings", tile_buildings)
+                if tile_landuse is None:
+                    tile_landuse = fetched_landuse
+                    save_cached_osm_data(tile_center, half_size_m, "landuse", tile_landuse)
+            all_buildings.extend(tile_buildings or [])
+            all_landuse.extend(tile_landuse or [])
+            logger.info(
+                "OSM tile %d/%d complete: %d buildings, %d landuse",
+                index,
+                len(tiles),
+                len(tile_buildings or []),
+                len(tile_landuse or []),
+            )
+
+        if failed_tiles:
+            # Partial geometry would silently lower planning quality. Do not mark
+            # an incomplete large-area fetch as a successful prefetch.
+            logger.error("OSM tiled prefetch incomplete: %d/%d tiles failed", failed_tiles, len(tiles))
+            return None
+        return _dedupe_osm_features(all_buildings), _dedupe_osm_features(all_landuse)
+
+    def _fetch_combined_osm_tile(
+        self, center: LatLon, half_size_m: float
+    ) -> Optional[Tuple[List[dict], List[dict]]]:
+        bbox = _bbox_around_point(center.lat, center.lon, half_size_m)
+        query = f"""
+        [out:json][timeout:60];
+        (
+          way["building"]({bbox});
+          relation["building"]({bbox});
+          way["landuse"]({bbox});
+          way["natural"]({bbox});
+          relation["landuse"]({bbox});
+          relation["natural"]({bbox});
+        );
+        out geom;
+        """
+        try:
+            data = _post_overpass(query, timeout=75, context="tiled OSM fetch")
+            return _parse_overpass_elements(data)
+        except Exception as exc:
+            logger.error("Failed tiled OSM fetch for bbox %s: %s", bbox, exc)
+            return None
+
     def _fetch_buildings_from_osm(self, center: LatLon, radius_m: float) -> Optional[List[dict]]:
         """Fetch buildings directly from OSM (bypasses cache check)."""
         bbox = _bbox_around_point(center.lat, center.lon, radius_m)
@@ -337,18 +553,8 @@ class OSMMapProvider(MapProvider):
             
             logger.debug(f"OSM API response: {len(data.get('elements', []))} elements")
             
-            buildings = []
-            for element in data.get("elements", []):
-                if element.get("type") == "way" and "geometry" in element:
-                    building = {
-                        "id": element.get("id"),
-                        "tags": element.get("tags", {}),
-                        "geometry": element.get("geometry", []),
-                    }
-                    # Extract material from OSM tags
-                    building["material"] = _extract_building_material(building)
-                    building["height_m"] = _estimate_osm_height_m(building.get("tags", {}))
-                    buildings.append(building)
+            buildings, _ = _parse_overpass_elements(data)
+            buildings = _dedupe_osm_features(buildings)
             
             logger.info(f"Successfully fetched {len(buildings)} buildings from OSM")
             if len(buildings) == 0:
@@ -384,16 +590,8 @@ class OSMMapProvider(MapProvider):
         try:
             data = _post_overpass(query, timeout=30, context="landuse fetch")
             
-            areas = []
-            for element in data.get("elements", []):
-                if element.get("type") == "way" and "geometry" in element:
-                    areas.append({
-                        "id": element.get("id"),
-                        "tags": element.get("tags", {}),
-                        "geometry": element.get("geometry", []),
-                    })
-            
-            return areas
+            _, areas = _parse_overpass_elements(data)
+            return _dedupe_osm_features(areas)
             
         except Exception as e:
             logger.warning(f"Failed to fetch landuse from OSM: {e}")
