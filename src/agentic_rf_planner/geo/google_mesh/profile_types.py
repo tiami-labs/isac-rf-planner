@@ -20,7 +20,7 @@ without recomputing mesh intersections.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -48,6 +48,10 @@ class BearingProfile(BaseModel):
 
     bearing_deg: float = Field(..., ge=0.0, lt=360.0)
     segments: List[RayBlockSegment] = Field(default_factory=list)
+    terrain_heights: Optional[List[Tuple[float, float]]] = Field(
+        default=None,
+        description="(range_m, height_m_amsl) DSM samples from Google mesh surface, sorted by range_m",
+    )
 
 
 class RayProfileSet(BaseModel):
