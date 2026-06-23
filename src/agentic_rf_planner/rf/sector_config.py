@@ -328,14 +328,20 @@ def create_omnidirectional_sector(rf_params) -> SectorConfig:
     
     Used as default when no sectors are specified.
     """
+    beamwidth_h_deg = float(getattr(rf_params, "horizontal_beamwidth_deg", 360.0) or 360.0)
+    sector_type = "360" if beamwidth_h_deg >= 359.9 else "angle"
+    azimuth_deg = float(getattr(rf_params, "azimuth_deg", 0.0) or 0.0) % 360.0
+    half = beamwidth_h_deg / 2.0
     return SectorConfig(
-        sector_id="omnidirectional",
-        sector_type="360",
+        sector_id="omnidirectional" if sector_type == "360" else "transmitter_pattern",
+        sector_type=sector_type,
+        start_angle_deg=(0.0 if sector_type == "360" else (azimuth_deg - half) % 360.0),
+        end_angle_deg=(360.0 if sector_type == "360" else (azimuth_deg + half) % 360.0),
         freq_mhz=rf_params.freq_mhz,
         tx_power_dbm=rf_params.tx_power_dbm,
         channel_bandwidth_mhz=rf_params.channel_bandwidth_mhz,
-        azimuth_deg=0.0,
-        beamwidth_h_deg=360.0,
+        azimuth_deg=azimuth_deg,
+        beamwidth_h_deg=beamwidth_h_deg,
         beamwidth_v_deg=float(getattr(rf_params, "vertical_beamwidth_deg", 8.0) or 8.0),
         electrical_tilt_deg=float(getattr(rf_params, "electrical_tilt_deg", 0.0) or 0.0),
         mechanical_tilt_deg=float(getattr(rf_params, "mechanical_tilt_deg", 0.0) or 0.0),

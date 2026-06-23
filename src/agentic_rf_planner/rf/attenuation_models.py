@@ -11,6 +11,7 @@ from ..pipeline.schemas import WorldModel, AttenuationGrid, MaterialType, RFPara
 from .material_models import DEFAULT_MATERIAL_DB
 from .modulation_schemes import get_modulation_by_name, select_modulation
 from .ofdm_params import MIMOConfig, OFDMParams
+from .dvt import received_power_to_field_strength_dbuv_m
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,10 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         interference = sum(other same-carrier sector powers, linear domain)
         SINR = 10*log10(P_serving / (P_noise + Sum(P_interferers)))
     """
+
+    is_dvt = _is_dvt(world.rf_params)
+    if is_dvt and not (getattr(world.rf_params, "sectors", None) or []):
+        return _compute_single_dvt_grid(world)
 
     max_rsrp_dbm = float(getattr(world.rf_params, "max_rsrp_dbm", -62.0) or -62.0)
     tx_h = float(getattr(world.rf_params, "tx_height_m", 0.0) or 0.0)
@@ -73,7 +78,7 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         sector_params = _resolve_sector_params(cell, world.rf_params, sector_lookup)
         sector_freq_mhz = float(sector_params["freq_mhz"])
         sector_bandwidth_mhz = float(sector_params["channel_bandwidth_mhz"])
-        rs_eirp_dbm = _reference_signal_eirp_dbm(
+        rs_eirp_dbm = _transmit_source_eirp_dbm(
             world.rf_params,
             tx_power_dbm_override=float(sector_params["tx_power_dbm"]),
             tx_antenna_gain_dbi=float(sector_params["tx_antenna_gain_dbi"]),
@@ -136,7 +141,18 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
                 - vertical_pattern_loss_db
                 + rx_combining_gain_db
             )
-        rsrp = min(rsrp_uncapped, max_rsrp_dbm)
+        # NR uses a near-field RSRP display cap. DVT reports the uncapped
+        # received carrier power because ERP is already the radiated source term.
+        rsrp = rsrp_uncapped if is_dvt else min(rsrp_uncapped, max_rsrp_dbm)
+        field_strength_dbuv_m = (
+            received_power_to_field_strength_dbuv_m(
+                rsrp,
+                sector_freq_mhz,
+                rx_gain_dbi=rx_combining_gain_db,
+            )
+            if is_dvt
+            else None
+        )
 
         key = (round(cell.lat, 8), round(cell.lon, 8))
         sample_groups[key].append(
@@ -149,6 +165,7 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
                 "channel_bandwidth_mhz": sector_bandwidth_mhz,
                 "extra_loss_db": extra_loss_db,
                 "propagation_mode": str(getattr(cell, "propagation_mode", "los") or "los"),
+                "field_strength_dbuv_m": field_strength_dbuv_m,
             }
         )
 
@@ -171,6 +188,8 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
     top_interferer_rsrp_dbm: list[float] = []
     pilot_pollution_metric_db: list[float] = []
     modulation_counts: Dict[str, int] = {}
+    received_power_out: list[float] = []
+    field_strength_out: list[float] = []
 
     sector_id_order: list[str] = [
         str(s.get("sector_id", "")).strip()
@@ -211,23 +230,30 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         interference_mw = sum(_dbm_to_mw(float(sample["rsrp_dbm"])) for sample in same_carrier_interferers)
         sinr = 10.0 * math.log10(serving_mw / max(_dbm_to_mw(noise_floor_dbm) + interference_mw, 1e-15))
 
-        if world.rf_params.enable_link_adaptation and world.rf_params.fixed_modulation is None:
-            mod_scheme = select_modulation(sinr) or get_modulation_by_name("QPSK")
+        if is_dvt:
+            # DVT waveform selection is a transmitter preset, not NR link adaptation.
+            waveform = str(world.rf_params.dvt.waveform if world.rf_params.dvt is not None else "baseline")
+            mod_name_out = waveform
+            throughput = 0.0
         else:
-            mod_name = world.rf_params.fixed_modulation or "QPSK"
-            mod_scheme = get_modulation_by_name(mod_name)
+            if world.rf_params.enable_link_adaptation and world.rf_params.fixed_modulation is None:
+                mod_scheme = select_modulation(sinr) or get_modulation_by_name("QPSK")
+            else:
+                mod_name = world.rf_params.fixed_modulation or "QPSK"
+                mod_scheme = get_modulation_by_name(mod_name)
+                if mod_scheme is None:
+                    logger.warning("Unknown fixed modulation %s, using QPSK", mod_name)
+                    mod_scheme = get_modulation_by_name("QPSK")
             if mod_scheme is None:
-                logger.warning("Unknown fixed modulation %s, using QPSK", mod_name)
                 mod_scheme = get_modulation_by_name("QPSK")
-        if mod_scheme is None:
-            mod_scheme = get_modulation_by_name("QPSK")
 
-        ofdm = OFDMParams(
-            subcarrier_spacing_khz=world.rf_params.subcarrier_spacing_khz,
-            num_rb=world.rf_params.num_resource_blocks,
-            channel_bandwidth_mhz=float(serving["channel_bandwidth_mhz"]),
-        )
-        throughput = mod_scheme.spectral_efficiency * ofdm.effective_bandwidth_mhz * mimo_streams
+            ofdm = OFDMParams(
+                subcarrier_spacing_khz=world.rf_params.subcarrier_spacing_khz,
+                num_rb=world.rf_params.num_resource_blocks,
+                channel_bandwidth_mhz=float(serving["channel_bandwidth_mhz"]),
+            )
+            throughput = mod_scheme.spectral_efficiency * ofdm.effective_bandwidth_mhz * mimo_streams
+            mod_name_out = mod_scheme.name.value
 
         top_interferer_dbm = float(same_carrier_interferers[0]["rsrp_dbm"]) if same_carrier_interferers else -200.0
         pollution_metric_db = (
@@ -240,13 +266,16 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         cell_lon.append(float(serving["lon"]))
         rsrp_dbm.append(float(serving["rsrp_dbm"]))
         sinr_db.append(sinr)
-        modulation.append(mod_scheme.name.value)
+        modulation.append(mod_name_out)
         throughput_mbps.append(throughput)
+        if is_dvt:
+            received_power_out.append(float(serving["rsrp_dbm"]))
+            field_strength_out.append(float(serving["field_strength_dbuv_m"]))
         serving_sector_id.append(str(serving["sector_id"]))
         interferer_count.append(len(same_carrier_interferers))
         top_interferer_rsrp_dbm.append(top_interferer_dbm)
         pilot_pollution_metric_db.append(pollution_metric_db)
-        modulation_counts[mod_scheme.name.value] = modulation_counts.get(mod_scheme.name.value, 0) + 1
+        modulation_counts[mod_name_out] = modulation_counts.get(mod_name_out, 0) + 1
 
         if rsrp_by_sector_lists is not None:
             by_sid = {str(s["sector_id"]): float(s["rsrp_dbm"]) for s in samples}
@@ -317,6 +346,154 @@ def compute_attenuation_grid(world: WorldModel) -> AttenuationGrid:
         top_interferer_rsrp_dbm=top_interferer_rsrp_dbm,
         pilot_pollution_metric_db=pilot_pollution_metric_db,
         rsrp_by_sector=rsrp_by_sector_lists,
+        technology="dvt" if is_dvt else "5g_nr",
+        received_power_dbm=received_power_out if is_dvt else None,
+        field_strength_dbuv_m=field_strength_out if is_dvt else None,
+        waveform=(str(world.rf_params.dvt.waveform) if is_dvt and world.rf_params.dvt is not None else None),
+        terrain_loss_db=terrain_loss_out if terrain_loss_out else None,
+        los_terrain=los_terrain_out if los_terrain_out else None,
+        terrain_state=terrain_state_out if terrain_state_out else None,
+        z_ground_m=z_ground_out if z_ground_out else None,
+    )
+
+
+def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
+    """Memory-efficient DVT path for one broadcast transmitter.
+
+    A DVT request has one radiated source and one antenna pattern, so the 5G
+    best-server/interferer grouping is unnecessary. This computes the same
+    per-cell source, path, obstruction, terrain, and antenna-pattern terms in a
+    single pass without allocating one candidate dictionary per cell.
+    """
+
+    rf_params = world.rf_params
+    tx_h = float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
+    rx_h = float(getattr(rf_params, "rx_height_m", 1.5) or 1.5)
+    sector_lookup = _build_sector_lookup(rf_params)
+    waveform = str(rf_params.dvt.waveform if rf_params.dvt is not None else "baseline")
+
+    cell_lat: list[float] = []
+    cell_lon: list[float] = []
+    received_power_dbm: list[float] = []
+    field_strength_dbuv_m: list[float] = []
+    sinr_db: list[float] = []
+    modulation: list[str] = []
+    throughput_mbps: list[float] = []
+    serving_sector_id: list[str] = []
+    interferer_count: list[int] = []
+    top_interferer_rsrp_dbm: list[float] = []
+    pilot_pollution_metric_db: list[float] = []
+    terrain_loss_out: list[float] = []
+    los_terrain_out: list[bool] = []
+    terrain_state_out: list[str] = []
+    z_ground_out: list[float] = []
+
+    for cell in world.cells:
+        d2 = max(float(cell.distance_m), 1.0)
+        d3 = _three_dimensional_distance_m(d2, tx_h, rx_h)
+        if (
+            bool(getattr(rf_params, "terrain_enabled", True))
+            and getattr(cell, "z_rx_abs_m", None) is not None
+            and getattr(world, "z_tx_abs_m", None) is not None
+        ):
+            dz_abs = float(cell.z_rx_abs_m) - float(world.z_tx_abs_m)
+            d3 = math.sqrt(d2 * d2 + dz_abs * dz_abs)
+
+        sector_params = _resolve_sector_params(cell, rf_params, sector_lookup)
+        freq_mhz = float(sector_params["freq_mhz"])
+        bandwidth_mhz = float(sector_params["channel_bandwidth_mhz"])
+        source_eirp_dbm = _transmit_source_eirp_dbm(rf_params)
+        path_loss_db = _scenario_path_loss_db(
+            distance_2d_m=d2,
+            distance_3d_m=d3,
+            freq_mhz=freq_mhz,
+            tx_height_m=tx_h,
+            rx_height_m=rx_h,
+            is_los=bool(getattr(cell, "is_los", True)),
+            rf_params=rf_params,
+        )
+
+        penetration_loss_db = float(getattr(cell, "penetration_loss_db", 0.0) or 0.0)
+        shadow_loss_db = float(getattr(cell, "shadow_loss_db", 0.0) or 0.0)
+        diffraction_loss_db = float(getattr(cell, "diffraction_loss_db", 0.0) or 0.0)
+        canyon_recovery_db = float(getattr(cell, "canyon_recovery_db", 0.0) or 0.0)
+        terrain_loss_db = float(getattr(cell, "terrain_loss_db", 0.0) or 0.0)
+        extra_loss_db = max(
+            0.0,
+            penetration_loss_db
+            + shadow_loss_db
+            + diffraction_loss_db
+            + terrain_loss_db
+            - canyon_recovery_db,
+        )
+        horizontal_pattern_loss_db = _horizontal_pattern_attenuation_db(
+            bearing_deg=float(cell.bearing_deg),
+            sector_params=sector_params,
+            rf_params=rf_params,
+        )
+        vertical_pattern_loss_db = _vertical_pattern_attenuation_db(
+            distance_m=d2,
+            tx_height_m=tx_h,
+            rx_height_m=rx_h,
+            rf_params=rf_params,
+            sector_params=sector_params,
+        )
+        rx_gain_dbi = float(getattr(rf_params, "ue_antenna_gain_dbi", 0.0) or 0.0)
+        precomputed = getattr(cell, "precomputed_rsrp_dbm", None)
+        if precomputed is not None:
+            power_dbm = float(precomputed)
+        else:
+            power_dbm = (
+                source_eirp_dbm
+                - path_loss_db
+                - extra_loss_db
+                - horizontal_pattern_loss_db
+                - vertical_pattern_loss_db
+                + rx_gain_dbi
+            )
+
+        noise_floor_dbm = _noise_floor_dbm_for_bandwidth(rf_params, bandwidth_mhz)
+        field_dbuv_m = received_power_to_field_strength_dbuv_m(
+            power_dbm,
+            freq_mhz,
+            rx_gain_dbi=rx_gain_dbi,
+        )
+
+        cell.extra_loss_db = extra_loss_db
+        cell_lat.append(float(cell.lat))
+        cell_lon.append(float(cell.lon))
+        received_power_dbm.append(power_dbm)
+        field_strength_dbuv_m.append(field_dbuv_m)
+        sinr_db.append(power_dbm - noise_floor_dbm)
+        modulation.append(waveform)
+        throughput_mbps.append(0.0)
+        serving_sector_id.append(str(sector_params["sector_id"]))
+        interferer_count.append(0)
+        top_interferer_rsrp_dbm.append(-200.0)
+        pilot_pollution_metric_db.append(99.0)
+        terrain_loss_out.append(terrain_loss_db)
+        los_terrain_out.append(bool(getattr(cell, "los_terrain", True)))
+        terrain_state_out.append(str(getattr(cell, "terrain_state", "los") or "los"))
+        z_ground_out.append(float(getattr(cell, "z_ground_m", 0.0) or 0.0))
+
+    return AttenuationGrid(
+        tx=world.tx,
+        rf_params=rf_params,
+        cell_lat=cell_lat,
+        cell_lon=cell_lon,
+        rsrp_dbm=received_power_dbm,
+        sinr_db=sinr_db,
+        modulation=modulation,
+        throughput_mbps=throughput_mbps,
+        serving_sector_id=serving_sector_id,
+        interferer_count=interferer_count,
+        top_interferer_rsrp_dbm=top_interferer_rsrp_dbm,
+        pilot_pollution_metric_db=pilot_pollution_metric_db,
+        rsrp_by_sector=None,
+        technology="dvt",
+        received_power_dbm=received_power_dbm,
+        field_strength_dbuv_m=field_strength_dbuv_m,
+        waveform=waveform,
         terrain_loss_db=terrain_loss_out if terrain_loss_out else None,
         los_terrain=los_terrain_out if los_terrain_out else None,
         terrain_state=terrain_state_out if terrain_state_out else None,
@@ -383,12 +560,12 @@ def _resolve_sector_params(cell: Any, rf_params: RFParams, sector_lookup: dict[s
         "azimuth_deg": float(
             getattr(cell, "sector_azimuth_deg", None)
             if getattr(cell, "sector_azimuth_deg", None) is not None
-            else sector_cfg.get("azimuth_deg", 0.0)
+            else sector_cfg.get("azimuth_deg", getattr(rf_params, "azimuth_deg", 0.0))
         ),
         "beamwidth_h_deg": float(
             getattr(cell, "sector_beamwidth_h_deg", None)
             if getattr(cell, "sector_beamwidth_h_deg", None) is not None
-            else sector_cfg.get("beamwidth_h_deg", 360.0)
+            else sector_cfg.get("beamwidth_h_deg", getattr(rf_params, "horizontal_beamwidth_deg", 360.0))
         ),
         "beamwidth_v_deg": float(
             getattr(cell, "sector_beamwidth_v_deg", None)
@@ -434,6 +611,35 @@ def _resolve_sector_tx_gain_db(cell: Any, sector_cfg: dict[str, Any], rf_params:
     return float(getattr(rf_params, "tx_antenna_gain_dbi", 0.0) or 0.0)
 
 
+def _is_dvt(rf_params: RFParams) -> bool:
+    return str(getattr(rf_params, "technology", "5g_nr") or "5g_nr").strip().lower() == "dvt"
+
+
+def _transmit_source_eirp_dbm(
+    rf_params: RFParams,
+    tx_power_dbm_override: float | None = None,
+    tx_antenna_gain_dbi: float | None = None,
+) -> float:
+    """Return the isotropic source term for the active technology.
+
+    DVT uses the physical source selected by ``DVTPower``: direct ERP, or
+    conducted power with TX-chain gain, feeder loss, and antenna gain. The
+    directional antenna-pattern attenuation is applied separately per cell.
+    NR keeps its occupied-RE/reference-signal allocation while sharing the same
+    physical TX-chain fields.
+    """
+    if _is_dvt(rf_params):
+        dvt = getattr(rf_params, "dvt", None)
+        if dvt is None:
+            raise ValueError("DVT RF parameters require a dvt transmitter object")
+        return float(dvt.power.source_eirp_dbm)
+    return _reference_signal_eirp_dbm(
+        rf_params,
+        tx_power_dbm_override=tx_power_dbm_override,
+        tx_antenna_gain_dbi=tx_antenna_gain_dbi,
+    )
+
+
 def _reference_signal_eirp_dbm(
     rf_params: RFParams,
     tx_power_dbm_override: float | None = None,
@@ -460,9 +666,10 @@ def _reference_signal_eirp_dbm(
         tx_gain_db = float(tx_antenna_gain_dbi)
     else:
         tx_gain_db = float(getattr(rf_params, "tx_antenna_gain_dbi", 0.0) or 0.0)
+    tx_chain_gain_db = float(getattr(rf_params, "tx_chain_gain_db", 0.0) or 0.0)
     feeder_loss_db = float(getattr(rf_params, "tx_feeder_loss_db", 0.0) or 0.0)
     ref_offset_db = float(getattr(rf_params, "reference_signal_offset_db", 0.0) or 0.0)
-    return epre_dbm + tx_gain_db - feeder_loss_db + ref_offset_db
+    return epre_dbm + tx_chain_gain_db + tx_gain_db - feeder_loss_db + ref_offset_db
 
 
 def _effective_total_tilt_deg(rf_params: RFParams, sector_params: dict[str, Any] | None = None) -> float:
@@ -610,6 +817,8 @@ def _scenario_path_loss_db(
     is_los: bool,
     rf_params: RFParams,
 ) -> float:
+    if _is_dvt(rf_params):
+        return _free_space_path_loss_db(distance_3d_m, freq_mhz)
     model = str(getattr(rf_params, "path_loss_model", "legacy") or "legacy").strip().lower()
     scenario = str(getattr(rf_params, "propagation_scenario", "umi_street_canyon") or "umi_street_canyon").strip().lower()
     if model != "3gpp_38901":
