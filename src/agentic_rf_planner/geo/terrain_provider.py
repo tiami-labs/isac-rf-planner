@@ -1,63 +1,76 @@
-"""DEM elevation provider for terrain-aware propagation."""
+"""TerrainProvider — ordered fallback chain over TerrainHeightSource implementations.
+
+The provider itself contains no terrain logic.  It delegates every query to
+the first source in its chain that reports available(), then falls through to
+the next source if the preferred one is unavailable.
+
+Factory functions build the chain for the two standard configurations:
+
+  create_terrain_provider(rf_params)
+      Standard chain: Copernicus raster → OpenTopoData → Flat.
+      Drop-in replacement for the previous monolithic TerrainProvider.
+
+  create_terrain_provider_with_mesh(rf_params, profile_set)
+      Extended chain: Google Mesh → Copernicus → Flat.
+      Used when a RayProfileSet with terrain_heights is available; gives
+      sub-5 m terrain resolution instead of 30 m Copernicus.
+
+Both factories return Optional[TerrainProvider]; None means terrain is
+disabled (terrain_enabled=False in rf_params).
+
+External callers depend only on TerrainProvider's public methods:
+  elevation_m, profile_along_bearing, prefetch_for_polar_grid,
+  ensure_raster_window, provider_used.
+Nothing else in the codebase should import a concrete source class.
+"""
 
 from __future__ import annotations
 
 import logging
-import math
-import os
-from typing import Dict, List, Optional, Sequence, Tuple
-
-import requests
+from typing import List, Optional, Tuple
 
 from ..pipeline.schemas import LatLon, RFParams
+from .dem_cache import ElevationCacheStore
+from .google_mesh.profile_types import RayProfileSet
+from .terrain_source import TerrainHeightSource
+from .terrain_sources import (
+    CopernicusTerrainSource,
+    FlatTerrainSource,
+    GoogleElevationTerrainSource,
+    GoogleMeshTerrainSource,
+)
 
 logger = logging.getLogger(__name__)
 
-_OPENTOPO_URL = "https://api.opentopodata.org/v1/aster30m"
-_GOOGLE_ELEV_URL = "https://maps.googleapis.com/maps/api/elevation/json"
-_BATCH_SIZE = 50
-
-
-def _project_from_tx(lat: float, lon: float, distance_m: float, bearing_deg: float) -> Tuple[float, float]:
-    r = 6371000.0
-    br = math.radians(bearing_deg)
-    lat1 = math.radians(lat)
-    lon1 = math.radians(lon)
-    lat2 = math.asin(
-        math.sin(lat1) * math.cos(distance_m / r)
-        + math.cos(lat1) * math.sin(distance_m / r) * math.cos(br)
-    )
-    lon2 = lon1 + math.atan2(
-        math.sin(br) * math.sin(distance_m / r) * math.cos(lat1),
-        math.cos(distance_m / r) - math.sin(lat1) * math.sin(lat2),
-    )
-    return math.degrees(lat2), math.degrees(lon2)
-
-
-def _cache_key(lat: float, lon: float, precision: int = 5) -> Tuple[float, float]:
-    return (round(float(lat), precision), round(float(lon), precision))
+# Re-export for any callers that imported this constant from terrain_provider.
+from .dem_cache import DATASET_LOCAL_RASTER  # noqa: F401
 
 
 class TerrainProvider:
-    """Fetch and cache ground elevation (meters AMSL) for planner samples."""
+    """Ordered fallback chain over TerrainHeightSource implementations.
 
-    def __init__(
-        self,
-        dem_source: str = "auto",
-        resolution_m: Optional[float] = None,
-    ) -> None:
-        self.dem_source = str(dem_source or "auto").strip().lower()
-        self.resolution_m = float(resolution_m or 30.0)
-        self._cache: Dict[Tuple[float, float], float] = {}
-        self.provider_used: str = "none"
-        self._google_key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+    Instantiate via the factory functions below rather than directly.
+    """
+
+    def __init__(self, sources: List[TerrainHeightSource]) -> None:
+        if not sources:
+            raise ValueError("TerrainProvider requires at least one source")
+        self._sources = sources
+        self._last_used: str = "none"
+
+    # ------------------------------------------------------------------
+    # Public API (unchanged from the previous monolithic implementation)
+    # ------------------------------------------------------------------
+
+    @property
+    def provider_used(self) -> str:
+        """Name of the source that last served a query."""
+        return self._last_used
 
     def elevation_m(self, lat: float, lon: float) -> float:
-        key = _cache_key(lat, lon)
-        if key in self._cache:
-            return self._cache[key]
-        self._batch_fetch([(float(lat), float(lon))])
-        return self._cache.get(key, 0.0)
+        src = self._first_available()
+        self._last_used = src.name
+        return src.elevation_m(lat, lon)
 
     def profile_along_bearing(
         self,
@@ -66,25 +79,9 @@ class TerrainProvider:
         max_range_m: float,
         step_m: float,
     ) -> Tuple[List[float], List[float]]:
-        """Return (u_m[], z_dem_m[]) from TX outward including endpoints."""
-        step = max(1.0, float(step_m))
-        max_r = max(step, float(max_range_m))
-        u_list: List[float] = []
-        z_list: List[float] = []
-        points: List[Tuple[float, float]] = []
-        r = 0.0
-        while r <= max_r + 1e-6:
-            if r <= 1e-6:
-                lat, lon = tx.lat, tx.lon
-            else:
-                lat, lon = _project_from_tx(tx.lat, tx.lon, r, bearing_deg)
-            points.append((lat, lon))
-            u_list.append(r)
-            r += step
-        self._batch_fetch(points)
-        for lat, lon in points:
-            z_list.append(self.elevation_m(lat, lon))
-        return u_list, z_list
+        src = self._first_available()
+        self._last_used = src.name
+        return src.profile_along_bearing(tx, bearing_deg, max_range_m, step_m)
 
     def prefetch_for_polar_grid(
         self,
@@ -93,102 +90,107 @@ class TerrainProvider:
         step_m: float,
         dtheta_deg: float,
     ) -> None:
-        """Warm cache for all bearing/range samples used by coverage_grid."""
-        step = max(1.0, float(step_m))
-        max_r = max(step, float(max_range_m))
-        dtheta = max(0.25, float(dtheta_deg))
-        points: List[Tuple[float, float]] = [(tx.lat, tx.lon)]
-        theta = 0.0
-        while theta < 360.0 - 1e-6:
-            r = 0.0
-            while r <= max_r + 1e-6:
-                if r <= 1e-6:
-                    points.append((tx.lat, tx.lon))
-                else:
-                    points.append(_project_from_tx(tx.lat, tx.lon, r, theta))
-                r += step
-            theta += dtheta
-        logger.info("Terrain prefetch: %d sample points (dem=%s)", len(points), self.dem_source)
-        self._batch_fetch(points)
+        """Warm the active source's cache for all coverage-grid samples."""
+        src = self._first_available()
+        self._last_used = src.name
+        src.prefetch(tx, max_range_m, step_m, dtheta_deg)
 
-    def _batch_fetch(self, latlon: Sequence[Tuple[float, float]]) -> None:
-        pending: List[Tuple[float, float]] = []
-        for lat, lon in latlon:
-            key = _cache_key(lat, lon)
-            if key not in self._cache:
-                pending.append((float(lat), float(lon)))
-        if not pending:
-            return
-        for i in range(0, len(pending), _BATCH_SIZE):
-            chunk = pending[i : i + _BATCH_SIZE]
-            elevations = self._fetch_chunk(chunk)
-            for (lat, lon), z in zip(chunk, elevations):
-                if z is None:
-                    continue
-                self._cache[_cache_key(lat, lon)] = float(z)
+    def ensure_raster_window(self, lat: float, lon: float, radius_m: float) -> bool:
+        """Load the Copernicus raster window if it is in the chain.
 
-    def _fetch_chunk(self, chunk: Sequence[Tuple[float, float]]) -> List[Optional[float]]:
-        source = self.dem_source
-        if source == "auto":
-            if self._google_key:
-                source = "google"
-            else:
-                source = "opentopodata"
-        if source in ("google", "google_elevation") and self._google_key:
-            try:
-                out = self._fetch_google(chunk)
-                self.provider_used = "google"
-                return out
-            except Exception as exc:
-                logger.warning("Google elevation failed: %s; falling back to OpenTopoData", exc)
-        if source in ("flat", "disabled", "none"):
-            self.provider_used = "flat"
-            return [0.0] * len(chunk)
-        try:
-            out = self._fetch_opentopodata(chunk)
-            self.provider_used = "opentopodata"
-            return out
-        except Exception as exc:
-            logger.warning("OpenTopoData elevation failed: %s; leaving points uncached", exc)
-            return [None] * len(chunk)
+        Returns False when no Copernicus source is present (e.g. mesh-only chain).
+        """
+        for src in self._sources:
+            if isinstance(src, CopernicusTerrainSource):
+                return src.ensure_raster_window(lat, lon, radius_m)
+        return False
 
-    def _fetch_opentopodata(self, chunk: Sequence[Tuple[float, float]]) -> List[float]:
-        locs = "|".join(f"{lat:.6f},{lon:.6f}" for lat, lon in chunk)
-        resp = requests.get(_OPENTOPO_URL, params={"locations": locs}, timeout=45)
-        resp.raise_for_status()
-        data = resp.json()
-        if str(data.get("status", "")).lower() != "ok":
-            raise RuntimeError(data.get("error") or data)
-        out: List[float] = []
-        for item in data.get("results") or []:
-            elev = item.get("elevation")
-            out.append(0.0 if elev is None else float(elev))
-        if len(out) != len(chunk):
-            raise RuntimeError(f"OpenTopoData returned {len(out)} elevations for {len(chunk)} points")
-        return out
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
-    def _fetch_google(self, chunk: Sequence[Tuple[float, float]]) -> List[float]:
-        locs = "|".join(f"{lat:.6f},{lon:.6f}" for lat, lon in chunk)
-        resp = requests.get(
-            _GOOGLE_ELEV_URL,
-            params={"locations": locs, "key": self._google_key},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if str(data.get("status", "")).upper() != "OK":
-            raise RuntimeError(data.get("error_message") or data)
-        out: List[float] = []
-        for item in data.get("results") or []:
-            out.append(float(item.get("elevation", 0.0)))
-        if len(out) != len(chunk):
-            raise RuntimeError(f"Google elevation returned {len(out)} for {len(chunk)} points")
-        return out
+    def _first_available(self) -> TerrainHeightSource:
+        for src in self._sources:
+            if src.available():
+                return src
+        # FlatTerrainSource is always last and always available; this is unreachable
+        # in practice but satisfies the type checker.
+        raise RuntimeError("No TerrainHeightSource is available — chain is empty or all unavailable")
 
 
-def create_terrain_provider(rf_params: RFParams) -> Optional[TerrainProvider]:
+# ---------------------------------------------------------------------------
+# Factory functions
+# ---------------------------------------------------------------------------
+
+def create_terrain_provider(
+    rf_params: RFParams,
+    elevation_store: Optional[ElevationCacheStore] = None,
+) -> Optional["TerrainProvider"]:
+    """Standard chain: Copernicus raster → Flat.
+
+    Drop-in replacement for the previous create_terrain_provider.  Returns
+    None when terrain_enabled is False.
+    """
     if not bool(getattr(rf_params, "terrain_enabled", True)):
         return None
-    source = str(getattr(rf_params, "dem_source", "auto") or "auto")
-    res = getattr(rf_params, "terrain_resolution_m", None)
-    return TerrainProvider(dem_source=source, resolution_m=res)
+
+    max_r = getattr(rf_params, "max_range_m", None)
+
+    copernicus = CopernicusTerrainSource(
+        elevation_store=elevation_store,
+        max_range_m=float(max_r) if max_r is not None else None,
+    )
+
+    sources: List[TerrainHeightSource] = [copernicus, FlatTerrainSource()]
+
+    # Honour explicit dem_source=google / google_elevation if set.
+    dem_source = str(getattr(rf_params, "dem_source", "") or "").strip().lower()
+    if dem_source in ("google", "google_elevation"):
+        google_elev = GoogleElevationTerrainSource(elevation_store=elevation_store)
+        if google_elev.available():
+            sources = [google_elev, copernicus, FlatTerrainSource()]
+        else:
+            logger.warning(
+                "dem_source=google requested but GOOGLE_MAPS_API_KEY not set; "
+                "falling back to Copernicus"
+            )
+
+    provider = TerrainProvider(sources=sources)
+    logger.info(
+        "TerrainProvider created: chain=[%s]",
+        ", ".join(s.name for s in sources),
+    )
+    return provider
+
+
+def create_terrain_provider_with_mesh(
+    rf_params: RFParams,
+    profile_set: RayProfileSet,
+    elevation_store: Optional[ElevationCacheStore] = None,
+) -> Optional["TerrainProvider"]:
+    """Extended chain: Google Mesh → Copernicus → Flat.
+
+    Used when a RayProfileSet with terrain_heights is available.  The mesh
+    source provides sub-5 m resolution; Copernicus is the automatic fallback
+    for bearings or areas where mesh profiles are absent or not yet populated.
+    Returns None when terrain_enabled is False.
+    """
+    if not bool(getattr(rf_params, "terrain_enabled", True)):
+        return None
+
+    max_r = getattr(rf_params, "max_range_m", None)
+
+    mesh = GoogleMeshTerrainSource(profile_set)
+    copernicus = CopernicusTerrainSource(
+        elevation_store=elevation_store,
+        max_range_m=float(max_r) if max_r is not None else None,
+    )
+    sources: List[TerrainHeightSource] = [mesh, copernicus, FlatTerrainSource()]
+
+    provider = TerrainProvider(sources=sources)
+    logger.info(
+        "TerrainProvider (with mesh) created: chain=[%s], mesh_profiles_with_heights=%d",
+        ", ".join(s.name for s in sources),
+        sum(1 for p in profile_set.profiles if p.terrain_heights),
+    )
+    return provider
