@@ -18,10 +18,11 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from ..config import load_rf_config
 from ..pipeline.schemas import RFParams, LatLon
+from ..rf.dvt import DVTTransmitter
 from ..agents.rf_planning_agent import run_rf_planning_for_point
 
 from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
@@ -57,6 +58,34 @@ _ui_remote_plan: Dict[str, Any] = {
 }
 
 
+# --- Last plan result — always updated on every /api/plan call regardless of publish_ui ---
+_last_plan_result_lock = threading.Lock()
+_last_plan_result: Dict[str, Any] = {"plan": None}
+
+# --- Screenshot capture — server signals browser to capture and upload screenshots ---
+_screenshot_lock = threading.Lock()
+_screenshot_request: Dict[str, Any] = {"seq": 0, "requested_utc": None}
+_screenshot_store: Dict[str, bytes] = {}  # filename -> raw PNG bytes
+
+# --- Clear-map command — tells the browser to clear overlays ---
+_ui_clear_map_lock = threading.Lock()
+_ui_clear_map: Dict[str, Any] = {"seq": 0, "requested_utc": None}
+
+# --- Profile request — tells the /3d browser to run ensureProfiles() for a TX ---
+_ui_profile_request_lock = threading.Lock()
+_ui_profile_request: Dict[str, Any] = {
+    "seq": 0,
+    "lat": None,
+    "lon": None,
+    "tx_height_m": None,
+    "rx_height_m": None,
+    "max_range_m": None,
+    "dr_m": None,
+    "dtheta_deg": None,
+    "requested_utc": None,
+}
+
+
 def _rf_remote_ui_publish_plan_result(result: Dict[str, Any], log: Optional[logging.Logger] = None) -> int:
     """Push a completed plan to the queue consumed by GET /api/ui/remote-plan-rf/poll (open /3d and / tabs)."""
     utc_done = datetime.now(timezone.utc).isoformat()
@@ -70,6 +99,44 @@ def _rf_remote_ui_publish_plan_result(result: Dict[str, Any], log: Optional[logg
     if log:
         log.info("Published plan to remote UI queue: seq=%s", new_seq)
     return new_seq
+
+
+def _resolve_effective_ray_mode(req: "PlanRequest") -> str:
+    """Map planner surface + ray_mode to the propagation backend.
+
+    /3d always uses 3d_osm (height-sliced OSM polar march). /2d uses 2d.
+    Explicit 3d_rt / google mesh modes are preserved when requested.
+    """
+    surface = (getattr(req, "planner_surface", None) or "").strip().lower()
+    requested = (req.ray_mode or "2d").strip().lower()
+    rt_modes = ("3d_rt", "3d-rt", "rt3d", "3d_raytrace", "raytrace", "3d_rt_google", "3d_rt_osm")
+    if surface == "2d":
+        return "2d"
+    if surface == "3d":
+        if requested in rt_modes:
+            return requested
+        return "3d_osm"
+    if requested in ("3d_osm", "3d-osm", "osm3d"):
+        return requested
+    return requested
+
+
+def _infer_planner_surface(req: "PlanRequest", effective_ray_mode: str) -> str:
+    explicit = (getattr(req, "planner_surface", None) or "").strip().lower()
+    if explicit in ("2d", "3d"):
+        return explicit
+    rm = str(effective_ray_mode or "2d").strip().lower()
+    if rm == "2d":
+        return "2d"
+    return "3d"
+
+
+def _plan_surface_for_poll(plan: Dict[str, Any]) -> str:
+    surf = str(plan.get("planner_surface") or "").strip().lower()
+    if surf in ("2d", "3d"):
+        return surf
+    rm = str(plan.get("ray_mode") or "2d").strip().lower()
+    return "2d" if rm == "2d" else "3d"
 
 
 REMOTE_3D_RT_QUEUE_BOOT_UTC = datetime.now(timezone.utc).isoformat()
@@ -410,6 +477,7 @@ class RaytracePathsRequest(BaseModel):
     num_tx_antennas: int = 1
     num_rx_antennas: int = 1
     mimo_mode: str = "MIMO"
+    tx_chain_gain_db: float = 0.0
     tx_antenna_gain_dbi: float = 17.0
     tx_feeder_loss_db: float = 2.0
     reference_signal_offset_db: float = -18.0
@@ -486,6 +554,11 @@ def _compute_raytrace_paths_response(req: RaytracePathsRequest, progress=None) -
         ray_mode="3d_rt",
         tx_height_m=req.tx_height_m,
         rx_height_m=req.rx_height_m,
+        tx_chain_gain_db=req.tx_chain_gain_db,
+        tx_antenna_gain_dbi=req.tx_antenna_gain_dbi,
+        tx_feeder_loss_db=req.tx_feeder_loss_db,
+        reference_signal_offset_db=req.reference_signal_offset_db,
+        ue_antenna_gain_dbi=req.ue_antenna_gain_dbi,
         termination_rsrp_dbm=req.termination_rsrp_dbm,
         rt_max_bounces=req.max_bounces,
         rt_max_reflections_per_sample=req.max_paths,
@@ -1033,8 +1106,11 @@ class PlanRequest(BaseModel):
     Clients that omit optional keys get the same baseline as the dashboard before user edits.
     """
 
-    lat: float
-    lon: float
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    technology: str = "5g_nr"
+    waveform: Optional[str] = None  # 5g_nr | atsc1 | atsc3 | dvbt | baseline
+    dvt: Optional[DVTTransmitter] = None
     freq_mhz: float = 3500.0
     tx_power_dbm: float = 43.0  # eNodeB-ish default
     noise_floor_dbm: Optional[float] = None  # If None, calculated from bandwidth + NF
@@ -1060,9 +1136,13 @@ class PlanRequest(BaseModel):
     # Ray propagation mode selection
     # If omitted, defaults to "2d". UI controls this via the ray-mode selector.
     ray_mode: Optional[str] = None  # "2d" or "3d"
+    # Which planner surface initiated the request: "2d" (Leaflet) or "3d" (Cesium).
+    # When set, overrides ray_mode to the correct propagation backend for that surface.
+    planner_surface: Optional[str] = None
     # Must match planner_3d.js / index_3d defaults (input id tx-height-m fallback 10.0).
     tx_height_m: float = 10.0
     rx_height_m: float = 1.5
+    tx_chain_gain_db: Optional[float] = None
     tx_antenna_gain_dbi: Optional[float] = None
     tx_feeder_loss_db: Optional[float] = None
     reference_signal_offset_db: Optional[float] = None
@@ -1112,6 +1192,7 @@ class PlanRequest(BaseModel):
     buildings_on_terrain: Optional[bool] = None
     landcover_clutter_enabled: Optional[bool] = None
     coverage_display_layer: Optional[str] = None
+    compact_output: Optional[bool] = None
 
     # Optional RX markers for the 3D dashboard (per-TX measurement sites). Each item:
     # {"id": "rx1_1", "lat": ..., "lon": ..., "name": "optional label"}
@@ -1122,6 +1203,38 @@ class PlanRequest(BaseModel):
     # so API-driven runs draw on the live planner without a second click.
     # In-browser “Plan” buttons should set publish_ui=False to avoid double-apply.
     publish_ui: bool = True
+
+    @model_validator(mode="after")
+    def resolve_transmitter_coordinates(self) -> "PlanRequest":
+        valid_waveforms = {"5g_nr", "atsc1", "atsc3", "dvbt", "baseline"}
+        requested_waveform = str(self.waveform).strip().lower() if self.waveform is not None else None
+        if requested_waveform is not None and requested_waveform not in valid_waveforms:
+            raise ValueError(f"waveform must be one of {sorted(valid_waveforms)}")
+        if self.dvt is not None:
+            self.technology = "dvt"
+            nested_waveform = str(self.dvt.waveform)
+            if requested_waveform is not None and requested_waveform != nested_waveform:
+                raise ValueError("waveform must match dvt.waveform")
+            self.waveform = nested_waveform
+            dvt_lat = float(self.dvt.tx.latitude)
+            dvt_lon = float(self.dvt.tx.longitude)
+            if self.lat is not None and abs(float(self.lat) - dvt_lat) > 1.0e-8:
+                raise ValueError("lat must match dvt.tx.latitude when both are supplied")
+            if self.lon is not None and abs(float(self.lon) - dvt_lon) > 1.0e-8:
+                raise ValueError("lon must match dvt.tx.longitude when both are supplied")
+            self.lat = dvt_lat
+            self.lon = dvt_lon
+        if self.lat is None or self.lon is None:
+            raise ValueError("lat/lon are required unless supplied by dvt.tx")
+        technology = str(self.technology).strip().lower()
+        if technology == "dvt" and self.dvt is None:
+            raise ValueError("technology='dvt' requires the dvt transmitter object")
+        if requested_waveform in {"atsc1", "atsc3", "dvbt", "baseline"} and self.dvt is None:
+            raise ValueError("DVT waveform requires the dvt transmitter object")
+        if self.dvt is None:
+            self.technology = "5g_nr"
+            self.waveform = "5g_nr"
+        return self
 
 
 class PlanAndTrace3DRequest(PlanRequest):
@@ -1211,6 +1324,7 @@ def _raytrace_request_from_plan_and_rx(plan_req: PlanRequest, rx_lat: float, rx_
         num_tx_antennas=plan_req.num_tx_antennas,
         num_rx_antennas=plan_req.num_rx_antennas,
         mimo_mode=plan_req.mimo_mode,
+        tx_chain_gain_db=(plan_req.tx_chain_gain_db if plan_req.tx_chain_gain_db is not None else 0.0),
         tx_antenna_gain_dbi=(plan_req.tx_antenna_gain_dbi if plan_req.tx_antenna_gain_dbi is not None else 17.0),
         tx_feeder_loss_db=(plan_req.tx_feeder_loss_db if plan_req.tx_feeder_loss_db is not None else 2.0),
         reference_signal_offset_db=(plan_req.reference_signal_offset_db if plan_req.reference_signal_offset_db is not None else -18.0),
@@ -1328,7 +1442,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         _record_planner_phase("rf_params", "Resolving RF parameters", None)
         # Use UI-provided ray_mode if present, otherwise default to 2d (ignore env var)
         # The UI toggle should control this, not an environment variable
-        effective_ray_mode = (req.ray_mode or "2d").strip().lower()
+        effective_ray_mode = _resolve_effective_ray_mode(req)
         # Load RF config for building attenuation etc. (config-driven, no code changes needed)
         try:
             rf_cfg = load_rf_config("configs/rf.params.yaml")
@@ -1339,13 +1453,25 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         except Exception as e:
             rf_cfg = {}
             logger.warning("Failed to load RF config: %s", e)
+        is_dvt_request = str(req.technology or "5g_nr").strip().lower() == "dvt"
         rf_params = RFParams(
+            technology=("dvt" if is_dvt_request else "5g_nr"),
+            waveform=(req.waveform or (str(req.dvt.waveform) if req.dvt is not None else "5g_nr")),
+            dvt=req.dvt,
             freq_mhz=req.freq_mhz,
             tx_power_dbm=req.tx_power_dbm,
             noise_floor_dbm=req.noise_floor_dbm,
             noise_figure_db=req.noise_figure_db,
-            max_range_m=(req.max_range_m if req.max_range_m is not None else rf_cfg.get("max_range_m", RFParams.model_fields["max_range_m"].default)),
-            step_m=(req.step_m if req.step_m is not None else RFParams.model_fields["step_m"].default),
+            max_range_m=(
+                req.max_range_m
+                if req.max_range_m is not None
+                else (20000.0 if is_dvt_request else rf_cfg.get("max_range_m", RFParams.model_fields["max_range_m"].default))
+            ),
+            step_m=(
+                req.step_m
+                if req.step_m is not None
+                else (20.0 if is_dvt_request else RFParams.model_fields["step_m"].default)
+            ),
             dtheta_deg=(req.dtheta_deg if req.dtheta_deg is not None else RFParams.model_fields.get("dtheta_deg").default if "dtheta_deg" in RFParams.model_fields else 5.0),
             subcarrier_spacing_khz=req.subcarrier_spacing_khz,
             num_resource_blocks=req.num_resource_blocks,
@@ -1359,6 +1485,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             ray_mode=effective_ray_mode,
             tx_height_m=req.tx_height_m,
             rx_height_m=req.rx_height_m,
+            tx_chain_gain_db=(req.tx_chain_gain_db if req.tx_chain_gain_db is not None else rf_cfg.get("tx_chain_gain_db", RFParams.model_fields["tx_chain_gain_db"].default)),
             tx_antenna_gain_dbi=(req.tx_antenna_gain_dbi if req.tx_antenna_gain_dbi is not None else rf_cfg.get("tx_antenna_gain_dbi", RFParams.model_fields["tx_antenna_gain_dbi"].default)),
             tx_feeder_loss_db=(req.tx_feeder_loss_db if req.tx_feeder_loss_db is not None else rf_cfg.get("tx_feeder_loss_db", RFParams.model_fields["tx_feeder_loss_db"].default)),
             reference_signal_offset_db=(req.reference_signal_offset_db if req.reference_signal_offset_db is not None else rf_cfg.get("reference_signal_offset_db", RFParams.model_fields["reference_signal_offset_db"].default)),
@@ -1400,6 +1527,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             buildings_on_terrain=(req.buildings_on_terrain if req.buildings_on_terrain is not None else rf_cfg.get("buildings_on_terrain", RFParams.model_fields["buildings_on_terrain"].default)),
             landcover_clutter_enabled=(req.landcover_clutter_enabled if req.landcover_clutter_enabled is not None else rf_cfg.get("landcover_clutter_enabled", RFParams.model_fields["landcover_clutter_enabled"].default)),
             coverage_display_layer=(req.coverage_display_layer if req.coverage_display_layer is not None else rf_cfg.get("coverage_display_layer", RFParams.model_fields["coverage_display_layer"].default)),
+            compact_output=req.compact_output,
         )
         logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
         if req.sectors:
@@ -1412,6 +1540,58 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         logger.info(f"  Ray mode: {rf_params.ray_mode} (tx_h={rf_params.tx_height_m}m, rx_h={rf_params.rx_height_m}m)")
         logger.info(f"  Ray mode: {effective_ray_mode} (tx_height_m={rf_params.tx_height_m}, rx_height_m={rf_params.rx_height_m})")
         
+        # When dem_source=copernicus_mesh, ensure mesh profiles exist before running.
+        # If missing, signal the /3d browser via poll queue and wait up to 180s.
+        _dem_src = str(getattr(rf_params, "dem_source", "") or "").strip().lower()
+        if _dem_src == "copernicus_mesh":
+            import asyncio as _aio
+            from ..geo.google_mesh import MeshProfileStore as _MPS
+            from ..pipeline.schemas import LatLon as _LL
+
+            def _mesh_ready() -> bool:
+                try:
+                    _ps = _MPS().get(
+                        tx=_LL(lat=req.lat, lon=req.lon),
+                        tx_height_m=float(req.tx_height_m or 0.0),
+                        rx_height_m=float(req.rx_height_m or 1.5),
+                        max_range_m=float(req.max_range_m or 2000.0),
+                        dr_m=float(req.step_m or 5.0),
+                        dtheta_deg=float(req.dtheta_deg or 5.0),
+                        version=PROFILE_VERSION,
+                    )
+                    return _ps is not None and any(p.terrain_heights for p in _ps.profiles)
+                except Exception:
+                    return False
+
+            if not _mesh_ready():
+                _utc_pr = datetime.now(timezone.utc).isoformat()
+                with _ui_profile_request_lock:
+                    _ui_profile_request["seq"] = int(_ui_profile_request.get("seq") or 0) + 1
+                    _ui_profile_request["lat"] = req.lat
+                    _ui_profile_request["lon"] = req.lon
+                    _ui_profile_request["tx_height_m"] = float(req.tx_height_m or 0.0)
+                    _ui_profile_request["rx_height_m"] = float(req.rx_height_m or 1.5)
+                    _ui_profile_request["max_range_m"] = float(req.max_range_m or 2000.0)
+                    _ui_profile_request["dr_m"] = float(req.step_m or 5.0)
+                    _ui_profile_request["dtheta_deg"] = float(req.dtheta_deg or 5.0)
+                    _ui_profile_request["requested_utc"] = _utc_pr
+                logger.info("api/plan: waiting for /3d browser to generate mesh profiles (%.6f, %.6f)…", req.lat, req.lon)
+                _deadline = _aio.get_event_loop().time() + 600.0
+                while _aio.get_event_loop().time() < _deadline:
+                    await _aio.sleep(1.5)
+                    if _mesh_ready():
+                        logger.info("api/plan: mesh profiles ready — proceeding.")
+                        break
+                else:
+                    with _ui_profile_request_lock:
+                        _ui_profile_request["lat"] = None
+                    raise HTTPException(
+                        status_code=504,
+                        detail="Timed out waiting for /3d browser to generate mesh profiles. Open /3d tab and try again.",
+                    )
+                with _ui_profile_request_lock:
+                    _ui_profile_request["lat"] = None
+
         logger.info("Step 2: Calling run_rf_planning_for_point...")
         _record_planner_phase("planner_dispatch", "Dispatching RF planning pipeline", None)
         # Run in executor to avoid blocking the event loop during long processing
@@ -1434,6 +1614,9 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         logger.info(f"  Result keys: {list(result.keys())}")
         if req.rx_sites:
             result["rx_sites"] = list(req.rx_sites)
+        result["planner_surface"] = _infer_planner_surface(req, str(result.get("ray_mode") or effective_ray_mode))
+        with _last_plan_result_lock:
+            _last_plan_result["plan"] = result
         if req.publish_ui:
             _rf_remote_ui_publish_plan_result(result, logger)
         return result
@@ -1469,7 +1652,58 @@ async def api_ui_remote_plan_rf(req: RemotePlanRFRequest) -> Dict[str, Any]:
     plan_body = req.model_dump(exclude={"rx_lat", "rx_lon"})
     plan_body["publish_ui"] = False
     plan_only = PlanRequest(**plan_body)
-    ray_mode_eff = (plan_only.ray_mode or "2d").strip().lower()
+    ray_mode_eff = _resolve_effective_ray_mode(plan_only)
+
+    # When dem_source=copernicus_mesh, ensure mesh profiles exist before running plan.
+    # If missing, signal the /3d browser via the poll queue and wait up to 180s.
+    dem_source_req = str(getattr(plan_only, "dem_source", "") or "").strip().lower()
+    if dem_source_req == "copernicus_mesh":
+        import asyncio as _asyncio
+        from ..geo.google_mesh import MeshProfileStore as _MeshProfileStore
+        from ..pipeline.schemas import LatLon as _LatLon
+
+        def _profiles_ready() -> bool:
+            try:
+                _store = _MeshProfileStore()
+                _tx = _LatLon(lat=plan_only.lat, lon=plan_only.lon)
+                _ps = _store.get(
+                    tx=_tx,
+                    tx_height_m=float(plan_only.tx_height_m or 0.0),
+                    rx_height_m=float(plan_only.rx_height_m or 1.5),
+                    max_range_m=float(plan_only.max_range_m or 2000.0),
+                    dr_m=float(plan_only.step_m or 5.0),
+                    dtheta_deg=float(plan_only.dtheta_deg or 5.0),
+                    version=PROFILE_VERSION,
+                )
+                return _ps is not None and any(p.terrain_heights for p in _ps.profiles)
+            except Exception:
+                return False
+
+        if not _profiles_ready():
+            utc_pr = datetime.now(timezone.utc).isoformat()
+            with _ui_profile_request_lock:
+                _ui_profile_request["seq"] = int(_ui_profile_request.get("seq") or 0) + 1
+                _ui_profile_request["lat"] = plan_only.lat
+                _ui_profile_request["lon"] = plan_only.lon
+                _ui_profile_request["tx_height_m"] = float(plan_only.tx_height_m or 0.0)
+                _ui_profile_request["rx_height_m"] = float(plan_only.rx_height_m or 1.5)
+                _ui_profile_request["max_range_m"] = float(plan_only.max_range_m or 2000.0)
+                _ui_profile_request["dr_m"] = float(plan_only.step_m or 5.0)
+                _ui_profile_request["dtheta_deg"] = float(plan_only.dtheta_deg or 5.0)
+                _ui_profile_request["requested_utc"] = utc_pr
+            logger.info("Waiting for /3d browser to generate mesh profiles (%.6f, %.6f)…", plan_only.lat, plan_only.lon)
+            deadline = _asyncio.get_event_loop().time() + 600.0
+            while _asyncio.get_event_loop().time() < deadline:
+                await _asyncio.sleep(1.5)
+                if _profiles_ready():
+                    logger.info("Mesh profiles now available — proceeding with plan.")
+                    break
+            else:
+                with _ui_profile_request_lock:
+                    _ui_profile_request["lat"] = None
+                raise HTTPException(status_code=504, detail="Timed out waiting for /3d browser to generate mesh profiles. Ensure /3d tab is open.")
+            with _ui_profile_request_lock:
+                _ui_profile_request["lat"] = None
 
     try:
         if ray_mode_eff in ("3d_rt", "3d-rt", "rt3d"):
@@ -1487,6 +1721,7 @@ async def api_ui_remote_plan_rf(req: RemotePlanRFRequest) -> Dict[str, Any]:
             result: Dict[str, Any] = {
                 "mode": "3d_rt",
                 "ray_mode": "3d_rt",
+                "planner_surface": _infer_planner_surface(plan_only, "3d_rt"),
                 "original_point": {"lat": plan_only.lat, "lon": plan_only.lon},
                 "snapped_tx": {"lat": plan_only.lat, "lon": plan_only.lon},
                 "rx_point": {"lat": float(req.rx_lat), "lon": float(req.rx_lon)},
@@ -1528,11 +1763,7 @@ async def api_ui_remote_plan_rf(req: RemotePlanRFRequest) -> Dict[str, Any]:
         _ui_remote_plan["error"] = None
         _ui_remote_plan["completed_utc"] = utc_done
     logger.info("Remote plan RF published for UI poll: seq=%s", new_seq)
-    return {
-        "ok": True,
-        "seq": new_seq,
-        "message": "Plan published. Open /3d tabs will pick this up via poll and draw on Cesium.",
-    }
+    return result
 
 
 @app.get("/api/ui/remote-plan-rf/poll")
@@ -1558,7 +1789,243 @@ async def api_ui_remote_plan_rf_poll(since_seq: int = 0) -> Dict[str, Any]:
             out["plan"] = plan
         elif st == "error" and err is not None:
             out["error"] = err
+
+    # Include pending profile generation request for the /3d browser.
+    with _ui_profile_request_lock:
+        pr = dict(_ui_profile_request)
+    if pr.get("seq", 0) > 0 and pr.get("lat") is not None:
+        out["profile_request"] = {k: pr[k] for k in ("seq", "lat", "lon", "tx_height_m", "rx_height_m", "max_range_m", "dr_m", "dtheta_deg", "requested_utc")}
+
+    # Include pending clear-map command.
+    with _ui_clear_map_lock:
+        cm_seq = int(_ui_clear_map.get("seq") or 0)
+        cm_utc = _ui_clear_map.get("requested_utc")
+    if cm_seq > int(since_seq):
+        out["clear_map"] = {"seq": cm_seq, "requested_utc": cm_utc}
+
+    # Include pending screenshot capture request.
+    # Screenshot seq is independent of plan seq — always include when active (seq > 0).
+    with _screenshot_lock:
+        sc_seq = int(_screenshot_request.get("seq") or 0)
+        sc_utc = _screenshot_request.get("requested_utc")
+    if sc_seq > 0:
+        out["screenshot_request"] = {"seq": sc_seq, "requested_utc": sc_utc}
+
     return out
+
+
+@app.post("/api/ui/upload-screenshot")
+async def api_ui_upload_screenshot(request: Request) -> Dict[str, Any]:
+    """Browser uploads a captured PNG screenshot. filename passed as query param."""
+    filename = request.query_params.get("filename", "screenshot.png")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty body")
+    with _screenshot_lock:
+        _screenshot_store[filename] = data
+    return {"status": "ok", "filename": filename, "bytes": len(data)}
+
+
+@app.get("/api/export-zip")
+async def api_export_zip() -> StreamingResponse:
+    """Build and return a ZIP of the last plan result: metadata.json + heatmap PNGs.
+
+    Equivalent to what the Export ZIP button does in the UI, minus browser screenshots
+    (those require the Cesium canvas). Works for any planner surface.
+    """
+    import zipfile
+    import io
+    import base64
+
+    with _last_plan_result_lock:
+        plan = _last_plan_result.get("plan")
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="No plan result available. Run a plan first.")
+
+    # Signal browser to capture screenshots, clear any stale ones, wait up to 30s.
+    import asyncio as _asyncio
+    with _screenshot_lock:
+        _screenshot_store.clear()
+        _screenshot_request["seq"] = int(_screenshot_request.get("seq") or 0) + 1
+        _screenshot_request["requested_utc"] = datetime.now(timezone.utc).isoformat()
+
+    deadline = _asyncio.get_event_loop().time() + 30.0
+    while _asyncio.get_event_loop().time() < deadline:
+        await _asyncio.sleep(1.0)
+        with _screenshot_lock:
+            has_both = "full_view.png" in _screenshot_store and "full_view_without_rf.png" in _screenshot_store
+        if has_both:
+            break
+    # Continue even if screenshots didn't arrive (no browser open) — ZIP will lack them.
+
+    with _screenshot_lock:
+        screenshots = dict(_screenshot_store)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname, fdata in screenshots.items():
+            zf.writestr(fname, fdata)
+        # metadata.json — mirrors export_utils.js buildExportMetadata structure
+        plans_meta = []
+        for i, p in enumerate([plan] if not isinstance(plan, list) else plan):
+            heatmap = p.get("heatmap") or {}
+            grid = p.get("grid") or {}
+            snapped = p.get("snapped_tx") or p.get("original_point") or {}
+            rf = p.get("rf_config_used") or grid.get("rf_params") or {}
+            rsrp = grid.get("rsrp_dbm") or []
+            rsrp_finite = [v for v in rsrp if isinstance(v, (int, float)) and v == v]
+            plans_meta.append({
+                "plan_index": i + 1,
+                "gnodeb_index": i + 1,
+                "tx_lat": snapped.get("lat"),
+                "tx_lon": snapped.get("lon"),
+                "snapped_tx": snapped,
+                "heatmap_overlay_file": f"heatmap_overlay_TX{i + 1}.png",
+                "heatmap_radius_m": heatmap.get("radius_m"),
+                "ray_mode": p.get("ray_mode"),
+                "planner_surface": p.get("planner_surface"),
+                "rf_config_used": rf,
+                "rsrp_min_dbm": min(rsrp_finite) if rsrp_finite else None,
+                "rsrp_max_dbm": max(rsrp_finite) if rsrp_finite else None,
+                "heatmap_scale": {
+                    "vmin": heatmap.get("vmin", -140),
+                    "vmax": heatmap.get("vmax", -60),
+                    "actual_min": heatmap.get("actual_min"),
+                    "actual_max": heatmap.get("actual_max"),
+                },
+                "sectors": p.get("sectors") or [],
+                "terrain": p.get("terrain"),
+            })
+
+            # heatmap_overlay_TXn.png
+            png_b64 = heatmap.get("png_b64", "")
+            if png_b64:
+                m = png_b64.split(",", 1)
+                raw = base64.b64decode(m[1] if len(m) == 2 else m[0])
+                zf.writestr(f"heatmap_overlay_TX{i + 1}.png", raw)
+
+            # per-sector heatmaps
+            hbs = p.get("heatmap_by_sector") or {}
+            sectors = p.get("sectors") or []
+            for j, sec in enumerate(sectors):
+                sid = str(sec.get("sector_id", j + 1)).replace("/", "_")
+                sec_hm = hbs.get(str(sec.get("sector_id", ""))) or hbs.get(str(j))
+                if sec_hm and sec_hm.get("png_b64"):
+                    m2 = sec_hm["png_b64"].split(",", 1)
+                    raw2 = base64.b64decode(m2[1] if len(m2) == 2 else m2[0])
+                    zf.writestr(f"heatmap_gnb{i + 1}_sector_{j + 1}_{sid}.png", raw2)
+
+        metadata = {
+            "export_timestamp_iso": datetime.now(timezone.utc).isoformat(),
+            "planner_version": plan.get("planner_surface", "3d") if isinstance(plan, dict) else "3d",
+            "plans": plans_meta,
+        }
+        zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+
+    buf.seek(0)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    filename = f"rf_planner_export_{ts}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/ui/clear-map")
+async def api_ui_clear_map() -> Dict[str, Any]:
+    """Tell all open /3d and /2d tabs to clear their map overlays."""
+    utc_now = datetime.now(timezone.utc).isoformat()
+    with _ui_clear_map_lock:
+        _ui_clear_map["seq"] = int(_ui_clear_map.get("seq") or 0) + 1
+        new_seq = int(_ui_clear_map["seq"])
+        _ui_clear_map["requested_utc"] = utc_now
+    return {"status": "ok", "seq": new_seq}
+
+
+@app.post("/api/import-zip")
+async def api_import_zip(request: Request) -> Dict[str, Any]:
+    """Import an exported ZIP and draw it on all open /3d and /2d tabs.
+
+    Accepts multipart/form-data with field 'file', or raw ZIP bytes as body.
+    Extracts metadata.json + heatmap PNGs and pushes to the plan poll queue.
+    """
+    import zipfile
+    import io
+    import base64
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart" in content_type:
+        from fastapi import UploadFile
+        form = await request.form()
+        file_field = form.get("file")
+        if file_field is None:
+            raise HTTPException(status_code=400, detail="multipart field 'file' missing")
+        zip_bytes = await file_field.read()
+    else:
+        zip_bytes = await request.body()
+
+    if not zip_bytes:
+        raise HTTPException(status_code=400, detail="Empty body")
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Not a valid ZIP file")
+
+    names = zf.namelist()
+    if "metadata.json" not in names:
+        raise HTTPException(status_code=400, detail="ZIP missing metadata.json")
+
+    metadata = json.loads(zf.read("metadata.json"))
+    plans_meta = metadata.get("plans") or []
+    if not plans_meta:
+        raise HTTPException(status_code=400, detail="metadata.json has no plans")
+
+    # Reconstruct plan result from first plan entry + heatmap PNG
+    p = plans_meta[0]
+    heatmap_file = p.get("heatmap_overlay_file", "heatmap_overlay_TX1.png")
+    png_b64 = None
+    if heatmap_file in names:
+        raw = zf.read(heatmap_file)
+        png_b64 = "data:image/png;base64," + base64.b64encode(raw).decode()
+
+    # Per-sector heatmaps
+    heatmap_by_sector: Dict[str, Any] = {}
+    for row in p.get("sector_export_rows") or []:
+        per_sec_file = row.get("per_sector_heatmap")
+        sid = str(row.get("sector_id", ""))
+        if per_sec_file and per_sec_file in names and sid:
+            raw_s = zf.read(per_sec_file)
+            b64_s = "data:image/png;base64," + base64.b64encode(raw_s).decode()
+            heatmap_by_sector[sid] = {"png_b64": b64_s, "radius_m": p.get("heatmap_radius_m")}
+
+    hs = p.get("heatmap_scale") or {}
+    plan_result: Dict[str, Any] = {
+        "ray_mode": p.get("ray_mode", "3d_osm"),
+        "planner_surface": p.get("planner_surface") or metadata.get("planner_version", "3d"),
+        "original_point": p.get("snapped_tx"),
+        "snapped_tx": p.get("snapped_tx"),
+        "rf_config_used": p.get("rf_config_used"),
+        "sectors": p.get("sectors") or [],
+        "heatmap": {
+            "png_b64": png_b64,
+            "radius_m": p.get("heatmap_radius_m"),
+            "vmin": hs.get("vmin", -140),
+            "vmax": hs.get("vmax", -60),
+            "actual_min": hs.get("actual_min"),
+            "actual_max": hs.get("actual_max"),
+        },
+        "heatmap_by_sector": heatmap_by_sector or None,
+        "grid": {"rf_params": p.get("rf_config_used"), "tx": p.get("snapped_tx")},
+        "terrain": p.get("terrain"),
+        "_imported": True,
+    }
+
+    seq = _rf_remote_ui_publish_plan_result(plan_result)
+    snapped = p.get("snapped_tx") or {}
+    return {"status": "imported", "seq": seq, "tx_lat": snapped.get("lat"), "tx_lon": snapped.get("lon")}
 
 
 @app.post("/api/ui/remote-3d-rt")
@@ -2046,30 +2513,35 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
     
     Request body (optional JSON):
         {
-            "clear_osm": true/false  # If True, clears persistent OSM cache. Default: False
+            "clear_osm": true/false,  # If True, clears persistent OSM cache. Default: False
+            "clear_dem": true/false,  # If True, clears persistent DEM elevation cache. Default: False
+            "clear_mesh": true/false  # If True, clears Google mesh profile cache. Default: False
         }
     
-    Note: OSM cache is preserved by default to avoid repeated API calls for the same region.
-          Set clear_osm=true only if you need to force fresh data.
+    Note: OSM and DEM caches are preserved by default to avoid repeated API calls.
+          Set clear_osm=true or clear_dem=true only if you need to force fresh data.
     """
     logger = logging.getLogger(__name__)
     
     # Parse request body (if provided)
     clear_osm = False
+    clear_dem = False
     clear_mesh = False
     try:
         body = await req.json()
         if isinstance(body, dict):
             clear_osm = body.get("clear_osm", False)
+            clear_dem = body.get("clear_dem", False)
             clear_mesh = body.get("clear_mesh", False)
     except:
-        # No body provided, use default (preserve OSM cache)
+        # No body provided, use default (preserve persistent caches)
         pass
     
     result = {
         "status": "ok",
         "message": "Cache cleared",
         "osm_cache_cleared": False,
+        "dem_cache_cleared": False,
         "mesh_cache_cleared": False,
     }
     
@@ -2090,7 +2562,33 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
         })
     else:
         logger.info("Cache clear requested - OSM cache preserved (use clear_osm=true to clear)")
-        result["message"] = "In-memory cache cleared. OSM cache preserved (to avoid repeated API calls)."
+
+    if clear_dem:
+        from ..geo.dem_cache import clear_dem_cache, get_dem_cache_stats
+
+        stats_before = get_dem_cache_stats()
+        deleted_rows = clear_dem_cache()
+        logger.info(f"DEM cache clear requested - deleted {deleted_rows} row(s)")
+        result.update({
+            "dem_cache_cleared": True,
+            "dem_rows_deleted": deleted_rows,
+            "dem_cache_stats_before": stats_before,
+        })
+
+    if clear_osm or clear_dem or clear_mesh:
+        parts = []
+        if clear_osm:
+            parts.append("OSM")
+        if clear_dem:
+            parts.append("DEM")
+        if clear_mesh:
+            parts.append("mesh")
+        result["message"] = f"Persistent cache cleared: {', '.join(parts)}"
+    else:
+        result["message"] = (
+            "In-memory cache cleared. OSM/DEM caches preserved "
+            "(use clear_osm=true or clear_dem=true to clear)."
+        )
 
     if clear_mesh:
         store = MeshProfileStore()
