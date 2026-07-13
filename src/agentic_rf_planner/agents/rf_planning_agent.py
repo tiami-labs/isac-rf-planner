@@ -63,7 +63,7 @@ def run_rf_planning_for_point(
     map_provider: Optional[MapProvider] = None,
     max_snap_distance_m: float = 50.0,  # Increased default for better coverage
     num_views: int = 4,
-    ray_mode: str = "2d",  # "2d" (OSM polygons) or "3d" (Google mesh profiles)
+    ray_mode: str = "2d",  # "2d", "3d_osm", "3d_rt", "3d_rt_osm"
     tx_height_m: float = 0.0,
     rx_height_m: float = 1.5,
     progress_cb: Optional[Callable[[str, str], None]] = None,
@@ -147,8 +147,8 @@ def run_rf_planning_for_point(
         #   - 3D: GoogleMeshOSMMapProvider (persisted mesh ray profiles, OSM semantics)
         try:
             ray_mode_l = str(ray_mode).lower()
-            if ray_mode_l in ("3d", "mesh", "google_mesh", "google-mesh", "3d_rt", "3d-rt"):
-                logger.info("  Creating GoogleMeshOSMMapProvider (3D)...")
+            if ray_mode_l in ("3d_rt", "3d-rt"):
+                logger.info("  Creating GoogleMeshOSMMapProvider (3D RT)...")
                 from ..geo.google_mesh import GoogleMeshOSMMapProvider, MeshProfileStore, MissingMeshProfiles
 
                 osm = OSMMapProvider(cache_radius_m=1000.0, slice_height_m=tx_height_m)
@@ -163,20 +163,15 @@ def run_rf_planning_for_point(
                     dtheta_deg=getattr(rf_params, "dtheta_deg", 5.0),
                 )
 
-                # Fail fast if mesh profiles are missing (avoid spending time before erroring).
                 try:
                     map_provider.prefetch_all_data(snapped.latlon, rf_params.max_range_m + 50.0)
                 except MissingMeshProfiles as e:
-                    # 3D mode requires mesh profiles - fall back to 2D OSM mode instead of stub
-                    logger.warning(f"  3D mesh profiles missing (key={e.key}), falling back to 2D OSM mode")
-                    logger.info("  Using OSM MapProvider (2D) as fallback...")
-                    map_provider = osm  # Use the OSM provider we already created
-                    # Update ray_mode to 2d for consistency
-                    rf_params.ray_mode = "2d"
-                    logger.info("✓ Using OSM MapProvider for geometry-based world model (2D fallback)")
+                    logger.warning(f"  3D RT mesh profiles missing (key={e.key}), falling back to OSM")
+                    map_provider = osm
+                    rf_params.ray_mode = "3d_osm"
 
                 if map_provider is not None and not isinstance(map_provider, OSMMapProvider):
-                    logger.info("✓ Using Google-mesh MapProvider (3D ray propagation)")
+                    logger.info("✓ Using Google-mesh MapProvider (3D RT)")
             elif ray_mode_l in ("3d_osm", "3d-osm", "osm3d"):
                 # 3D (OSM-only) is a height-sliced variant of OSM polygons.
                 # We keep the same ray-march + material-loss logic, but filter
@@ -351,11 +346,48 @@ def run_rf_planning_for_point(
     logger.debug("Building world model from geometry...")
     terrain_provider = None
     if bool(getattr(rf_params, "terrain_enabled", True)):
-        from ..geo.terrain_provider import create_terrain_provider
+        from ..geo.terrain_provider import create_terrain_provider, create_terrain_provider_with_mesh
+        from ..geo.google_mesh import MeshProfileStore
+        from ..geo.google_mesh.profile_types import PROFILE_VERSION
 
-        terrain_provider = create_terrain_provider(rf_params)
-        if terrain_provider is not None:
-            progress("terrain", "Loading DEM for terrain-aware propagation")
+        _dem_source = str(getattr(rf_params, "dem_source", "") or "").strip().lower()
+
+        if _dem_source == "copernicus_mesh":
+            _mesh_profile_set = None
+            try:
+                _store = MeshProfileStore()
+                _mesh_profile_set = _store.get(
+                    tx=snapped.latlon,
+                    tx_height_m=tx_height_m,
+                    rx_height_m=rx_height_m,
+                    max_range_m=float(rf_params.max_range_m),
+                    dr_m=float(rf_params.step_m),
+                    dtheta_deg=float(getattr(rf_params, "dtheta_deg", 5.0)),
+                    version=PROFILE_VERSION,
+                )
+            except Exception as _e:
+                logger.debug("Mesh profile lookup failed (non-critical): %s", _e)
+
+            _has_mesh_terrain = (
+                _mesh_profile_set is not None
+                and any(p.terrain_heights for p in _mesh_profile_set.profiles)
+            )
+
+            if _has_mesh_terrain:
+                terrain_provider = create_terrain_provider_with_mesh(rf_params, _mesh_profile_set)
+                if terrain_provider is not None:
+                    n_profiles = sum(1 for p in _mesh_profile_set.profiles if p.terrain_heights)
+                    logger.info("Terrain: Google mesh (%d bearing profiles) + Copernicus fallback", n_profiles)
+                    progress("terrain", f"Google mesh terrain active ({n_profiles} bearing profiles) + Copernicus fallback")
+            else:
+                terrain_provider = create_terrain_provider(rf_params)
+                if terrain_provider is not None:
+                    logger.info("Terrain: Copernicus 30m (mesh profiles not yet generated)")
+                    progress("terrain", "Loading DEM for terrain-aware propagation")
+        else:
+            terrain_provider = create_terrain_provider(rf_params)
+            if terrain_provider is not None:
+                progress("terrain", "Loading DEM for terrain-aware propagation")
     world = build_world_model(
         tx=snapped.latlon,
         rf_params=rf_params,
@@ -363,13 +395,17 @@ def run_rf_planning_for_point(
         map_provider=map_provider,
         terrain_provider=terrain_provider,
     )
-    logger.info(f"Built world model with {len(world.cells)} cells")
-    progress("world_model", f"World model built ({len(world.cells)} candidate cells)")
+    num_world_cells = len(world.cells)
+    logger.info(f"Built world model with {num_world_cells} cells")
+    progress("world_model", f"World model built ({num_world_cells} candidate cells)")
 
     # 5) RF attenuation
     progress("attenuation", "Computing per-cell RSRP, serving cell, and interference")
     logger.debug("Computing RF attenuation...")
     grid = compute_attenuation_grid(world)
+    # The attenuation grid now owns all output values; release per-cell Pydantic
+    # objects before raster encoding and response serialization.
+    world.cells.clear()
     logger.info(f"Computed attenuation grid with {len(grid.cell_lat)} points")
     progress("attenuation", f"RF attenuation complete ({len(grid.cell_lat)} output points)")
 
@@ -381,12 +417,29 @@ def run_rf_planning_for_point(
     except Exception:
         step_m = 5.0
     base = (2.0 * float(rf_params.max_range_m)) / max(5.0, step_m)
-    tex_size = int(min(1024, max(512, round(base))))
+    is_dvt_plan = str(getattr(rf_params, "technology", "5g_nr") or "5g_nr").lower() == "dvt"
+    # A 40 km diameter at 20 m output spacing needs ~2000 pixels to retain the
+    # requested display resolution. Existing 5G texture limits remain unchanged.
+    texture_cap = 2048 if is_dvt_plan else 1024
+    tex_size = int(min(texture_cap, max(512, round(base))))
     # 2D OSM and 3D modes share the same pre-colored ellipse PNG (local ENU → texture),
     # so Leaflet and Cesium both get a continuous drape instead of radial spoke circles.
     logger.debug(f"Generating ellipse heatmap PNG (size={tex_size}, ray_mode={ray_mode_eff2})...")
     progress("heatmap", f"Rendering heatmap texture ({tex_size} px)")
-    heatmap_payload = attenuation_grid_to_png_ellipse(grid, size=tex_size, vmin=-140.0, vmax=-60.0)
+    if is_dvt_plan and grid.field_strength_dbuv_m:
+        heatmap_payload = attenuation_grid_to_png_ellipse(
+            grid,
+            size=tex_size,
+            vmin=20.0,
+            vmax=120.0,
+            rsrp_values=list(grid.field_strength_dbuv_m),
+        )
+        heatmap_payload["layer"] = "field_strength_dbuv_m"
+        heatmap_payload["units"] = "dBuV/m"
+    else:
+        heatmap_payload = attenuation_grid_to_png_ellipse(grid, size=tex_size, vmin=-140.0, vmax=-60.0)
+        heatmap_payload["layer"] = "rsrp_dbm"
+        heatmap_payload["units"] = "dBm"
     logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
     progress("heatmap", "Heatmap rendering complete")
 
@@ -406,6 +459,32 @@ def run_rf_planning_for_point(
                 logger.warning("Per-sector heatmap failed for %s: %s", sid, e)
     progress("heatmap", f"Per-sector rasters: {len(heatmap_by_sector)}")
 
+    # Alternate layer PNGs (same ellipse drape as RSRP — not per-cell point/voxel grid).
+    heatmap_terrain: Optional[Dict[str, Any]] = None
+    heatmap_sinr: Optional[Dict[str, Any]] = None
+    if grid.terrain_loss_db:
+        try:
+            terrain_cap = float(getattr(rf_params, "terrain_loss_cap_db", 40.0) or 40.0)
+            heatmap_terrain = attenuation_grid_to_png_ellipse(
+                grid,
+                size=tex_size,
+                vmin=0.0,
+                vmax=terrain_cap,
+                rsrp_values=list(grid.terrain_loss_db),
+            )
+        except Exception as e:
+            logger.warning("Terrain loss heatmap PNG failed: %s", e)
+    if grid.sinr_db:
+        try:
+            heatmap_sinr = attenuation_grid_to_png_ellipse(
+                grid,
+                size=tex_size,
+                vmin=-5.0,
+                vmax=30.0,
+                rsrp_values=list(grid.sinr_db),
+            )
+        except Exception as e:
+            logger.warning("SINR heatmap PNG failed: %s", e)
 
     # Sectors: use validated SectorConfig (same as coverage/physics) so API/UI see resolved HPBW, azimuth, etc.
     sectors_info: List[Dict[str, Any]] = []
@@ -418,17 +497,29 @@ def run_rf_planning_for_point(
     
     # Prepare response
     
-    # Reduce payload size for 3D OSM-only mode unless terrain metadata is needed.
-    grid_payload = grid.model_dump()
-    terrain_on = bool(getattr(rf_params, "terrain_enabled", True))
-    if ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d") and not terrain_on:
-        try:
-            grid_payload["num_points"] = len(grid.cell_lat)
-        except Exception:
-            pass
-        for k in ("cell_lat", "cell_lon", "rsrp_dbm", "sinr_db", "modulation", "throughput_mbps", "rsrp_by_sector"):
-            if k in grid_payload:
-                grid_payload[k] = [] if k != "rsrp_by_sector" else {}
+    # Reduce payload size for 3D OSM-only mode (terrain or not — same PNG drape path).
+    compact_setting = getattr(rf_params, "compact_output", None)
+    compact_large_dvt = (
+        is_dvt_plan
+        and compact_setting is not False
+        and (compact_setting is True or len(grid.cell_lat) > 100000)
+    )
+    compact_grid = ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d") or compact_large_dvt
+    compact_fields = {
+        "cell_lat", "cell_lon", "rsrp_dbm", "received_power_dbm",
+        "field_strength_dbuv_m", "sinr_db", "modulation", "throughput_mbps",
+        "serving_sector_id", "interferer_count", "top_interferer_rsrp_dbm",
+        "pilot_pollution_metric_db", "rsrp_by_sector", "terrain_loss_db",
+        "los_terrain", "terrain_state", "z_ground_m",
+    }
+    # Excluding before model_dump avoids constructing a second multi-million-item
+    # copy only to delete it immediately afterward.
+    grid_payload = grid.model_dump(exclude=compact_fields if compact_grid else None)
+    if compact_grid:
+        grid_payload["num_points"] = len(grid.cell_lat)
+        grid_payload["compacted"] = True
+        for k in compact_fields:
+            grid_payload[k] = {} if k == "rsrp_by_sector" else []
 
     # Use the effective mode after provider init/fallbacks.
     effective_ray_mode = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode)
@@ -461,6 +552,10 @@ def run_rf_planning_for_point(
         "heatmap_by_sector": heatmap_by_sector if heatmap_by_sector else None,
         "building_area_sqm": building_area_sqm,
     }
+    if heatmap_terrain:
+        result["heatmap_terrain"] = heatmap_terrain
+    if heatmap_sinr:
+        result["heatmap_sinr"] = heatmap_sinr
 
     if bool(getattr(rf_params, "terrain_enabled", True)):
         result["terrain"] = {
@@ -516,7 +611,7 @@ def run_rf_planning_for_point(
     # Add VLM results if available
     if views:
         result["world_model"] = {
-            "num_cells": len(world.cells),
+            "num_cells": num_world_cells,
             "materials_detected": len(views),
         }
 
