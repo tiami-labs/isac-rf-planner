@@ -91,15 +91,25 @@ def build_world_model(
     )
     logger.info(f"Created {len(cells)} cells in coverage grid (with adaptive termination)")
     
-    # Performance fast-path: 3D OSM-only mode renders from a raster/PNG overlay and only
-    # requires the propagation state already stamped into each cell by build_coverage_grid.
-    # The geometry/VLM refinement below is expensive and redundant for this mode.
+    # Performance fast-path: coverage_grid has already evaluated every OSM/mesh
+    # interval and stamped the resulting state into each cell. If no VLM refinement
+    # is requested, repeating per-cell map queries is redundant for both 2D and 3D.
     ray_mode_eff = str(getattr(rf_params, "ray_mode", "") or "").strip().lower()
-    if ray_mode_eff in ("3d_osm", "3d-osm", "osm3d"):
-        logger.info("3D OSM-only mode: skipping per-cell world refinement (using coverage-grid propagation state)")
-        z_tx_ground_m = None
-        z_tx_abs_m = None
-        if terrain_provider is not None:
+    coverage_state_complete = bool(cells and getattr(cells[0], "coverage_precomputed", False))
+    if not views and (coverage_state_complete or ray_mode_eff in ("3d_osm", "3d-osm", "osm3d")):
+        logger.info("Coverage state precomputed: skipping redundant per-cell world refinement")
+        configured_site_altitude_m = getattr(rf_params, "site_altitude_m", None)
+        z_tx_ground_m = (
+            float(configured_site_altitude_m)
+            if configured_site_altitude_m is not None
+            else None
+        )
+        z_tx_abs_m = (
+            z_tx_ground_m + float(rf_params.tx_height_m)
+            if z_tx_ground_m is not None
+            else None
+        )
+        if terrain_provider is not None and configured_site_altitude_m is None:
             z_tx_ground_m = float(terrain_provider.elevation_m(tx.lat, tx.lon))
             z_tx_abs_m = z_tx_ground_m + float(rf_params.tx_height_m)
         return WorldModel(
@@ -118,13 +128,18 @@ def build_world_model(
     
     for cell in cells:
         bearing = cell.bearing_deg  # 0–360
+        coverage_precomputed = bool(getattr(cell, "coverage_precomputed", False))
         
-        # PRIMARY: Assign material from geometry (map data)
-        material_from_geometry = _estimate_material_from_geometry(
-            tx=tx,
-            cell=cell,
-            map_provider=map_provider,
-        )
+        # PRIMARY: Reuse the exact polar interval result when coverage_grid has
+        # already evaluated this path. Legacy/external cells retain the old query path.
+        if coverage_precomputed:
+            material_from_geometry = getattr(cell, "dominant_material", MaterialType.UNKNOWN)
+        else:
+            material_from_geometry = _estimate_material_from_geometry(
+                tx=tx,
+                cell=cell,
+                map_provider=map_provider,
+            )
         
         # SECONDARY: Refine with VLM if available
         if views:
@@ -138,9 +153,9 @@ def build_world_model(
             matched_material = material_from_geometry
 
         # Phase 1: LOS detection and path length
-        is_los = True
-        num_buildings = 0
-        num_trees = 0
+        is_los = bool(getattr(cell, "is_los", True)) if coverage_precomputed else True
+        num_buildings = int(getattr(cell, "num_buildings", 0) or 0) if coverage_precomputed else 0
+        num_trees = int(getattr(cell, "num_trees", 0) or 0) if coverage_precomputed else 0
         actual_path_length_m = cell.distance_m  # Default to straight-line
         
         penetration_loss_db = float(getattr(cell, 'penetration_loss_db', 0.0) or 0.0)
@@ -156,6 +171,7 @@ def build_world_model(
             and diffraction_loss_db == 0.0
             and canyon_recovery_db == 0.0
             and map_provider is not None
+            and not coverage_precomputed
         ):
             # Legacy fallback for any cells that predate the split-loss model.
             cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
@@ -173,7 +189,7 @@ def build_world_model(
                     "wood", rf_params.freq_mhz, attenuation_config=bldg_atten_cfg
                 )
         
-        if map_provider is not None:
+        if map_provider is not None and not coverage_precomputed:
             cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
             
             # Get buildings along ray with material information (for counting/classification)
@@ -198,8 +214,8 @@ def build_world_model(
             actual_path_length_m = cell.distance_m  # Use straight-line distance
         
         # Count obstacles along LOS (existing logic)
-        obstacles_count = 0
-        if map_provider is not None:
+        obstacles_count = int(getattr(cell, "obstacles_count", 0) or 0)
+        if map_provider is not None and not coverage_precomputed:
             obstacles_count = estimate_obstacles_along_ray(
                 tx=tx,
                 target_lat=cell.lat,
@@ -244,11 +260,25 @@ def build_world_model(
         rf_params=rf_params,
         cells=cells,
         z_tx_ground_m=(
-            float(terrain_provider.elevation_m(tx.lat, tx.lon)) if terrain_provider is not None else None
+            float(rf_params.site_altitude_m)
+            if getattr(rf_params, "site_altitude_m", None) is not None
+            else (
+                float(terrain_provider.elevation_m(tx.lat, tx.lon))
+                if terrain_provider is not None
+                else None
+            )
         ),
         z_tx_abs_m=(
-            float(terrain_provider.elevation_m(tx.lat, tx.lon)) + float(rf_params.tx_height_m)
-            if terrain_provider is not None
+            (
+                float(rf_params.site_altitude_m)
+                if getattr(rf_params, "site_altitude_m", None) is not None
+                else float(terrain_provider.elevation_m(tx.lat, tx.lon))
+            )
+            + float(rf_params.tx_height_m)
+            if (
+                getattr(rf_params, "site_altitude_m", None) is not None
+                or terrain_provider is not None
+            )
             else None
         ),
     )

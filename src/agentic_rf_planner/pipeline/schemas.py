@@ -3,7 +3,9 @@
 from enum import Enum
 from typing import List, Optional, Dict, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+from ..rf.dvt import DVTTransmitter
 
 
 class LatLon(BaseModel):
@@ -62,7 +64,11 @@ class ViewTileDescription(BaseModel):
 
 
 class RFParams(BaseModel):
-    """RF simulation parameters."""
+    """RF simulation parameters for 5G NR and DVT transmitters."""
+
+    technology: str = "5g_nr"  # 5g_nr | dvt
+    waveform: Optional[str] = None  # 5g_nr | atsc1 | atsc3 | dvbt | baseline
+    dvt: Optional[DVTTransmitter] = None
 
     freq_mhz: float
     tx_power_dbm: float
@@ -107,6 +113,7 @@ class RFParams(BaseModel):
     # - RSRP is derived from a reference-signal-equivalent source term using
     #   EPRE-style spreading plus antenna/feed assumptions and a conservative
     #   reference-signal offset tuned for typical mid-band macro deployments.
+    tx_chain_gain_db: float = 0.0
     tx_antenna_gain_dbi: float = 17.0
     tx_feeder_loss_db: float = 2.0
     reference_signal_offset_db: float = -18.0
@@ -118,6 +125,10 @@ class RFParams(BaseModel):
     max_vertical_attenuation_db: float = 30.0
     max_horizontal_attenuation_db: float = 30.0
     front_to_back_attenuation_db: float = 25.0
+    azimuth_deg: float = 0.0
+    horizontal_beamwidth_deg: float = 360.0
+    # Optional site elevation override. For DVT this is populated from tx.altitude.
+    site_altitude_m: Optional[float] = None
 
     # Scenario / calibration controls for the vendor-grade roadmap.
     # We start with deterministic median path loss and deterministic shadow/recovery
@@ -149,7 +160,7 @@ class RFParams(BaseModel):
 
     # Terrain / environment (Phase 1 terrain core)
     terrain_enabled: bool = True
-    dem_source: str = "auto"  # auto | google | opentopodata | flat
+    dem_source: str = "opentopodata"  # auto | google | opentopodata | local_raster | flat
     terrain_resolution_m: Optional[float] = None
     earth_curvature_k: float = 4.0 / 3.0
     fresnel_min_clearance: float = 0.6
@@ -157,7 +168,51 @@ class RFParams(BaseModel):
     terrain_loss_cap_db: float = 40.0
     buildings_on_terrain: bool = True
     landcover_clutter_enabled: bool = True
-    coverage_display_layer: str = "rsrp"  # rsrp | sinr | terrain_shadow
+    coverage_display_layer: str = "rsrp"  # rsrp | sinr | terrain_shadow | field_strength
+    compact_output: Optional[bool] = None  # None=auto for large DVT/3D results
+
+    @model_validator(mode="after")
+    def apply_dvt_transmitter(self) -> "RFParams":
+        """Project the typed DVT transmitter into the shared propagation fields."""
+        if self.dvt is None and str(self.technology).strip().lower() != "dvt":
+            profile = str(self.waveform or "5g_nr").strip().lower()
+            if profile != "5g_nr":
+                raise ValueError("non-5G waveform requires technology='dvt' and a dvt transmitter object")
+            self.technology = "5g_nr"
+            self.waveform = "5g_nr"
+            return self
+        if self.dvt is None:
+            raise ValueError("technology='dvt' requires a dvt transmitter object")
+
+        self.technology = "dvt"
+        requested_waveform = str(self.waveform or self.dvt.waveform).strip().lower()
+        if requested_waveform not in ("dvt", str(self.dvt.waveform)):
+            raise ValueError("waveform must match dvt.waveform")
+        self.waveform = str(self.dvt.waveform)
+        self.freq_mhz = self.dvt.frequency_mhz
+        self.channel_bandwidth_mhz = self.dvt.bandwidth_mhz
+        # Project the physical transmitter chain into shared fields. For ERP
+        # input these values are zero by validation; for conducted power they
+        # are applied exactly once by the DVT source-power calculation.
+        self.tx_power_dbm = self.dvt.power.input_power_dbm
+        self.tx_chain_gain_db = self.dvt.power.tx_gain_db
+        self.tx_antenna_gain_dbi = self.dvt.power.antenna_gain_dbi
+        self.tx_feeder_loss_db = self.dvt.power.feeder_loss_db
+        self.reference_signal_offset_db = 0.0
+        self.tx_height_m = self.dvt.tx.antenna_height
+        self.site_altitude_m = self.dvt.tx.altitude
+        self.azimuth_deg = self.dvt.tx.azimuth_deg
+        self.horizontal_beamwidth_deg = self.dvt.tx.beamwidth_h_deg
+        self.vertical_beamwidth_deg = self.dvt.tx.beamwidth_v_deg
+        self.electrical_tilt_deg = self.dvt.tx.effective_down_tilt_deg
+        self.mechanical_tilt_deg = 0.0
+        self.max_horizontal_attenuation_db = self.dvt.tx.max_horizontal_attenuation_db
+        self.front_to_back_attenuation_db = self.dvt.tx.front_to_back_attenuation_db
+        self.max_vertical_attenuation_db = self.dvt.tx.max_vertical_attenuation_db
+        self.coverage_display_layer = (
+            "field_strength" if self.coverage_display_layer == "rsrp" else self.coverage_display_layer
+        )
+        return self
 
 
 class WorldCell(BaseModel):
@@ -216,6 +271,9 @@ class WorldCell(BaseModel):
     canyon_recovery_db: float = 0.0
     metal_blocked: bool = False
     buildings_along_path: List[Dict[str, Any]] = []
+    # True when coverage_grid already evaluated all map intersections and loss states.
+    # world_builder uses this to avoid repeating OSM queries for every output cell.
+    coverage_precomputed: bool = False
 
     # Optional precomputed RSRP for this sector candidate.
     # Used by multipath ray tracing mode to avoid re-deriving RSRP from only
@@ -264,6 +322,10 @@ class AttenuationGrid(BaseModel):
     top_interferer_rsrp_dbm: List[float]
     pilot_pollution_metric_db: List[float]
     rsrp_by_sector: Optional[Dict[str, List[float]]] = None
+    technology: str = "5g_nr"
+    received_power_dbm: Optional[List[float]] = None
+    field_strength_dbuv_m: Optional[List[float]] = None
+    waveform: Optional[str] = None
     terrain_loss_db: Optional[List[float]] = None
     los_terrain: Optional[List[bool]] = None
     terrain_state: Optional[List[str]] = None
