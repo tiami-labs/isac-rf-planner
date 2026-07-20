@@ -2344,6 +2344,22 @@ function updateRSRPLegend(scaleMinRSRP, scaleMaxRSRP, actualMinRSRP, actualMaxRS
   const minValue = document.getElementById("legend-min-value");
   if (maxValue) maxValue.textContent = Number.isFinite(actualMaxRSRP) ? actualMaxRSRP.toFixed(1) : "-";
   if (minValue) minValue.textContent = Number.isFinite(actualMinRSRP) ? actualMinRSRP.toFixed(1) : "-";
+
+  const selectedLayer = (typeof RFTerrainParams !== "undefined")
+    ? RFTerrainParams.getCoverageDisplayLayer()
+    : "rsrp";
+  const legendUnit = selectedLayer === "field_strength" ? "dBµV/m"
+    : selectedLayer === "rsrp" ? "dBm"
+    : "dB";
+  const maxUnit = document.getElementById("legend-unit-max");
+  const minUnit = document.getElementById("legend-unit-min");
+  if (maxUnit) maxUnit.textContent = legendUnit;
+  if (minUnit) minUnit.textContent = legendUnit;
+
+  const titleEl = legend.querySelector("h3");
+  if (titleEl && typeof RFTerrainParams !== "undefined") {
+    titleEl.textContent = RFTerrainParams.coverageLayerLabel(RFTerrainParams.getCoverageDisplayLayer());
+  }
 }
 
 function colorForValue(v, vmin, vmax) {
@@ -2376,9 +2392,43 @@ function colorForValue(v, vmin, vmax) {
   return new Cesium.Color(r, g, b, 0.70);
 }
 
-// Render RF coverage using the same per-cell grid that the 2D UI uses.
-// This intentionally preserves "missing" cells (no forced circular mask, no interpolation),
-// which is what makes the footprint deform and follow streets / blockers.
+/** Pick pre-colored PNG heatmap for the active display layer (always drape, never point grid). */
+function pickHeatmapForLayer(plan, layer) {
+  const covLayer = layer || (
+    typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getCoverageDisplayLayer() : "rsrp"
+  );
+  if (covLayer === "terrain_shadow" && plan.heatmap_terrain && plan.heatmap_terrain.png_b64) {
+    return plan.heatmap_terrain;
+  }
+  if (covLayer === "sinr" && plan.heatmap_sinr && plan.heatmap_sinr.png_b64) {
+    return plan.heatmap_sinr;
+  }
+  return plan.heatmap;
+}
+
+/** Same PNG ellipse drape for 3D OSM city plans — RSRP, SINR, and terrain layers. */
+async function renderOsmPlanHeatmapOn3d(out, covLayer) {
+  if (out && out.heatmap && out.heatmap.layer === "field_strength_dbuv_m") {
+    covLayer = "field_strength";
+    const layerEl = document.getElementById("coverage-display-layer");
+    if (layerEl) layerEl.value = "field_strength";
+  }
+  // City policy: one draw path. Always drape the RSRP PNG geometry; layer PNG only updates legend scale.
+  const layerHeatmap = pickHeatmapForLayer(out, covLayer);
+  const drapeHeatmap = (out.heatmap && out.heatmap.png_b64) ? out.heatmap : layerHeatmap;
+  const sectorHm = covLayer === "rsrp" ? out.heatmap_by_sector : null;
+  if (drapeHeatmap && drapeHeatmap.png_b64) {
+    await renderHeatmapDrapeOsm3d(drapeHeatmap, out.grid, sectorHm, layerHeatmap);
+    return true;
+  }
+  if (sectorHm && typeof sectorHm === "object" && Object.keys(sectorHm).length) {
+    await renderHeatmapDrapesPerSectorOsm3d(sectorHm, out.grid);
+    return true;
+  }
+  return false;
+}
+
+// Fallback only when backend returned no PNG (legacy payloads). Prefer pickHeatmapForLayer + drape.
 function renderGridCoverage(grid) {
   if (!grid || !Array.isArray(grid.cell_lat) || !Array.isArray(grid.cell_lon) || !Array.isArray(grid.rsrp_dbm)) return;
   const lats = grid.cell_lat;
@@ -2457,6 +2507,8 @@ async function renderHeatmapDrapesPerSectorOsm3d(heatmapBySector, grid) {
   for (const [sid, hm] of entries) {
     const imgSrc = hm && hm.png_b64;
     if (!imgSrc) continue;
+    const sw = offsetEnuToLatLon(txLat, txLon, -radiusM, -radiusM);
+    const ne = offsetEnuToLatLon(txLat, txLon, radiusM, radiusM);
     trackRfEntity(viewer.entities.add({
       name: `RSRP sector ${sid}`,
       position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
@@ -2472,12 +2524,8 @@ async function renderHeatmapDrapesPerSectorOsm3d(heatmapBySector, grid) {
   }
 }
 
-// 3D OSM-only rendering: map-aligned raster drape (no radial spokes).
-async function renderHeatmapDrapeOsm3d(heatmap, grid, heatmapBySector) {
-  // Fast path for 3D OSM-only mode:
-  // - Backend returns a pre-colored PNG texture (base64 data URL).
-  // - We drape it as a single Cesium ellipse clamped to ground/tiles.
-  // This avoids per-vertex clampToHeightMostDetailed, which is too slow for interactive use.
+// 3D OSM-only rendering: map-aligned PNG rectangle drape (same policy as 2D Leaflet + city exports).
+async function renderHeatmapDrapeOsm3d(heatmap, grid, heatmapBySector, legendHeatmap) {
   if (heatmapBySector && typeof heatmapBySector === "object" && Object.keys(heatmapBySector).length) {
     await renderHeatmapDrapesPerSectorOsm3d(heatmapBySector, grid);
     return;
@@ -2499,35 +2547,42 @@ async function renderHeatmapDrapeOsm3d(heatmap, grid, heatmapBySector) {
 
   if (!Number.isFinite(radiusM) || radiusM <= 0) return;
 
-  // Legend: use the fixed scale for consistency, but show actual min/max from the grid if provided.
-  const actualMin = (heatmap && Number.isFinite(heatmap.actual_min)) ? Number(heatmap.actual_min) :
-    ((heatmap && Number.isFinite(heatmap.vmin)) ? Number(heatmap.vmin) : FIXED_RSRP_MIN);
-  const actualMax = (heatmap && Number.isFinite(heatmap.actual_max)) ? Number(heatmap.actual_max) :
-    ((heatmap && Number.isFinite(heatmap.vmax)) ? Number(heatmap.vmax) : FIXED_RSRP_MAX);
-  updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
+  const legend = legendHeatmap || heatmap;
+  const scaleMin = (legend && Number.isFinite(legend.vmin)) ? Number(legend.vmin) : FIXED_RSRP_MIN;
+  const scaleMax = (legend && Number.isFinite(legend.vmax)) ? Number(legend.vmax) : FIXED_RSRP_MAX;
+  const actualMin = (legend && Number.isFinite(legend.actual_min)) ? Number(legend.actual_min) : scaleMin;
+  const actualMax = (legend && Number.isFinite(legend.actual_max)) ? Number(legend.actual_max) : scaleMax;
+  updateRSRPLegend(scaleMin, scaleMax, actualMin, actualMax);
 
   const imgSrc = heatmap && heatmap.png_b64 ? heatmap.png_b64 : null;
 
   if (!imgSrc) {
-    // Fallback: if backend didn't provide a PNG, fall back to point grid (if available).
-    // Note: 3d_osm API responses often omit per-cell arrays to save payload; then only png_b64 can draw.
-    if (grid && Array.isArray(grid.cell_lat) && grid.cell_lat.length) {
-      renderGridCoverage(grid);
-    } else {
-      console.warn(
-        "renderHeatmapDrapeOsm3d: no heatmap.png_b64 and no grid.cell_lat — nothing to drape. "
-        + "Check /api/plan response or server heatmap generation.",
-      );
-    }
+    console.warn(
+      "renderHeatmapDrapeOsm3d: no heatmap.png_b64 — re-run Plan RF Queue. "
+      + "Point-grid fallback is disabled (city/terrain share one PNG drape path).",
+    );
     return;
   }
 
-  const ent = trackRfEntity(viewer.entities.add({
+  addHeatmapDrape(imgSrc, txLat, txLon, radiusM);
+}
+
+// Local tangent-plane offset (east m, north m) from (latDeg, lonDeg) — same as app.js / 2D Leaflet.
+function offsetEnuToLatLon(latDeg, lonDeg, eastM, northM) {
+  const R = 6371000.0;
+  const φ = (latDeg * Math.PI) / 180.0;
+  const dLat = (northM / R) * (180.0 / Math.PI);
+  const dLon = (eastM / (R * Math.cos(φ))) * (180.0 / Math.PI);
+  return { lat: latDeg + dLat, lon: lonDeg + dLon };
+}
+
+/** One city-style PNG drape: Cesium ellipse clamped to ground/tiles (unchanged city geometry). */
+function addHeatmapDrape(imgSrc, txLat, txLon, radiusM) {
+  return trackRfEntity(viewer.entities.add({
     position: Cesium.Cartesian3.fromDegrees(txLon, txLat),
     ellipse: {
       semiMajorAxis: radiusM,
       semiMinorAxis: radiusM,
-      // Smaller granularity reduces visible faceting.
       granularity: Cesium.Math.toRadians(0.25),
       material: new Cesium.ImageMaterialProperty({ image: imgSrc, transparent: true }),
       heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
@@ -3943,7 +3998,23 @@ function drawSectorOverlays(sectors, txLat, txLon, radiusM) {
   }
 }
 
+let _ensureProfilesInProgress = false;
+let _ensureProfilesStartedAt = 0;
 async function ensureProfiles(txLat, txLon) {
+  // Reset stuck guard if previous attempt has been running for over 60s.
+  if (_ensureProfilesInProgress && (Date.now() - _ensureProfilesStartedAt) > 60000) {
+    _ensureProfilesInProgress = false;
+  }
+  if (_ensureProfilesInProgress) return;
+  _ensureProfilesInProgress = true;
+  _ensureProfilesStartedAt = Date.now();
+  try {
+    return await _ensureProfilesImpl(txLat, txLon);
+  } finally {
+    _ensureProfilesInProgress = false;
+  }
+}
+async function _ensureProfilesImpl(txLat, txLon) {
   const txHeightM = getNumber("tx-height-m", 10.0);
   const rxHeightM = getNumber("rx-height-m", 1.5);
   const maxRangeM = getNumber("max-range", 2500.0);
@@ -3965,7 +4036,7 @@ async function ensureProfiles(txLat, txLon) {
   setMeshStatus("3D profiles missing. Generating + uploading…");
 
   await buildAndUploadProfiles({
-    containerId: "cesiumProfilerHost",
+    existingViewer: viewer,
     lat: txLat,
     lon: txLon,
     txHeightM,
@@ -3982,7 +4053,7 @@ async function ensureProfiles(txLat, txLon) {
 }
 
 function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) {
-  return {
+  const body = {
     lat,
     lon,
     freq_mhz: getNumber("freq-mhz", 3500.0),
@@ -4028,6 +4099,7 @@ function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) 
     },
     sectors: sectors.length ? sectors : null,
     ray_mode: rayMode,
+    planner_surface: "3d",
     tx_height_m: txHeightM,
     rx_height_m: rxHeightM,
 
@@ -4040,6 +4112,12 @@ function buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors) 
     publish_ui: false,
     ...(typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getTerrainPlanParams() : {}),
   };
+  const waveformFields = window.RFWaveformUI
+    ? window.RFWaveformUI.buildPlanFields({ lat, lon, txHeightM, sectors })
+    : { technology: "5g_nr", waveform: "5g_nr" };
+  Object.assign(body, waveformFields);
+  window.RFWaveformUI?.sanitizePlanBody(body);
+  return body;
 }
 
 async function applyPlanResponseToViewer(out, {
@@ -4098,14 +4176,12 @@ async function applyPlanResponseToViewer(out, {
 
   if (out.grid) {
     const covLayer = typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getCoverageDisplayLayer() : "rsrp";
-    const hasTerrainGrid =
-      covLayer !== "rsrp" &&
-      Array.isArray(out.grid.cell_lat) &&
-      out.grid.cell_lat.length > 0 &&
-      (Array.isArray(out.grid.terrain_loss_db) || Array.isArray(out.grid.sinr_db));
-    if (rayMode === "3d" || isRtMode) {
-      if (out.heatmap) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid, out.heatmap_by_sector);
+    const isGoogleMesh = false;
+    if (isRtMode) {
+      const layerHeatmap = pickHeatmapForLayer(out, covLayer);
+      const sectorHm = covLayer === "rsrp" ? out.heatmap_by_sector : null;
+      if (layerHeatmap && layerHeatmap.png_b64) {
+        await renderHeatmapDrapeOsm3d(layerHeatmap, out.grid, sectorHm);
       } else {
         try {
           await renderDrapedSurfaceCoverage(out.grid);
@@ -4114,26 +4190,30 @@ async function applyPlanResponseToViewer(out, {
           renderGridCoverage(out.grid);
         }
       }
-    } else if (rayMode === "3d_osm") {
-      if (hasTerrainGrid) {
-        renderGridCoverage(out.grid);
-      } else if (out.heatmap && out.heatmap.png_b64) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid, out.heatmap_by_sector);
-      } else if (out.heatmap_by_sector && Object.keys(out.heatmap_by_sector).length) {
-        await renderHeatmapDrapesPerSectorOsm3d(out.heatmap_by_sector, out.grid);
-      } else if (out.grid && Array.isArray(out.grid.cell_lat) && out.grid.cell_lat.length) {
-        renderGridCoverage(out.grid);
+    } else if (isGoogleMesh) {
+      const layerHeatmap = pickHeatmapForLayer(out, covLayer);
+      const sectorHm = covLayer === "rsrp" ? out.heatmap_by_sector : null;
+      if (layerHeatmap && layerHeatmap.png_b64) {
+        await renderHeatmapDrapeOsm3d(layerHeatmap, out.grid, sectorHm);
       } else {
-        const msg = "3D OSM plan has no heatmap image (and no per-cell grid). Check server heatmap/PNG or re-run from Plan RF Queue.";
-        console.warn("RFPlanner3D:", msg, out);
-        setStatus(`${msg} See browser console.`);
+        try {
+          await renderDrapedSurfaceCoverage(out.grid);
+        } catch (e) {
+          console.warn("Surface drape failed, falling back to point grid:", e);
+          renderGridCoverage(out.grid);
+        }
       }
     } else {
-      // 2D OSM: same ellipse PNG drape as 3D OSM (continuous field, not radial point grid).
-      if (out.heatmap && out.heatmap.png_b64) {
-        await renderHeatmapDrapeOsm3d(out.heatmap, out.grid, out.heatmap_by_sector);
-      } else {
-        renderGridCoverage(out.grid);
+      const drew = await renderOsmPlanHeatmapOn3d(out, covLayer);
+      if (!drew) {
+        const msg = "Plan has no heatmap PNG for this display layer — re-run Plan RF Queue.";
+        console.warn("RFPlanner3D:", msg, { covLayer, rayMode, out });
+        setStatus(`${msg} See browser console.`);
+      } else if (String(out.ray_mode || "").toLowerCase() === "2d") {
+        console.warn(
+          "RFPlanner3D: plan ray_mode=2d on /3d — draw uses 3D OSM PNG drape but propagation was 2D. "
+          + "Re-run with planner_surface=3d or ray_mode=3d_osm.",
+        );
       }
     }
   }
@@ -4145,7 +4225,7 @@ async function applyPlanResponseToViewer(out, {
   const secLon = (out.snapped_tx && Number.isFinite(out.snapped_tx.lon))
     ? out.snapped_tx.lon
     : (out.original_point && Number.isFinite(out.original_point.lon) ? out.original_point.lon : NaN);
-  if (out.sectors && out.sectors.length && Number.isFinite(secLat) && Number.isFinite(secLon)) {
+  if (!window.RFWaveformUI?.isDvt() && out.sectors && out.sectors.length && Number.isFinite(secLat) && Number.isFinite(secLon)) {
     drawSectorOverlays(out.sectors, secLat, secLon, radiusM);
   }
 
@@ -4172,6 +4252,7 @@ async function applyPlanResponseToViewer(out, {
 
 function startRemotePlanRfPolling() {
   let lastSeq = 0;
+  let lastScreenshotSeq = 0;
   try {
     const raw = sessionStorage.getItem(REMOTE_PLAN_SEQ_STORAGE_KEY);
     if (raw) lastSeq = Math.max(0, Number(raw) || 0);
@@ -4203,14 +4284,63 @@ function startRemotePlanRfPolling() {
         } catch { /* ignore */ }
         return;
       }
+      // Screenshot capture request — checked BEFORE the j.new gate so it fires
+      // even when no new plan result has been produced (export-zip independent of plan seq).
+      if (j.screenshot_request && typeof j.screenshot_request === "object" && Number(j.screenshot_request.seq) > lastScreenshotSeq) {
+        lastScreenshotSeq = Number(j.screenshot_request.seq);
+        try {
+          const withRf = await captureViewBlob(true);
+          const withoutRf = await captureViewBlob(false);
+          await fetch("/api/ui/upload-screenshot?filename=full_view.png", { method: "POST", body: withRf, headers: { "Content-Type": "image/png" } });
+          await fetch("/api/ui/upload-screenshot?filename=full_view_without_rf.png", { method: "POST", body: withoutRf, headers: { "Content-Type": "image/png" } });
+        } catch (e) {
+          console.warn("Screenshot capture for export failed:", e);
+        }
+        return;
+      }
+
+      // Clear-map command — before j.new gate (independent of plan seq).
+      if (j.clear_map && typeof j.clear_map === "object" && Number(j.clear_map.seq) > lastSeq) {
+        lastSeq = Number(j.clear_map.seq);
+        try { sessionStorage.setItem(REMOTE_PLAN_SEQ_STORAGE_KEY, String(lastSeq)); } catch { /* ignore */ }
+        clearMap();
+        return;
+      }
+
+      // Profile generation request — before j.new gate (server blocks waiting for these).
+      if (j.profile_request && typeof j.profile_request === "object" && j.profile_request.lat != null) {
+        const pr = j.profile_request;
+        setStatus(`Generating Google mesh profiles for server request…`);
+        try {
+          setInputValue("tx-height-m", pr.tx_height_m ?? 10.0);
+          setInputValue("rx-height-m", pr.rx_height_m ?? 1.5);
+          setInputValue("max-range", pr.max_range_m ?? 2000.0);
+          setInputValue("dr-m", pr.dr_m ?? 5.0);
+          setInputValue("dtheta", pr.dtheta_deg ?? 5.0);
+          await ensureProfiles(pr.lat, pr.lon);
+          setStatus("Mesh profiles generated — server will proceed with plan.");
+        } catch (e) {
+          setStatus(`Failed to generate mesh profiles: ${e}`);
+        }
+        return;
+      }
+
       const seq = Number(j.seq) || 0;
       if (!j.new || seq <= lastSeq) return;
       lastSeq = seq;
       try {
         sessionStorage.setItem(REMOTE_PLAN_SEQ_STORAGE_KEY, String(lastSeq));
       } catch { /* ignore */ }
+
       if (j.status === "ready" && j.plan && typeof j.plan === "object") {
-        console.info("RFPlanner3D remote poll apply", { seq, plan: j.plan });
+        const plan = j.plan;
+        const surface = String(plan.planner_surface || "").toLowerCase();
+        const rm = String(plan.ray_mode || "").toLowerCase();
+        if (surface === "2d" || (surface !== "3d" && rm === "2d")) {
+          console.info("RFPlanner3D remote poll skip (2D plan)", { seq, ray_mode: rm, planner_surface: surface });
+          return;
+        }
+        console.info("RFPlanner3D remote poll apply", { seq, plan });
         await applyPlanResponseToViewer(j.plan, { refreshStreetLabelsOnSuccess: true, statusPrefix: "Remote" });
       } else if (j.status === "error" && j.error) {
         const er = j.error;
@@ -4373,14 +4503,16 @@ async function runPlanForTx(lat, lon, {
   const rayMode = getString("ray-mode", "3d_osm").toLowerCase();
   const txHeightM = getNumber("tx-height-m", 10.0);
   const rxHeightM = getNumber("rx-height-m", 1.5);
-  const sectors = collectSectorConfigs();
+  const sectors = window.RFWaveformUI?.isDvt() ? [] : collectSectorConfigs();
   const prefix = total > 1 ? `TX ${queueIndex}/${total}` : "TX";
   const attemptText = attempt > 1 ? ` (retry ${attempt - 1})` : "";
 
   currentTxLocation = { lat, lon };
   updateTxMarker(lat, lon);
 
-  if (rayMode === "3d" || rayMode === "3d_rt" || rayMode === "3d_rt_google" || rayMode === "3d_rt_osm") {
+  const demSource = getString("dem-source", "opentopodata");
+  const needsMeshProfiles = rayMode === "3d_rt" || rayMode === "3d_rt_google" || rayMode === "3d_rt_osm" || demSource === "copernicus_mesh";
+  if (needsMeshProfiles) {
     try {
       setStatus(`${prefix}${attemptText}: checking cached 3D ray profiles…`);
       await ensureProfiles(lat, lon);
@@ -4392,7 +4524,14 @@ async function runPlanForTx(lat, lon, {
 
   setStatus(`${prefix}${attemptText}: running RF planning…`);
 
-  const body = buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors);
+  let body;
+  try {
+    body = buildPlanRequestBody(lat, lon, rayMode, txHeightM, rxHeightM, sectors);
+  } catch (e) {
+    const error = `Invalid waveform/transmitter configuration: ${e.message || e}`;
+    setStatus(`${prefix}${attemptText}: ${error}`);
+    return { ok: false, error, cacheCenter: { lat, lon } };
+  }
 
   let resp;
   try {
@@ -4844,7 +4983,43 @@ Click Plan RF Queue.`);
   document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
   document.getElementById("export-local-mesh-btn")?.addEventListener("click", () => exportLocalMesh());
   document.getElementById("clear-map-btn").addEventListener("click", () => clearMap());
+  document.getElementById("import-zip-input")?.addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setStatus("Importing ZIP…");
+    try {
+      const resp = await fetch("/api/import-zip", { method: "POST", body: file, headers: { "Content-Type": "application/zip" } });
+      const j = await resp.json();
+      if (!resp.ok) throw new Error(j.detail || resp.statusText);
+      setStatus(`Imported: TX (${j.tx_lat?.toFixed(5)}, ${j.tx_lon?.toFixed(5)}). Drawing…`);
+    } catch (err) {
+      setStatus(`Import failed: ${err}`);
+    }
+    e.target.value = "";
+  });
   await loadRfParamsDefaults();
+  window.RFWaveformUI?.init({
+    onChange({ technology }) {
+      const rayMode = document.getElementById("ray-mode");
+      if (rayMode) {
+        for (const option of rayMode.options) {
+          const mode = String(option.value || "").toLowerCase();
+          if (mode === "3d_rt" || mode === "3d_rt_google" || mode === "3d_rt_osm") {
+            option.disabled = technology === "dvt";
+          }
+        }
+        if (technology === "dvt" && String(rayMode.value || "").toLowerCase() !== "3d_osm") {
+          rayMode.value = "3d_osm";
+        }
+      }
+      updateRtControlsVisibility();
+      if (technology === "dvt") {
+        setMeshStatus("DVT selected. Large-area planning uses 3D OSM; Google-mesh RT modes are disabled.");
+      } else {
+        setMeshStatus("");
+      }
+    },
+  });
   updateTxInputSummary();
   updateRtControlsVisibility();
   setRtClickMode("tx");
