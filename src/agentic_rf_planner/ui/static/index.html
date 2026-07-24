@@ -54,6 +54,158 @@
       <div id="mesh-profile-status" class="rf-mesh-hint"></div>
     </div>
 
+    <div class="rf-sidebar-section" id="waveform-transmitter-section">
+      <h3 class="rf-sidebar-h3">Waveform and transmitter</h3>
+      <div class="rf-field-block">
+        <label class="rf-label" for="waveform-profile">Waveform</label>
+        <select id="waveform-profile" class="rf-select">
+          <option value="5g_nr" selected>5G NR</option>
+          <option value="atsc1">DVT — ATSC 1.0</option>
+          <option value="atsc3">DVT — ATSC 3.0</option>
+          <option value="dvbt">DVT — DVB-T</option>
+          <option value="baseline">DVT — baseline</option>
+        </select>
+        <div id="waveform-summary" class="rf-sidebar-muted-sm" style="margin-top:6px;"></div>
+      </div>
+      <div id="dvt-transmitter-fields" hidden>
+        <div class="rf-field-grid">
+          <div>
+            <label class="rf-label" for="dvt-tx-name">TX name</label>
+            <input id="dvt-tx-name" class="rf-input" value="DVT TX" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-fc-mhz">Center frequency fc (MHz)</label>
+            <input id="dvt-fc-mhz" class="rf-input" type="number" min="0.001" step="0.001" value="587" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-bandwidth-mhz">Channel bandwidth (MHz)</label>
+            <input id="dvt-bandwidth-mhz" class="rf-input" type="number" min="0.001" step="0.001" value="6" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-fs-mhz">Sample rate fs (MHz)</label>
+            <input id="dvt-fs-mhz" class="rf-input" type="number" min="0.001" step="0.001" value="10" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-site-altitude-m">Site altitude (m AMSL)</label>
+            <input id="dvt-site-altitude-m" class="rf-input" type="number" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-polarization">Polarization</label>
+            <input id="dvt-polarization" class="rf-input" value="DA (E)" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-azimuth-deg">Azimuth (deg)</label>
+            <input id="dvt-azimuth-deg" class="rf-input" type="number" min="0" max="360" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-elevation-deg">Elevation (deg)</label>
+            <input id="dvt-elevation-deg" class="rf-input" type="number" min="-90" max="90" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-beamwidth-h-deg">Horizontal BW (deg)</label>
+            <input id="dvt-beamwidth-h-deg" class="rf-input" type="number" min="0.1" max="360" step="0.1" value="360" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-beamwidth-v-deg">Vertical BW (deg)</label>
+            <input id="dvt-beamwidth-v-deg" class="rf-input" type="number" min="0.1" max="180" step="0.1" value="8" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-electrical-tilt-deg">Electrical tilt (deg)</label>
+            <input id="dvt-electrical-tilt-deg" class="rf-input" type="number" min="-30" max="30" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-mechanical-tilt-deg">Mechanical tilt (deg)</label>
+            <input id="dvt-mechanical-tilt-deg" class="rf-input" type="number" min="-30" max="30" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-max-horizontal-atten-db">Max horizontal attenuation (dB)</label>
+            <input id="dvt-max-horizontal-atten-db" class="rf-input" type="number" min="0" max="60" step="0.1" value="30" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-front-to-back-atten-db">Front-to-back attenuation (dB)</label>
+            <input id="dvt-front-to-back-atten-db" class="rf-input" type="number" min="0" max="60" step="0.1" value="25" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-max-vertical-atten-db">Max vertical attenuation (dB)</label>
+            <input id="dvt-max-vertical-atten-db" class="rf-input" type="number" min="0" max="60" step="0.1" value="30" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-noise-figure-db">Receiver noise figure (dB)</label>
+            <input id="dvt-noise-figure-db" class="rf-input" type="number" step="0.1" value="7" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-rx-antenna-gain-dbi">Receiver antenna gain (dBi)</label>
+            <input id="dvt-rx-antenna-gain-dbi" class="rf-input" type="number" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-termination-power-dbm">Ray termination power (dBm)</label>
+            <input id="dvt-termination-power-dbm" class="rf-input" type="number" step="0.1" value="-140" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-dtheta-deg">Bearing step dθ (deg)</label>
+            <input id="dvt-dtheta-deg" class="rf-input" type="number" min="0.01" max="360" step="0.01" value="0.25" />
+          </div>
+        </div>
+        <div class="rf-field-grid" style="margin-top:8px;">
+          <div>
+            <label class="rf-label" for="max-range">Maximum range (m)</label>
+            <input id="max-range" class="rf-input" type="number" min="1" step="100" value="20000" />
+          </div>
+          <div>
+            <label class="rf-label" for="dr-m">Radial step dR (m)</label>
+            <input id="dr-m" class="rf-input" type="number" min="0.1" step="1" value="20" />
+          </div>
+        </div>
+        <div class="rf-field-block" style="margin-top:8px;">
+          <label class="rf-label" for="dvt-power-mode">Power input basis</label>
+          <select id="dvt-power-mode" class="rf-select">
+            <option value="erp" selected>ERP (kW, antenna system already included)</option>
+            <option value="conducted">Conducted power + RF-chain components</option>
+          </select>
+        </div>
+        <div id="dvt-erp-fields" class="rf-field-grid">
+          <div>
+            <label class="rf-label" for="dvt-erp-kw">ERP (kW)</label>
+            <input id="dvt-erp-kw" class="rf-input" type="number" min="0.000001" step="0.1" value="50" />
+          </div>
+        </div>
+        <div id="dvt-conducted-fields" class="rf-field-grid" hidden>
+          <div>
+            <label class="rf-label" for="dvt-conducted-power-kw">Conducted power (kW)</label>
+            <input id="dvt-conducted-power-kw" class="rf-input" type="number" min="0.000001" step="0.1" value="10" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-tx-gain-db">TX-chain gain (dB)</label>
+            <input id="dvt-tx-gain-db" class="rf-input" type="number" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-feeder-loss-db">Feeder loss (dB)</label>
+            <input id="dvt-feeder-loss-db" class="rf-input" type="number" min="0" step="0.1" value="1.5" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-antenna-gain-dbi">Antenna gain (dBi)</label>
+            <input id="dvt-antenna-gain-dbi" class="rf-input" type="number" step="0.1" value="12" />
+          </div>
+        </div>
+        <details style="margin-top:8px;">
+          <summary style="font-size:11px; color:#ccc;">Station identity metadata</summary>
+          <div class="rf-field-grid" style="margin-top:8px;">
+            <div><label class="rf-label" for="dvt-call-sign">Call sign</label><input id="dvt-call-sign" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-virtual-channel">Virtual channel</label><input id="dvt-virtual-channel" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-rf-channel">RF channel</label><input id="dvt-rf-channel" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-physical-channel">Physical channel</label><input id="dvt-physical-channel" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-facility-id">Facility ID</label><input id="dvt-facility-id" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-city">City</label><input id="dvt-city" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-network">Network</label><input id="dvt-network" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-station-standard">Standard</label><input id="dvt-station-standard" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-band">Band</label><input id="dvt-band" class="rf-input" /></div>
+            <div><label class="rf-label" for="dvt-source">Source</label><input id="dvt-source" class="rf-input" /></div>
+            <div style="grid-column:1/-1;"><label class="rf-label" for="dvt-source-url">Source URL</label><input id="dvt-source-url" class="rf-input" type="url" /></div>
+          </div>
+        </details>
+      </div>
+    </div>
+
     <div class="rf-sidebar-section" id="terrain-environment-section">
       <h3 class="rf-sidebar-h3">Terrain and Environment</h3>
       <label class="rf-check-row">
@@ -63,9 +215,9 @@
       <div class="rf-field-block">
         <label class="rf-label" for="dem-source">DEM source</label>
         <select id="dem-source" class="rf-select">
-          <option value="auto" selected>Auto</option>
+          <option value="auto">Auto (local 30m raster)</option>
           <option value="google">Google elevation</option>
-          <option value="opentopodata">SRTM / NASADEM (OpenTopoData)</option>
+          <option value="opentopodata" selected>Copernicus 30m (local raster)</option>
           <option value="flat">Flat (disabled)</option>
         </select>
       </div>
@@ -102,9 +254,10 @@
       <div class="rf-field-block">
         <label class="rf-label" for="coverage-display-layer">Display layer</label>
         <select id="coverage-display-layer" class="rf-select">
-          <option value="rsrp" selected>RSRP</option>
+          <option id="coverage-layer-rsrp" value="rsrp" selected>RSRP</option>
           <option value="sinr">SINR</option>
           <option value="terrain_shadow">Terrain shadow / loss</option>
+          <option value="field_strength">Field strength (dBµV/m)</option>
         </select>
       </div>
     </div>
@@ -155,8 +308,8 @@
         <button type="submit" class="rf-plan-submit">Plan RF Queue</button>
       </form>
 
-      <details open style="margin-top: 10px;">
-        <summary style="font-size: 12px; color: #ccc;">Advanced RF params</summary>
+      <details id="advanced-rf-params" open style="margin-top: 10px;">
+        <summary id="advanced-rf-summary" style="font-size: 12px; color: #ccc;">Advanced RF params</summary>
         <div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
           <div>
             <label style="display:block; font-size:10px; color:#ccc;">Freq (MHz)</label>
@@ -312,7 +465,7 @@
       </details>
     </div>
     
-    <div class="rf-sidebar-section">
+    <div class="rf-sidebar-section" id="sector-configuration-section">
       <h3 class="rf-sidebar-h3">Sector configuration</h3>
       <div id="sectors-container" style="display: flex; flex-direction: column; gap: 10px;">
         <!-- Sectors will be added here dynamically -->
@@ -332,7 +485,7 @@
     </div>
     
     <div class="rf-sidebar-section">
-      <div style="margin-bottom: 10px;">
+      <div id="sector-overlay-control" style="margin-bottom: 10px;">
         <label style="display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer;">
           <input 
             type="checkbox" 
@@ -378,8 +531,8 @@
         </div>
       </div>
       <div id="rsrp-legend-values">
-        <div>Max: <span id="legend-max-value">-</span> dBm</div>
-        <div>Min: <span id="legend-min-value">-</span> dBm</div>
+        <div>Max: <span id="legend-max-value">-</span> <span id="legend-unit-max">dBm</span></div>
+        <div>Min: <span id="legend-min-value">-</span> <span id="legend-unit-min">dBm</span></div>
       </div>
     </div>
     
@@ -393,6 +546,7 @@
   <script src="/export_utils.js"></script>
   <script src="/geocode_nav.js"></script>
   <script src="/terrain_params.js"></script>
+  <script src="/waveform_ui.js"></script>
   <script src="./app.js"></script>
   <script src="/integrated_2d_raytrace.js"></script>
 </body>

@@ -74,6 +74,7 @@ async function clampHeights(viewer, points) {
 export async function buildAndUploadProfiles(opts) {
   const {
     containerId,
+    existingViewer = null,
     lat,
     lon,
     txHeightM = 0.0,
@@ -85,99 +86,141 @@ export async function buildAndUploadProfiles(opts) {
     onProgress = null,
   } = opts || {};
 
-  if (!containerId) throw new Error("containerId required");
-  const host = document.getElementById(containerId);
-  if (!host) throw new Error(`missing container #${containerId}`);
-
-  const cfg = await fetchConfig();
-  if (!cfg.google_maps_api_key_present) {
-    throw new Error("Missing GOOGLE_MAPS_API_KEY in server environment");
-  }
-
-  // Cesium uses this for worker/asset URLs
-  if (!window.CESIUM_BASE_URL) window.CESIUM_BASE_URL = "/Cesium/";
-
-  // Required for photorealistic tiles
-  Cesium.GoogleMaps.defaultApiKey = cfg.google_maps_api_key;
-
   const progress = (msg) => { if (onProgress) onProgress(msg); };
 
-  progress("3D: initializing Cesium + Google mesh…");
+  // If the caller passes an already-initialised Cesium viewer (e.g. the live /3d viewer),
+  // use it directly — tiles are already loaded so sampling is near-instant.
+  let viewer;
+  let ownedViewer = false;
 
-  const viewer = new Cesium.Viewer(containerId, {
-    animation: false,
-    timeline: false,
-    geocoder: false,
-    homeButton: false,
-    sceneModePicker: false,
-    navigationHelpButton: false,
-    baseLayerPicker: false,
-    infoBox: false,
-    selectionIndicator: false,
-    terrainProvider: new Cesium.EllipsoidTerrainProvider(),
-    requestRenderMode: true,
-    maximumRenderTimeChange: Infinity,
-  });
+  let prevRequestRenderMode = null;
+  if (existingViewer) {
+    viewer = existingViewer;
+    // Keep continuous rendering on for the entire sample+upload phase so tiles stream.
+    prevRequestRenderMode = viewer.scene.requestRenderMode;
+    viewer.scene.requestRenderMode = false;
+    progress("3D: navigating to TX for tile streaming…");
+    viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(lon, lat, 150.0),
+      duration: 0.0,
+    });
+    // Force a render so the scene starts requesting tiles for the new camera position.
+    viewer.scene.requestRender();
+    // Wait for 3D tileset pending requests to drain (continuous render active).
+    await new Promise((resolve) => {
+      let waited = 0;
+      const maxWait = 15000;
+      const interval = 250;
+      const check = () => {
+        waited += interval;
+        if (waited >= maxWait) { resolve(); return; }
+        let pending = 0;
+        for (let i = 0; i < viewer.scene.primitives.length; i++) {
+          const p = viewer.scene.primitives.get(i);
+          if (p && p.statistics) {
+            pending += (p.statistics.numberOfPendingRequests || 0) + (p.statistics.numberOfTilesProcessing || 0);
+          }
+        }
+        // Need pending>0 seen at least once then draining, or max wait.
+        if (pending === 0 && waited >= 3000) { resolve(); return; }
+        setTimeout(check, interval);
+      };
+      setTimeout(check, interval);
+    });
+    progress("3D: tiles ready, sampling…");
+    // DO NOT restore requestRenderMode here — keep continuous rendering throughout sampling.
+  } else {
+    if (!containerId) throw new Error("containerId or existingViewer required");
+    const host = document.getElementById(containerId);
+    if (!host) throw new Error(`missing container #${containerId}`);
 
-  // Ensure the canvas renders even if host is offscreen
-  viewer.scene.requestRender();
+    const cfg = await fetchConfig();
+    if (!cfg.google_maps_api_key_present) {
+      throw new Error("Missing GOOGLE_MAPS_API_KEY in server environment");
+    }
 
-  let tileset = null;
-  try {
-    tileset = await Cesium.createGooglePhotorealistic3DTileset();
-    viewer.scene.primitives.add(tileset);
-    if (tileset.readyPromise) await tileset.readyPromise;
-  } catch (e) {
-    viewer.destroy();
-    throw new Error(`Failed to load Google photorealistic tileset: ${e}`);
+    if (!window.CESIUM_BASE_URL) window.CESIUM_BASE_URL = "/Cesium/";
+    Cesium.GoogleMaps.defaultApiKey = cfg.google_maps_api_key;
+
+    progress("3D: initializing Cesium + Google mesh…");
+
+    viewer = new Cesium.Viewer(containerId, {
+      animation: false,
+      timeline: false,
+      geocoder: false,
+      homeButton: false,
+      sceneModePicker: false,
+      navigationHelpButton: false,
+      baseLayerPicker: false,
+      infoBox: false,
+      selectionIndicator: false,
+      terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+      requestRenderMode: true,
+      maximumRenderTimeChange: Infinity,
+    });
+    ownedViewer = true;
+
+    viewer.scene.requestRender();
+
+    let tileset = null;
+    try {
+      tileset = await Cesium.createGooglePhotorealistic3DTileset();
+      viewer.scene.primitives.add(tileset);
+      if (tileset.readyPromise) await tileset.readyPromise;
+    } catch (e) {
+      viewer.destroy();
+      throw new Error(`Failed to load Google photorealistic tileset: ${e}`);
+    }
+
+    // Fly close to TX (150m) so high-detail tiles load before sampling.
+    viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(lon, lat, 150.0),
+      duration: 0.0,
+    });
+    viewer.scene.requestRender();
   }
-
-  // Fly near TX to ensure tiles stream in.
-  viewer.camera.flyTo({
-    destination: Cesium.Cartesian3.fromDegrees(lon, lat, 2000.0),
-    duration: 0.0,
-  });
-  viewer.scene.requestRender();
-
-  // Sample mesh height at TX by clamping a high probe.
-  const probeH = 2000.0;
-  const txProbe = Cesium.Cartesian3.fromDegrees(lon, lat, probeH);
-  const txHeights = await clampHeights(viewer, [txProbe]);
-  const txMeshH = (txHeights[0] == null) ? 0.0 : txHeights[0];
-
-  const planeH = txMeshH + txHeightM;
-  const clampProbeH = planeH + 250.0;
 
   const bearings = [];
   for (let b = 0; b < 360.0 - 1e-6; b += dthetaDeg) bearings.push(b);
-
-  progress(`3D: building profiles (bearings=${bearings.length}, maxRange=${maxRangeM}m, dr=${drM}m)…`);
-
-  const profiles = [];
   const nSteps = Math.floor(maxRangeM / drM);
 
-  for (let bi = 0; bi < bearings.length; bi++) {
-    const bearing = bearings[bi];
+  // Sample TX height first.
+  const txProbe = Cesium.Cartesian3.fromDegrees(lon, lat, 500.0);
+  const txHeightResult = await clampHeights(viewer, [txProbe]);
+  const txMeshH = (txHeightResult[0] == null) ? 0.0 : txHeightResult[0];
+  const planeH = txMeshH + txHeightM;
+  progress(`3D: TX mesh height=${txMeshH.toFixed(1)}m — sampling ${bearings.length} bearings in chunks…`);
 
-    const distances = [];
-    const pts = [];
-
-    for (let i = 1; i <= nSteps; i++) {
-      const r = i * drM;
-      distances.push(r);
-      const p = destinationLatLon(lat, lon, bearing, r);
-      pts.push(Cesium.Cartesian3.fromDegrees(p.lon, p.lat, clampProbeH));
+  // Process bearings in chunks of 8 so each clamp call covers a manageable tile area.
+  const CHUNK = 8;
+  const profiles = [];
+  for (let ci = 0; ci < bearings.length; ci += CHUNK) {
+    const chunk = bearings.slice(ci, ci + CHUNK);
+    const chunkPts = [];
+    const chunkOffsets = [];
+    for (const bearing of chunk) {
+      chunkOffsets.push(chunkPts.length);
+      for (let i = 1; i <= nSteps; i++) {
+        const r = i * drM;
+        const p = destinationLatLon(lat, lon, bearing, r);
+        chunkPts.push(Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 500.0));
+      }
     }
-
-    const heights = await clampHeights(viewer, pts);
-    const blocked = heights.map((h) => (h == null ? false : (mode === "slice" ? h >= planeH : false)));
-
-    const segs = compressBlocked(distances, blocked);
-    profiles.push({ bearing_deg: bearing, segments: segs });
-
-    if ((bi + 1) % 5 === 0) {
-      progress(`3D: profiling… ${bi + 1}/${bearings.length} bearings`);
+    const chunkHeights = await clampHeights(viewer, chunkPts);
+    for (let j = 0; j < chunk.length; j++) {
+      const offset = chunkOffsets[j];
+      const distances = [];
+      const heights = [];
+      for (let i = 0; i < nSteps; i++) {
+        distances.push((i + 1) * drM);
+        heights.push(chunkHeights[offset + i]);
+      }
+      const blocked = heights.map((h) => (h == null ? false : (mode === "slice" ? h >= planeH : false)));
+      const segs = compressBlocked(distances, blocked);
+      const terrainHeights = distances.map((r, i) => [r, heights[i] ?? txMeshH]);
+      profiles.push({ bearing_deg: chunk[j], segments: segs, terrain_heights: terrainHeights });
     }
+    if (ci % 24 === 0) progress(`3D: ${Math.min(ci + CHUNK, bearings.length)}/${bearings.length} bearings done…`);
   }
 
   const payload = {
@@ -198,15 +241,16 @@ export async function buildAndUploadProfiles(opts) {
     body: JSON.stringify(payload),
   });
 
-  const outText = await resp.text();
-  if (!resp.ok) {
-    viewer.destroy();
-    throw new Error(`Profile upload failed (${resp.status}): ${outText}`);
+  let outText, out;
+  try {
+    outText = await resp.text();
+    if (!resp.ok) throw new Error(`Profile upload failed (${resp.status}): ${outText}`);
+    out = JSON.parse(outText);
+  } finally {
+    if (ownedViewer) viewer.destroy();
+    else if (prevRequestRenderMode !== null) viewer.scene.requestRenderMode = prevRequestRenderMode;
   }
 
-  const out = JSON.parse(outText);
   progress(`3D: profile ready (key=${out.key})`);
-
-  viewer.destroy();
   return out;
 }

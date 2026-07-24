@@ -570,8 +570,8 @@ async function runRFPlanning(lat, lng, source = "click") {
       finishPolygonDrawing();
     }
     
-    // Collect sector configurations from UI
-    const sectors = collectSectorConfigs();
+    // DVT uses the transmitter antenna pattern; NR alone uses sector objects.
+    const sectors = window.RFWaveformUI?.isDvt() ? [] : collectSectorConfigs();
     
     console.log(`[RF Planner] Collected ${sectors.length} sector(s) from UI`);
     if (sectors.length > 0) {
@@ -678,11 +678,18 @@ async function runRFPlanning(lat, lng, source = "click") {
       sectors: sectors.length > 0 ? sectors : null,  // null = omnidirectional
       // Ray propagation: only geometry differs between 2D and 3D
       ray_mode: rayMode,
+      planner_surface: "2d",
       tx_height_m: txHeightM,
       rx_height_m: rxHeightM,
       publish_ui: false,
       ...(window.RFTerrainParams ? RFTerrainParams.getTerrainPlanParams() : {}),
     };
+
+    const waveformFields = window.RFWaveformUI
+      ? window.RFWaveformUI.buildPlanFields({ lat, lon: lng, txHeightM, sectors })
+      : { technology: "5g_nr", waveform: "5g_nr" };
+    Object.assign(rfParams, waveformFields);
+    window.RFWaveformUI?.sanitizePlanBody(rfParams);
     
     // If 3D mode is selected, ensure a persisted mesh profile exists for this TX/config.
     // This avoids a slow fallback and makes behavior explicit.
@@ -1643,6 +1650,17 @@ async function runPlanQueue2dOsmRays(queue) {
 // Try to restore last results on page load
 window.addEventListener('DOMContentLoaded', () => {
   loadRfParamsDefaults();
+  window.RFWaveformUI?.init({
+    onChange({ technology }) {
+      const rayMode = document.getElementById("ray-mode");
+      if (!rayMode) return;
+      for (const option of rayMode.options) {
+        if (String(option.value).toLowerCase() === "3d_rt_osm") option.disabled = technology === "dvt";
+      }
+      if (technology === "dvt" && String(rayMode.value).toLowerCase() === "3d_rt_osm") rayMode.value = "2d";
+      updateRayModeHelperText();
+    },
+  });
   if (window.RFAddressLookup) {
     window.RFAddressLookup.bindAddressLookup({
       setStatus,
@@ -1845,7 +1863,10 @@ map.on("click", (e) => {
   
   map.setView([lat, lng], 15);
   const queueCount = appendTxInputPoint(lat, lng);
-  setStatus(`TX added (${queueCount} queued): ${lat}, ${lng}. Add sector and click "Plan RF Queue" to run planning.`);
+  const nextStep = window.RFWaveformUI?.isDvt()
+    ? 'Configure the DVT transmitter and click "Plan RF Queue".'
+    : 'Add sector and click "Plan RF Queue" to run planning.';
+  setStatus(`TX added (${queueCount} queued): ${lat}, ${lng}. ${nextStep}`);
   console.log(`[RF Planner] TX location set: ${lat}, ${lng} (preserving existing RF heatmap)`);
 });
 
@@ -1891,8 +1912,13 @@ function renderHeatmap(result) {
   const lats = grid.cell_lat;
   const lons = grid.cell_lon;
   const rsrp = grid.rsrp_dbm;
-  const layer = (window.RFTerrainParams && RFTerrainParams.getCoverageDisplayLayer()) || "rsrp";
+  let layer = (window.RFTerrainParams && RFTerrainParams.getCoverageDisplayLayer()) || "rsrp";
   const h = result.heatmap;
+  if (h && h.layer === "field_strength_dbuv_m") {
+    layer = "field_strength";
+    const layerEl = document.getElementById("coverage-display-layer");
+    if (layerEl) layerEl.value = "field_strength";
+  }
   const pngSrc = h && h.png_b64 ? h.png_b64 : null;
   const tx = result.snapped_tx || grid.tx || result.original_point;
   const txLat = tx && Number.isFinite(tx.lat) ? tx.lat : null;
@@ -1905,9 +1931,20 @@ function renderHeatmap(result) {
     hasCells &&
     (layer === "rsrp" ||
       (layer === "sinr" && Array.isArray(grid.sinr_db)) ||
-      (layer === "terrain_shadow" && (Array.isArray(grid.terrain_loss_db) || Array.isArray(grid.los_terrain))));
+      (layer === "terrain_shadow" && (Array.isArray(grid.terrain_loss_db) || Array.isArray(grid.los_terrain))) ||
+      (layer === "field_strength" && Array.isArray(grid.field_strength_dbuv_m)));
+  let layerHeatmap = h;
+  if (layer === "terrain_shadow" && result.heatmap_terrain && result.heatmap_terrain.png_b64) {
+    layerHeatmap = result.heatmap_terrain;
+  } else if (layer === "sinr" && result.heatmap_sinr && result.heatmap_sinr.png_b64) {
+    layerHeatmap = result.heatmap_sinr;
+  }
+  const layerPngSrc = layerHeatmap && layerHeatmap.png_b64 ? layerHeatmap.png_b64 : null;
+  if (layerHeatmap && Number.isFinite(layerHeatmap.radius_m)) {
+    radiusM = Number(layerHeatmap.radius_m);
+  }
   const hasPngDrape =
-    !!(pngSrc && Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(radiusM) && radiusM > 0 && layer === "rsrp");
+    !!(layerPngSrc && Number.isFinite(txLat) && Number.isFinite(txLon) && Number.isFinite(radiusM) && radiusM > 0);
 
   if (!hasPngDrape && !hasLayerCells) {
     setStatus("No grid cells and no heatmap image returned.");
@@ -1932,12 +1969,15 @@ function renderHeatmap(result) {
       if (v > actualMax) actualMax = v;
     }
   }
-  if (h && Number.isFinite(h.actual_min) && layer === "rsrp") actualMin = Number(h.actual_min);
-  if (h && Number.isFinite(h.actual_max) && layer === "rsrp") actualMax = Number(h.actual_max);
+  if (layerHeatmap && Number.isFinite(layerHeatmap.actual_min)) actualMin = Number(layerHeatmap.actual_min);
+  if (layerHeatmap && Number.isFinite(layerHeatmap.actual_max)) actualMax = Number(layerHeatmap.actual_max);
   if (!Number.isFinite(actualMin) || !Number.isFinite(actualMax) || (hasLayerCells && actualMin === Infinity)) {
     if (layer === "terrain_shadow") {
       actualMin = 0;
       actualMax = 40;
+    } else if (layer === "field_strength") {
+      actualMin = 20;
+      actualMax = 120;
     } else if (layer === "sinr") {
       actualMin = -5;
       actualMax = 30;
@@ -1949,6 +1989,8 @@ function renderHeatmap(result) {
 
   if (layer === "terrain_shadow") {
     updateRSRPLegend(0, 40, actualMin, actualMax);
+  } else if (layer === "field_strength") {
+    updateRSRPLegend(20, 120, actualMin, actualMax);
   } else if (layer === "sinr") {
     updateRSRPLegend(-5, 30, actualMin, actualMax);
   } else {
@@ -1959,7 +2001,7 @@ function renderHeatmap(result) {
     const sw = offsetEnuToLatLon(txLat, txLon, -radiusM, -radiusM);
     const ne = offsetEnuToLatLon(txLat, txLon, radiusM, radiusM);
     const bounds = L.latLngBounds([sw.lat, sw.lon], [ne.lat, ne.lon]);
-    L.imageOverlay(pngSrc, bounds, {
+    L.imageOverlay(layerPngSrc, bounds, {
       opacity: 0.78,
       interactive: false,
       className: "rf-heatmap-drape",
@@ -1988,7 +2030,7 @@ function renderHeatmap(result) {
     map.setView([viewTx.lat, viewTx.lon], map.getZoom());
   }
 
-  if (result.sectors && result.sectors.length > 0 && viewTx) {
+  if (!window.RFWaveformUI?.isDvt() && result.sectors && result.sectors.length > 0 && viewTx) {
     drawSectorVisualization(result.sectors, viewTx, result.grid);
   }
 }
@@ -2065,7 +2107,9 @@ function drawSectorVisualization(sectors, txPoint, grid) {
   
   // Default to 2000m if no grid data
   if (maxRange === 0) {
-    maxRange = 2000;
+    maxRange = (grid && grid.rf_params && Number.isFinite(grid.rf_params.max_range_m))
+      ? Number(grid.rf_params.max_range_m)
+      : 2000;
   }
   
   // Color palette for sectors
@@ -2238,6 +2282,23 @@ function updateRSRPLegend(scaleMinRSRP, scaleMaxRSRP, actualMinRSRP, actualMaxRS
       minValue.textContent += ` (scale: ${scaleMinRSRP.toFixed(0)})`;
     }
   }
+  const selectedLayer = (typeof RFTerrainParams !== "undefined")
+    ? RFTerrainParams.getCoverageDisplayLayer()
+    : "rsrp";
+  const legendUnit = selectedLayer === "field_strength" ? "dBµV/m"
+    : selectedLayer === "rsrp" ? "dBm"
+    : "dB";
+  const maxUnit = document.getElementById("legend-unit-max");
+  const minUnit = document.getElementById("legend-unit-min");
+  if (maxUnit) maxUnit.textContent = legendUnit;
+  if (minUnit) minUnit.textContent = legendUnit;
+
+  const titleEl = legend.querySelector("h3");
+  if (titleEl && window.RFTerrainParams) {
+    titleEl.textContent = RFTerrainParams.coverageLayerLabel(
+      RFTerrainParams.getCoverageDisplayLayer(),
+    );
+  }
 }
 
 function displayMetadata(data) {
@@ -2259,6 +2320,9 @@ function displayMetadata(data) {
   const worldSource = data.world_model_source || "unknown";
   const vlmUsed = data.vlm_used || false;
   const svAvailable = data.streetview_available || false;
+  const technology = String(data.grid?.technology || data.rf_config_used?.technology || "5g_nr");
+  const waveform = String(data.grid?.waveform || data.rf_config_used?.dvt?.waveform || (technology === "dvt" ? "baseline" : "5g_nr"));
+  const waveformLabel = window.RFWaveformUI?.profileLabel(waveform) || waveform;
   
   let sourceBadge = worldSource === "geometry_vlm_refined" 
     ? '<span style="color: #4CAF50;">●</span> Geometry + VLM'
@@ -2267,6 +2331,7 @@ function displayMetadata(data) {
   metaDiv.innerHTML = `
     <div style="font-weight: bold; margin-bottom: 6px;">Model Status</div>
     <div style="margin-bottom: 4px;">${sourceBadge}</div>
+    <div style="margin-bottom: 4px;">Waveform: <strong>${waveformLabel}</strong> (${technology})</div>
     <div style="margin-bottom: 4px;">Clutter: <strong>${clutterType}</strong></div>
     <div style="margin-bottom: 4px;">Street View: ${svAvailable ? "✓ Available" : "✗ Not available"}</div>
     <div>VLM Refinement: ${vlmUsed ? "✓ Used" : "✗ Not used"}</div>
@@ -2349,6 +2414,12 @@ function startRemotePlanRfPolling2d() {
         const plan = j.plan;
         if (String(plan.mode || "") === "3d_rt") {
           setStatus("Remote result is 3d_rt (path trace). Open /3d to view. Use POST /api/plan (coverage) for 2D heatmap here.");
+          return;
+        }
+        const surface = String(plan.planner_surface || "").toLowerCase();
+        const rm = String(plan.ray_mode || "").toLowerCase();
+        if (surface === "3d" || (surface !== "2d" && rm !== "2d" && rm !== "")) {
+          console.info("RFPlanner2D remote poll skip (3D plan)", { seq, ray_mode: rm, planner_surface: surface });
           return;
         }
         console.info("RFPlanner2D remote poll apply", { seq, plan });
