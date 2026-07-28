@@ -5,9 +5,27 @@ from agentic_rf_planner.geo.physical_spanning import StubMapProvider
 from agentic_rf_planner.pipeline.schemas import AttenuationGrid, LatLon, RFParams, WorldCell, WorldModel
 from agentic_rf_planner.rf.attenuation_models import (
     _horizontal_pattern_attenuation_db,
+    _reference_signal_eirp_dbm,
     _scenario_path_loss_db,
     compute_attenuation_grid,
 )
+
+
+
+
+def test_physical_tx_chain_gain_applies_to_nr_source_term():
+    base = RFParams(
+        freq_mhz=3500.0,
+        tx_power_dbm=43.0,
+        tx_chain_gain_db=0.0,
+        tx_antenna_gain_dbi=17.0,
+        tx_feeder_loss_db=2.0,
+        reference_signal_offset_db=-18.0,
+    )
+    boosted = base.model_copy(update={"tx_chain_gain_db": 3.0})
+
+    delta_db = _reference_signal_eirp_dbm(boosted) - _reference_signal_eirp_dbm(base)
+    assert abs(delta_db - 3.0) < 1.0e-12
 
 
 def test_3gpp_umi_nlos_exceeds_los():
