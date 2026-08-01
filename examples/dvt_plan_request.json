@@ -1,0 +1,48 @@
+{
+  "technology": "dvt",
+  "waveform": "atsc3",
+  "ray_mode": "2d",
+  "dvt": {
+    "fc": 587000000,
+    "fs": 10000000,
+    "bandwidth": 6000000,
+    "waveform": "atsc3",
+    "tx": {
+      "latitude": 37.7749,
+      "longitude": -122.4194,
+      "altitude": 18.0,
+      "antennaHeight": 320.0,
+      "name": "Example DVT TX",
+      "azimuthDeg": 90.0,
+      "elevationDeg": -1.0,
+      "beamwidthHDeg": 65.0,
+      "beamwidthVDeg": 8.0,
+      "electricalTiltDeg": 0.0,
+      "mechanicalTiltDeg": 0.0,
+      "maxHorizontalAttenuationDb": 30.0,
+      "frontToBackAttenuationDb": 30.0,
+      "maxVerticalAttenuationDb": 30.0
+    },
+    "power": {
+      "erpKw": 50.0,
+      "polarization": "DA (E)"
+    },
+    "station": {
+      "callSign": "KEXAMPLE",
+      "virtualChannel": "7.1",
+      "rfChannel": 33,
+      "physicalChannel": 33,
+      "facilityId": 12345,
+      "city": "San Francisco",
+      "network": "Example Network",
+      "standard": "ATSC 3.0",
+      "band": "UHF",
+      "source": "internal",
+      "sourceUrl": "https://example.invalid/station/12345"
+    }
+  },
+  "max_range_m": 20000,
+  "step_m": 20,
+  "coverage_display_layer": "field_strength",
+  "compact_output": true
+}
