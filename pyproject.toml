@@ -51,6 +51,7 @@ dev = [
 
 [project.scripts]
 agentic-rf-planner = "agentic_rf_planner.cli:main"
+agentic-rf-prepare-region = "agentic_rf_planner.data.prepare_region:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
