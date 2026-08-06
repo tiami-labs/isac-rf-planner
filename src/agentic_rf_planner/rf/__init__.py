@@ -4,6 +4,8 @@ __all__ = [
     "MaterialRFProps",
     "DEFAULT_MATERIAL_DB",
     "DVTGeometry",
+    "DVTBroadcastAntenna",
+    "DVTAzimuthPatternPoint",
     "DVTPower",
     "DVTStationIdentity",
     "DVTTransmitter",
@@ -16,11 +18,13 @@ def __getattr__(name: str):
         from .material_models import DEFAULT_MATERIAL_DB, MaterialRFProps
 
         return {"MaterialRFProps": MaterialRFProps, "DEFAULT_MATERIAL_DB": DEFAULT_MATERIAL_DB}[name]
-    if name in {"DVTGeometry", "DVTPower", "DVTStationIdentity", "DVTTransmitter"}:
-        from .dvt import DVTGeometry, DVTPower, DVTStationIdentity, DVTTransmitter
+    if name in {"DVTGeometry", "DVTBroadcastAntenna", "DVTAzimuthPatternPoint", "DVTPower", "DVTStationIdentity", "DVTTransmitter"}:
+        from .dvt import (DVTGeometry, DVTBroadcastAntenna, DVTAzimuthPatternPoint, DVTPower, DVTStationIdentity, DVTTransmitter)
 
         return {
             "DVTGeometry": DVTGeometry,
+            "DVTBroadcastAntenna": DVTBroadcastAntenna,
+            "DVTAzimuthPatternPoint": DVTAzimuthPatternPoint,
             "DVTPower": DVTPower,
             "DVTStationIdentity": DVTStationIdentity,
             "DVTTransmitter": DVTTransmitter,
