@@ -76,16 +76,16 @@
       <div id="dvt-transmitter-fields" hidden>
         <div class="rf-field-grid">
           <div>
-            <label class="rf-label" for="dvt-tx-name">TX name</label>
+            <label class="rf-label" for="dvt-tx-name">Broadcast TX name</label>
             <input id="dvt-tx-name" class="rf-input" value="DVT TX" />
           </div>
           <div>
             <label class="rf-label" for="dvt-fc-mhz">Center frequency fc (MHz)</label>
-            <input id="dvt-fc-mhz" class="rf-input" type="number" min="0.001" step="0.001" value="587" />
+            <input id="dvt-fc-mhz" class="rf-input" type="number" min="40" max="1000" step="0.001" value="587" />
           </div>
           <div>
             <label class="rf-label" for="dvt-bandwidth-mhz">Channel bandwidth (MHz)</label>
-            <input id="dvt-bandwidth-mhz" class="rf-input" type="number" min="0.001" step="0.001" value="6" />
+            <input id="dvt-bandwidth-mhz" class="rf-input" type="number" min="1" max="10" step="0.001" value="6" />
           </div>
           <div>
             <label class="rf-label" for="dvt-fs-mhz">Sample rate fs (MHz)</label>
@@ -96,73 +96,88 @@
             <input id="dvt-site-altitude-m" class="rf-input" type="number" step="0.1" value="0" />
           </div>
           <div>
-            <label class="rf-label" for="dvt-polarization">Polarization</label>
+            <label class="rf-label" for="dvt-polarization">Licensed polarization</label>
             <input id="dvt-polarization" class="rf-input" value="DA (E)" />
           </div>
-          <div>
-            <label class="rf-label" for="dvt-azimuth-deg">Azimuth (deg)</label>
-            <input id="dvt-azimuth-deg" class="rf-input" type="number" min="0" max="360" step="0.1" value="0" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-elevation-deg">Elevation (deg)</label>
-            <input id="dvt-elevation-deg" class="rf-input" type="number" min="-90" max="90" step="0.1" value="0" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-beamwidth-h-deg">Horizontal BW (deg)</label>
-            <input id="dvt-beamwidth-h-deg" class="rf-input" type="number" min="0.1" max="360" step="0.1" value="360" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-beamwidth-v-deg">Vertical BW (deg)</label>
-            <input id="dvt-beamwidth-v-deg" class="rf-input" type="number" min="0.1" max="180" step="0.1" value="8" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-electrical-tilt-deg">Electrical tilt (deg)</label>
-            <input id="dvt-electrical-tilt-deg" class="rf-input" type="number" min="-30" max="30" step="0.1" value="0" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-mechanical-tilt-deg">Mechanical tilt (deg)</label>
-            <input id="dvt-mechanical-tilt-deg" class="rf-input" type="number" min="-30" max="30" step="0.1" value="0" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-max-horizontal-atten-db">Max horizontal attenuation (dB)</label>
-            <input id="dvt-max-horizontal-atten-db" class="rf-input" type="number" min="0" max="60" step="0.1" value="30" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-front-to-back-atten-db">Front-to-back attenuation (dB)</label>
-            <input id="dvt-front-to-back-atten-db" class="rf-input" type="number" min="0" max="60" step="0.1" value="25" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-max-vertical-atten-db">Max vertical attenuation (dB)</label>
-            <input id="dvt-max-vertical-atten-db" class="rf-input" type="number" min="0" max="60" step="0.1" value="30" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-noise-figure-db">Receiver noise figure (dB)</label>
-            <input id="dvt-noise-figure-db" class="rf-input" type="number" step="0.1" value="7" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-rx-antenna-gain-dbi">Receiver antenna gain (dBi)</label>
-            <input id="dvt-rx-antenna-gain-dbi" class="rf-input" type="number" step="0.1" value="0" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-termination-power-dbm">Ray termination power (dBm)</label>
-            <input id="dvt-termination-power-dbm" class="rf-input" type="number" step="0.1" value="-140" />
-          </div>
-          <div>
-            <label class="rf-label" for="dvt-dtheta-deg">Bearing step dθ (deg)</label>
-            <input id="dvt-dtheta-deg" class="rf-input" type="number" min="0.01" max="360" step="0.01" value="0.25" />
-          </div>
         </div>
+
+        <details open style="margin-top:8px;">
+          <summary style="font-size:11px; color:#ccc;">Broadcast antenna radiation pattern</summary>
+          <p class="rf-sidebar-muted-sm" style="margin:6px 0;">One station antenna system. This is not cellular sector configuration.</p>
+          <div class="rf-field-grid">
+            <div>
+              <label class="rf-label" for="dvt-pattern-type">Pattern representation</label>
+              <select id="dvt-pattern-type" class="rf-select">
+                <option value="omnidirectional" selected>Omnidirectional</option>
+                <option value="tabulated">Tabulated filed/manufacturer pattern</option>
+                <option value="parametric">Parametric broadcast approximation</option>
+              </select>
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-pattern-rotation-deg">Pattern rotation CW (deg)</label>
+              <input id="dvt-pattern-rotation-deg" class="rf-input" type="number" min="0" max="359.999" step="0.1" value="0" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-antenna-manufacturer">Manufacturer</label>
+              <input id="dvt-antenna-manufacturer" class="rf-input" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-antenna-model">Antenna model</label>
+              <input id="dvt-antenna-model" class="rf-input" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-beam-tilt-deg">Beam tilt, positive down (deg)</label>
+              <input id="dvt-beam-tilt-deg" class="rf-input" type="number" min="-30" max="30" step="0.1" value="0" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-vertical-beamwidth-deg">Vertical HPBW (deg)</label>
+              <input id="dvt-vertical-beamwidth-deg" class="rf-input" type="number" min="0.1" max="180" step="0.1" value="8" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-max-vertical-atten-db">Max vertical attenuation (dB)</label>
+              <input id="dvt-max-vertical-atten-db" class="rf-input" type="number" min="0" max="80" step="0.1" value="30" />
+            </div>
+          </div>
+          <div id="dvt-parametric-pattern-fields" class="rf-field-grid" hidden>
+            <div>
+              <label class="rf-label" for="dvt-main-azimuth-deg">Main-lobe true azimuth before rotation (deg)</label>
+              <input id="dvt-main-azimuth-deg" class="rf-input" type="number" min="0" max="359.999" step="0.1" value="0" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-horizontal-beamwidth-deg">Horizontal HPBW (deg)</label>
+              <input id="dvt-horizontal-beamwidth-deg" class="rf-input" type="number" min="0.1" max="360" step="0.1" value="360" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-max-horizontal-atten-db">Max horizontal attenuation (dB)</label>
+              <input id="dvt-max-horizontal-atten-db" class="rf-input" type="number" min="0" max="80" step="0.1" value="30" />
+            </div>
+            <div>
+              <label class="rf-label" for="dvt-front-to-back-atten-db">Front-to-back attenuation (dB)</label>
+              <input id="dvt-front-to-back-atten-db" class="rf-input" type="number" min="0" max="80" step="0.1" value="25" />
+            </div>
+          </div>
+          <div id="dvt-tabulated-pattern-fields" hidden>
+            <label class="rf-label" for="dvt-azimuth-pattern">Azimuth pattern samples</label>
+            <textarea id="dvt-azimuth-pattern" class="rf-input" rows="7" placeholder="azimuth_deg,relative_field_h,relative_field_v&#10;0,1.0,1.0&#10;90,0.75,0.75&#10;180,0.20,0.20&#10;270,0.10,0.10"></textarea>
+            <div class="rf-sidebar-muted-sm" style="margin-top:4px;">One CSV line per unrotated pattern sample. Two columns apply one relative-field pattern to both components; three columns provide H and V separately.</div>
+          </div>
+        </details>
+
         <div class="rf-field-block" style="margin-top:8px;">
-          <label class="rf-label" for="dvt-power-mode">Power input basis</label>
+          <label class="rf-label" for="dvt-power-mode">Broadcast power basis</label>
           <select id="dvt-power-mode" class="rf-select">
-            <option value="erp" selected>ERP (kW, antenna system already included)</option>
+            <option value="erp" selected>Maximum ERP by polarization component</option>
             <option value="conducted">Conducted power + RF-chain components</option>
           </select>
         </div>
         <div id="dvt-erp-fields" class="rf-field-grid">
           <div>
-            <label class="rf-label" for="dvt-erp-kw">ERP (kW)</label>
-            <input id="dvt-erp-kw" class="rf-input" type="number" min="0.000001" step="0.1" value="50" />
+            <label class="rf-label" for="dvt-erp-h-kw">Maximum horizontal ERP (kW)</label>
+            <input id="dvt-erp-h-kw" class="rf-input" type="number" min="0" step="0.1" value="50" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-erp-v-kw">Maximum vertical ERP (kW, 0 if absent)</label>
+            <input id="dvt-erp-v-kw" class="rf-input" type="number" min="0" step="0.1" value="0" />
           </div>
         </div>
         <div id="dvt-conducted-fields" class="rf-field-grid" hidden>
@@ -183,6 +198,37 @@
             <input id="dvt-antenna-gain-dbi" class="rf-input" type="number" step="0.1" value="12" />
           </div>
         </div>
+
+        <div class="rf-field-grid" style="margin-top:8px;">
+          <div>
+            <label class="rf-label" for="dvt-noise-figure-db">Receiver noise figure (dB)</label>
+            <input id="dvt-noise-figure-db" class="rf-input" type="number" step="0.1" value="7" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-rx-antenna-gain-dbi">Receiver antenna gain (dBi)</label>
+            <input id="dvt-rx-antenna-gain-dbi" class="rf-input" type="number" step="0.1" value="0" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-termination-power-dbm">Ray termination power (dBm)</label>
+            <input id="dvt-termination-power-dbm" class="rf-input" type="number" step="0.1" value="-140" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-dtheta-deg">Bearing step dθ (deg)</label>
+            <input id="dvt-dtheta-deg" class="rf-input" type="number" min="0.01" max="360" step="0.01" value="0.25" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-coverage-radius-m">Coverage radius (m)</label>
+            <input id="dvt-coverage-radius-m" class="rf-input" type="number" min="1" step="100" value="20000" />
+          </div>
+          <div>
+            <label class="rf-label" for="dvt-dr-m">Radial step dR (m)</label>
+            <input id="dvt-dr-m" class="rf-input" type="number" min="0.1" step="1" value="20" />
+          </div>
+        </div>
+
+
+        
+
         <details style="margin-top:8px;">
           <summary style="font-size:11px; color:#ccc;">Station identity metadata</summary>
           <div class="rf-field-grid" style="margin-top:8px;">
@@ -200,6 +246,47 @@
           </div>
         </details>
       </div>
+    </div>
+
+    <div class="rf-sidebar-section" id="channel-analysis-section">
+      <h3 class="rf-sidebar-h3">Link budget and bistatic channel</h3>
+      <label class="rf-check-row">
+        <input type="checkbox" id="channel-analysis-enabled" />
+        Enable waveform-agnostic receiver, target-return and Doppler analysis
+      </label>
+      <p class="rf-sidebar-muted-sm" style="margin:6px 0;">Available for every waveform. Frequency and occupied bandwidth come from the active transmitter; every coverage point is evaluated as a candidate target.</p>
+      <div id="channel-analysis-fields" hidden>
+        <div class="rf-field-grid">
+          <div style="grid-column:1/-1;"><label class="rf-label" for="channel-rx-location">Analysis RX location (lat,lon)</label><input id="channel-rx-location" class="rf-input" type="text" inputmode="decimal" placeholder="38.41717489626978, -121.39508190497462" /></div><div class="rf-sidebar-muted-sm" style="grid-column:1/-1;">Every coverage pixel is evaluated as a candidate target. Heatmaps report expected TX→target illumination, target→RX environmental return loss, echo power, Doppler, post-processing SNR, detection margin, and ISAC quality at that location.</div>
+          <div><label class="rf-label" for="channel-rx-altitude-m">RX site altitude (m AMSL)</label><input id="channel-rx-altitude-m" class="rf-input" type="number" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-rx-height-m">RX antenna height (m AGL)</label><input id="channel-rx-height-m" class="rf-input" type="number" min="0" step="0.1" value="10" /></div>
+          <div><label class="rf-label" for="channel-direct-gain-dbi">Direct/reference antenna gain (dBi)</label><input id="channel-direct-gain-dbi" class="rf-input" type="number" step="0.1" value="8" /></div>
+          <div><label class="rf-label" for="channel-echo-gain-dbi">Echo/surveillance antenna gain (dBi)</label><input id="channel-echo-gain-dbi" class="rf-input" type="number" step="0.1" value="12" /></div>
+          <div><label class="rf-label" for="channel-rx-feeder-loss-db">RX feeder loss (dB)</label><input id="channel-rx-feeder-loss-db" class="rf-input" type="number" min="0" step="0.1" value="1" /></div>
+          <div><label class="rf-label" for="channel-rx-noise-figure-db">RX noise figure (dB)</label><input id="channel-rx-noise-figure-db" class="rf-input" type="number" min="0" step="0.1" value="5" /></div>
+          <div><label class="rf-label" for="channel-target-height-m">Target height (m AGL)</label><input id="channel-target-height-m" class="rf-input" type="number" min="0" step="10" value="1000" /></div>
+          <div><label class="rf-label" for="channel-bistatic-rcs-m2">Bistatic RCS (m²)</label><input id="channel-bistatic-rcs-m2" class="rf-input" type="number" min="0.000001" step="0.1" value="10" /></div>
+          <div><label class="rf-label" for="channel-target-speed-mps">Target speed (m/s)</label><input id="channel-target-speed-mps" class="rf-input" type="number" min="0" step="0.1" value="50" /></div>
+          <div><label class="rf-label" for="channel-target-heading-deg">Target heading true (deg)</label><input id="channel-target-heading-deg" class="rf-input" type="number" min="0" max="359.999" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-target-climb-mps">Target climb rate (m/s)</label><input id="channel-target-climb-mps" class="rf-input" type="number" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-direct-excess-loss-db">Direct-path excess loss (dB)</label><input id="channel-direct-excess-loss-db" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-return-path-model">Target→RX propagation</label><select id="channel-return-path-model" class="rf-select"><option value="environmental_reciprocal_grid" selected>OSM + terrain reciprocal grid</option><option value="free_space_plus_excess">Free space + entered excess loss</option></select></div>
+          <div><label class="rf-label" for="channel-return-excess-loss-db">Additional target→RX loss (dB)</label><input id="channel-return-excess-loss-db" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-processing-bandwidth-mhz">Processing bandwidth (MHz, 0=waveform)</label><input id="channel-processing-bandwidth-mhz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-integration-s">Coherent integration / CPI (s)</label><input id="channel-integration-s" class="rf-input" type="number" min="0.000001" step="0.1" value="1" /></div>
+          <div><label class="rf-label" for="channel-prf-hz">Doppler sampling PRF (Hz, 0=unset)</label><input id="channel-prf-hz" class="rf-input" type="number" min="0" step="1" value="0" /></div>
+          <div><label class="rf-label" for="channel-clutter-notch-hz">Clutter notch (Hz)</label><input id="channel-clutter-notch-hz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-min-doppler-hz">Minimum detectable Doppler (Hz)</label><input id="channel-min-doppler-hz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+          <div><label class="rf-label" for="channel-processing-loss-db">Processing loss (dB)</label><input id="channel-processing-loss-db" class="rf-input" type="number" min="0" step="0.1" value="3" /></div>
+          <div><label class="rf-label" for="channel-system-loss-db">Other system loss (dB)</label><input id="channel-system-loss-db" class="rf-input" type="number" min="0" step="0.1" value="3" /></div>
+          <div><label class="rf-label" for="channel-required-snr-db">Required post-processing SNR (dB)</label><input id="channel-required-snr-db" class="rf-input" type="number" step="0.1" value="10" /></div>
+          <div><label class="rf-label" for="channel-direct-cancellation-db">Direct-path cancellation (dB)</label><input id="channel-direct-cancellation-db" class="rf-input" type="number" min="0" step="1" value="60" /></div>
+        </div>
+        <label class="rf-check-row" style="margin-top:8px;"><input type="checkbox" id="channel-target-inspector-enabled" checked /> Click any heatmap pixel as a candidate target: inspect both environmental path legs, expected echo, Doppler, SNR, margin, and its iso-range ellipse</label>
+        <p class="rf-sidebar-muted-sm" style="margin-top:6px;">Every heatmap pixel is a candidate target. Echo power, both path losses, total bistatic loss, Doppler, delay, SNR margin and ISAC quality class are calculated per location.</p>
+        <div id="channel-target-inspector" class="rf-sidebar-muted-sm" style="margin-top:8px; display:none;"></div>
+      </div>
+      <a id="channel-product-download" class="rf-sidebar-link" href="#" download hidden>Download complete RF + channel grid (.npz)</a>
     </div>
 
     <div class="rf-sidebar-section" id="terrain-environment-section">
@@ -251,9 +338,23 @@
         <label class="rf-label" for="coverage-display-layer">Display layer</label>
         <select id="coverage-display-layer" class="rf-select">
           <option id="coverage-layer-rsrp" value="rsrp" selected>RSRP</option>
-          <option value="sinr">SINR</option>
+          <option id="coverage-layer-sinr" value="sinr">SINR</option>
           <option value="terrain_shadow">Terrain shadow / loss</option>
-          <option value="field_strength">Field strength (dBµV/m)</option>
+          <option id="coverage-layer-field-strength" value="field_strength">Field strength (dBµV/m)</option>
+          <option id="coverage-layer-received-power" value="received_power">Received carrier power (dBm)</option>
+          <option id="coverage-layer-carrier-to-noise" value="carrier_to_noise">Carrier-to-noise C/N (dB)</option>
+          <option id="coverage-layer-incident-power" value="incident_power">Incident total-carrier power at target, 0 dBi (dBm)</option>
+          <option id="coverage-layer-bistatic-echo" value="bistatic_echo">Bistatic echo power (dBm)</option>
+          <option id="coverage-layer-bistatic-return-loss" value="bistatic_return_loss">Target→RX environmental path loss per target (dB)</option>
+          <option id="coverage-layer-bistatic-total-loss" value="bistatic_total_loss">Total TX→target→RX path loss per target (dB)</option>
+          <option id="coverage-layer-isac-quality" value="isac_quality">Expected ISAC quality at each target (0–5)</option>
+          <option id="coverage-layer-bistatic-snr" value="bistatic_snr">Post-processing echo SNR (dB)</option>
+          <option id="coverage-layer-bistatic-margin" value="bistatic_margin">Detection margin (dB)</option>
+          <option id="coverage-layer-bistatic-doppler" value="bistatic_doppler">Signed bistatic Doppler (Hz)</option>
+          <option id="coverage-layer-bistatic-range" value="bistatic_range">Total TX→target→RX path length per target (km)</option>
+          <option id="coverage-layer-bistatic-delay" value="bistatic_delay">Bistatic excess delay (µs)</option>
+          <option id="coverage-layer-bistatic-angle" value="bistatic_angle">Bistatic angle (deg)</option>
+          <option id="coverage-layer-bistatic-detectable" value="bistatic_detectable">Detectability mask (0/1)</option>
         </select>
       </div>
     </div>
