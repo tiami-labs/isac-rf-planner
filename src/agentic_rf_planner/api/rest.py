@@ -18,17 +18,24 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from ..config import load_rf_config
 from ..pipeline.schemas import RFParams, LatLon
 from ..rf.dvt import DVTTransmitter
+from ..rf.channel_analysis import ChannelAnalysisConfig
+from ..rf.channel_products import channel_product_path, get_cached_channel_product
 from ..agents.rf_planning_agent import run_rf_planning_for_point
 
 from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
 from ..geo.google_mesh.provider import MissingMeshProfiles
 from ..geo.road_labels import fetch_road_labels
 from ..geo.geocode import geocode_query
+from ..geo.local_osm_provider import (
+    LocalOSMAcquisitionError,
+    LocalOSMDatabaseError,
+    resolve_local_osm_database,
+)
 
 
 # FastAPI application must be created before route decorators are evaluated.
@@ -1098,6 +1105,35 @@ app.add_middleware(
 )
 
 
+DVT_FORBIDDEN_TOP_LEVEL_FIELDS = {
+    "freq_mhz",
+    "tx_power_dbm",
+    "subcarrier_spacing_khz",
+    "num_resource_blocks",
+    "channel_bandwidth_mhz",
+    "num_tx_antennas",
+    "num_rx_antennas",
+    "mimo_mode",
+    "enable_link_adaptation",
+    "fixed_modulation",
+    "sectors",
+    "tx_chain_gain_db",
+    "tx_antenna_gain_dbi",
+    "tx_feeder_loss_db",
+    "reference_signal_offset_db",
+    "max_rsrp_dbm",
+    "electrical_tilt_deg",
+    "mechanical_tilt_deg",
+    "vertical_beamwidth_deg",
+    "max_vertical_attenuation_db",
+    "max_horizontal_attenuation_db",
+    "front_to_back_attenuation_db",
+    "path_loss_model",
+    "propagation_scenario",
+    "termination_rsrp_dbm",
+}
+
+
 class PlanRequest(BaseModel):
     """Request model for RF planning.
 
@@ -1106,29 +1142,36 @@ class PlanRequest(BaseModel):
     Clients that omit optional keys get the same baseline as the dashboard before user edits.
     """
 
+    model_config = ConfigDict(populate_by_name=True)
+
     lat: Optional[float] = None
     lon: Optional[float] = None
     technology: str = "5g_nr"
     waveform: Optional[str] = None  # 5g_nr | atsc1 | atsc3 | dvbt | baseline
     dvt: Optional[DVTTransmitter] = None
+    channel_analysis: Optional[ChannelAnalysisConfig] = Field(
+        default=None,
+        validation_alias=AliasChoices("channel_analysis", "passive_radar"),
+        serialization_alias="channel_analysis",
+    )
     freq_mhz: float = 3500.0
     tx_power_dbm: float = 43.0  # eNodeB-ish default
     noise_floor_dbm: Optional[float] = None  # If None, calculated from bandwidth + NF
     noise_figure_db: float = 7.0  # Receiver noise figure (typical: 5-10 dB)
-    
+
     # Sector configuration (optional - if None, uses omnidirectional)
     sectors: Optional[List[Dict[str, Any]]] = None  # List of sector configs
-    
+
     # OFDM parameters (scs-khz / bw-mhz defaults from index_3d.html)
     subcarrier_spacing_khz: float = 30.0
     num_resource_blocks: int = 100
     channel_bandwidth_mhz: float = 40.0
-    
+
     # MIMO parameters (mimo-mode default selected option in index_3d.html)
     num_tx_antennas: int = 1
     num_rx_antennas: int = 1
     mimo_mode: str = "MIMO"  # SISO, SIMO, MISO, MIMO
-    
+
     # Link adaptation
     enable_link_adaptation: bool = True
     fixed_modulation: Optional[str] = None
@@ -1165,6 +1208,7 @@ class PlanRequest(BaseModel):
     canyon_recovery_max_db: Optional[float] = None
     canyon_recovery_slope_db_per_100m: Optional[float] = None
     termination_rsrp_dbm: Optional[float] = None
+    termination_power_dbm: Optional[float] = None
     building_attenuation: Optional[Dict[str, Any]] = None  # Override config; { materials: {...}, overall: {...} }
 
     # 3D multipath ray tracing (ray_mode=3d_rt)
@@ -1204,6 +1248,22 @@ class PlanRequest(BaseModel):
     # In-browser “Plan” buttons should set publish_ui=False to avoid double-apply.
     publish_ui: bool = True
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_channel_analysis(cls, values: Any) -> Any:
+        """Accept the previous passive_radar object shape as an input alias only."""
+        if not isinstance(values, dict):
+            return values
+        raw = values.get("channel_analysis", values.get("passive_radar"))
+        if raw is None or isinstance(raw, ChannelAnalysisConfig):
+            return values
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump(by_alias=True)
+        normalized = dict(values)
+        normalized.pop("passive_radar", None)
+        normalized["channel_analysis"] = raw
+        return normalized
+
     @model_validator(mode="after")
     def resolve_transmitter_coordinates(self) -> "PlanRequest":
         valid_waveforms = {"5g_nr", "atsc1", "atsc3", "dvbt", "baseline"}
@@ -1211,6 +1271,12 @@ class PlanRequest(BaseModel):
         if requested_waveform is not None and requested_waveform not in valid_waveforms:
             raise ValueError(f"waveform must be one of {sorted(valid_waveforms)}")
         if self.dvt is not None:
+            leaked_nr_fields = sorted(set(self.model_fields_set) & DVT_FORBIDDEN_TOP_LEVEL_FIELDS)
+            if leaked_nr_fields:
+                raise ValueError(
+                    "DVT requests must not contain NR-only top-level fields: "
+                    + ", ".join(leaked_nr_fields)
+                )
             self.technology = "dvt"
             nested_waveform = str(self.dvt.waveform)
             if requested_waveform is not None and requested_waveform != nested_waveform:
@@ -1224,6 +1290,14 @@ class PlanRequest(BaseModel):
                 raise ValueError("lon must match dvt.tx.longitude when both are supplied")
             self.lat = dvt_lat
             self.lon = dvt_lon
+            if "tx_height_m" in self.model_fields_set:
+                if abs(float(self.tx_height_m) - float(self.dvt.tx.antenna_height)) > 1.0e-8:
+                    raise ValueError("tx_height_m must match dvt.tx.antennaHeight when both are supplied")
+            self.tx_height_m = float(self.dvt.tx.antenna_height)
+            if self.channel_analysis is not None:
+                self.rx_height_m = float(self.channel_analysis.target.height_m_agl)
+        elif self.channel_analysis is not None:
+            self.rx_height_m = float(self.channel_analysis.target.height_m_agl)
         if self.lat is None or self.lon is None:
             raise ValueError("lat/lon are required unless supplied by dvt.tx")
         technology = str(self.technology).strip().lower()
@@ -1425,18 +1499,27 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
     """
     from fastapi import HTTPException
     import logging
-    
+
     logger = logging.getLogger(__name__)
-    
+
+    is_dvt_request = str(req.technology or "5g_nr").strip().lower() == "dvt"
     logger.info("="*60)
-    logger.info(f"API REQUEST: /api/plan")
-    logger.info(f"  lat: {req.lat}")
-    logger.info(f"  lon: {req.lon}")
-    logger.info(f"  freq_mhz: {req.freq_mhz}")
-    logger.info(f"  tx_power_dbm: {req.tx_power_dbm}")
+    logger.info("API REQUEST: /api/plan")
+    logger.info("  technology: %s", "dvt" if is_dvt_request else "5g_nr")
+    logger.info("  waveform: %s", req.waveform or "5g_nr")
+    logger.info("  lat: %s", req.lat)
+    logger.info("  lon: %s", req.lon)
+    if is_dvt_request and req.dvt is not None:
+        logger.info("  fc_mhz: %.6f", req.dvt.frequency_mhz)
+        logger.info("  fs_mhz: %.6f", req.dvt.fs / 1.0e6)
+        logger.info("  bandwidth_mhz: %.6f", req.dvt.bandwidth_mhz)
+        logger.info("  source_eirp_dbm: %.6f", req.dvt.power.source_eirp_dbm)
+    else:
+        logger.info("  freq_mhz: %s", req.freq_mhz)
+        logger.info("  tx_power_dbm: %s", req.tx_power_dbm)
     logger.info("="*60)
     _record_planner_phase("request_enter", f"/api/plan lat={req.lat:.6f} lon={req.lon:.6f}", None)
-    
+
     try:
         logger.info("Step 1: Creating RFParams...")
         _record_planner_phase("rf_params", "Resolving RF parameters", None)
@@ -1453,11 +1536,11 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         except Exception as e:
             rf_cfg = {}
             logger.warning("Failed to load RF config: %s", e)
-        is_dvt_request = str(req.technology or "5g_nr").strip().lower() == "dvt"
         rf_params = RFParams(
             technology=("dvt" if is_dvt_request else "5g_nr"),
             waveform=(req.waveform or (str(req.dvt.waveform) if req.dvt is not None else "5g_nr")),
             dvt=req.dvt,
+            channel_analysis=req.channel_analysis,
             freq_mhz=req.freq_mhz,
             tx_power_dbm=req.tx_power_dbm,
             noise_floor_dbm=req.noise_floor_dbm,
@@ -1507,7 +1590,15 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             diffraction_loss_cap_db=(req.diffraction_loss_cap_db if req.diffraction_loss_cap_db is not None else rf_cfg.get("diffraction_loss_cap_db", RFParams.model_fields["diffraction_loss_cap_db"].default)),
             canyon_recovery_max_db=(req.canyon_recovery_max_db if req.canyon_recovery_max_db is not None else rf_cfg.get("canyon_recovery_max_db", RFParams.model_fields["canyon_recovery_max_db"].default)),
             canyon_recovery_slope_db_per_100m=(req.canyon_recovery_slope_db_per_100m if req.canyon_recovery_slope_db_per_100m is not None else rf_cfg.get("canyon_recovery_slope_db_per_100m", RFParams.model_fields["canyon_recovery_slope_db_per_100m"].default)),
-            termination_rsrp_dbm=(req.termination_rsrp_dbm if req.termination_rsrp_dbm is not None else rf_cfg.get("termination_rsrp_dbm", RFParams.model_fields["termination_rsrp_dbm"].default)),
+            termination_rsrp_dbm=(
+                req.termination_power_dbm
+                if is_dvt_request and req.termination_power_dbm is not None
+                else (
+                    req.termination_rsrp_dbm
+                    if req.termination_rsrp_dbm is not None
+                    else rf_cfg.get("termination_rsrp_dbm", RFParams.model_fields["termination_rsrp_dbm"].default)
+                )
+            ),
             building_attenuation=(req.building_attenuation if req.building_attenuation is not None else rf_cfg.get("building_attenuation")),
 
             # Multipath ray tracing knobs (optional overrides)
@@ -1529,17 +1620,68 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             coverage_display_layer=(req.coverage_display_layer if req.coverage_display_layer is not None else rf_cfg.get("coverage_display_layer", RFParams.model_fields["coverage_display_layer"].default)),
             compact_output=req.compact_output,
         )
-        logger.info(f"  RFParams created: freq={rf_params.freq_mhz}MHz, power={rf_params.tx_power_dbm}dBm")
-        if req.sectors:
-            logger.info(f"  Sectors: {len(req.sectors)} sector(s) configured")
+        if is_dvt_request and rf_params.dvt is not None:
+            dvt_tx = rf_params.dvt
+            logger.info(
+                "  DVT RFParams: waveform=%s, fc=%.6fMHz, fs=%.6fMHz, BW=%.6fMHz",
+                dvt_tx.waveform,
+                dvt_tx.frequency_mhz,
+                dvt_tx.fs / 1.0e6,
+                dvt_tx.bandwidth_mhz,
+            )
+            logger.info(
+                "  DVT source: eirp=%.6fdBm, polarization=%s",
+                dvt_tx.power.source_eirp_dbm,
+                dvt_tx.power.polarization or "unspecified",
+            )
+            logger.info(
+                "  DVT broadcast antenna: pattern=%s, rotation=%.2fdeg CW, tilt=%.2fdeg, v_hpbw=%.2fdeg",
+                dvt_tx.antenna.pattern_type,
+                dvt_tx.antenna.rotation_deg,
+                dvt_tx.antenna.beam_tilt_deg,
+                dvt_tx.antenna.vertical_beamwidth_deg,
+            )
+            logger.info(
+                "  DVT geometry: site_altitude=%.2fm, antenna_height=%.2fm, rx_height=%.2fm",
+                dvt_tx.tx.altitude,
+                dvt_tx.tx.antenna_height,
+                rf_params.rx_height_m,
+            )
         else:
-            logger.info(f"  Sectors: Omnidirectional (360°)")
-        logger.info(f"  OFDM: SCS={rf_params.subcarrier_spacing_khz}kHz, RB={rf_params.num_resource_blocks}, BW={rf_params.channel_bandwidth_mhz}MHz")
-        logger.info(f"  MIMO: {rf_params.mimo_mode} ({rf_params.num_tx_antennas}x{rf_params.num_rx_antennas})")
-        logger.info(f"  Link adaptation: {'enabled' if rf_params.enable_link_adaptation else 'disabled'}")
+            logger.info("  NR RFParams: freq=%sMHz, power=%sdBm", rf_params.freq_mhz, rf_params.tx_power_dbm)
+            if req.sectors:
+                logger.info("  Sectors: %s sector(s) configured", len(req.sectors))
+            else:
+                logger.info("  Sectors: Omnidirectional (360°)")
+            logger.info(
+                "  OFDM: SCS=%skHz, RB=%s, BW=%sMHz",
+                rf_params.subcarrier_spacing_khz,
+                rf_params.num_resource_blocks,
+                rf_params.channel_bandwidth_mhz,
+            )
+            logger.info(
+                "  MIMO: %s (%sx%s)",
+                rf_params.mimo_mode,
+                rf_params.num_tx_antennas,
+                rf_params.num_rx_antennas,
+            )
+            logger.info("  Link adaptation: %s", "enabled" if rf_params.enable_link_adaptation else "disabled")
+        if rf_params.channel_analysis is not None:
+            ca = rf_params.channel_analysis
+            logger.info(
+                "  Channel analysis: receiver=(%.6f, %.6f), target_height=%.1fm, "
+                "bistatic_rcs=%.3fm2, target_speed=%.3fm/s heading=%.2fdeg, integration=%.3fs",
+                ca.receiver.latitude,
+                ca.receiver.longitude,
+                ca.target.height_m_agl,
+                ca.target.bistatic_rcs_m2,
+                ca.motion.speed_mps,
+                ca.motion.heading_deg_true,
+                ca.processing.coherent_integration_s,
+            )
         logger.info(f"  Ray mode: {rf_params.ray_mode} (tx_h={rf_params.tx_height_m}m, rx_h={rf_params.rx_height_m}m)")
         logger.info(f"  Ray mode: {effective_ray_mode} (tx_height_m={rf_params.tx_height_m}, rx_height_m={rf_params.rx_height_m})")
-        
+
         # When dem_source=copernicus_mesh, ensure mesh profiles exist before running.
         # If missing, signal the /3d browser via poll queue and wait up to 180s.
         _dem_src = str(getattr(rf_params, "dem_source", "") or "").strip().lower()
@@ -1597,7 +1739,7 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
         # Run in executor to avoid blocking the event loop during long processing
         import asyncio
         from concurrent.futures import ThreadPoolExecutor
-        
+
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor() as executor:
             result = await loop.run_in_executor(
@@ -1628,6 +1770,29 @@ async def api_plan(req: PlanRequest) -> Dict[str, Any]:
             detail={
                 "status": "missing_mesh_profiles",
                 "key": e.key,
+                "message": str(e),
+            },
+        )
+    except LocalOSMAcquisitionError as e:
+        _record_planner_phase("error", f"Automatic OSM acquisition failed: {e}", None)
+        logger.error("DVT automatic OSM acquisition failed: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "automatic_osm_acquisition_failed",
+                "database_path": str(resolve_local_osm_database()),
+                "message": str(e),
+                "retryable": True,
+            },
+        )
+    except LocalOSMDatabaseError as e:
+        _record_planner_phase("error", f"Local OSM cache database error: {e}", None)
+        logger.error("DVT local OSM cache database error: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "local_osm_cache_error",
+                "database_path": str(resolve_local_osm_database()),
                 "message": str(e),
             },
         )
@@ -2510,19 +2675,19 @@ def mesh_profiles_get(
 async def clear_cache(req: Request) -> Dict[str, Any]:
     """
     Clear backend caches.
-    
+
     Request body (optional JSON):
         {
             "clear_osm": true/false,  # If True, clears persistent OSM cache. Default: False
             "clear_dem": true/false,  # If True, clears persistent DEM elevation cache. Default: False
             "clear_mesh": true/false  # If True, clears Google mesh profile cache. Default: False
         }
-    
+
     Note: OSM and DEM caches are preserved by default to avoid repeated API calls.
           Set clear_osm=true or clear_dem=true only if you need to force fresh data.
     """
     logger = logging.getLogger(__name__)
-    
+
     # Parse request body (if provided)
     clear_osm = False
     clear_dem = False
@@ -2536,7 +2701,7 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
     except:
         # No body provided, use default (preserve persistent caches)
         pass
-    
+
     result = {
         "status": "ok",
         "message": "Cache cleared",
@@ -2544,16 +2709,16 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
         "dem_cache_cleared": False,
         "mesh_cache_cleared": False,
     }
-    
+
     # Only clear OSM cache if explicitly requested
     if clear_osm:
         from ..geo.osm_cache import clear_cache, get_cache_stats
-        
+
         stats_before = get_cache_stats()
         deleted = clear_cache()  # Clear all cache
-        
+
         logger.info(f"OSM cache clear requested - deleted {deleted} file(s)")
-        
+
         result.update({
             "message": f"OSM cache cleared - deleted {deleted} file(s)",
             "osm_cache_cleared": True,
@@ -2599,8 +2764,109 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
             "mesh_profiles_deleted": deleted_profiles,
             "mesh_cache_stats": store.stats(),
         })
-    
+
     return result
+
+
+@app.get("/api/channel-analysis/products/{product_id}/nearest")
+async def inspect_channel_analysis_target(
+    product_id: str,
+    lat: float,
+    lon: float,
+):
+    """Return all stored metrics for the grid point nearest a clicked target location."""
+
+    import numpy as np
+
+    cached = get_cached_channel_product(product_id)
+    source = "memory" if cached is not None else "npz"
+    if cached is not None:
+        arrays = cached.get("arrays", {})
+        metadata = cached.get("metadata", {})
+        latitude = np.asarray(arrays.get("latitude_deg"), dtype=np.float64)
+        longitude = np.asarray(arrays.get("longitude_deg"), dtype=np.float64)
+        array_items = list(arrays.items())
+    else:
+        path = channel_product_path(product_id)
+        if path is None or not path.is_file():
+            raise HTTPException(status_code=404, detail="Channel-analysis product not found")
+        with np.load(path, allow_pickle=False) as product:
+            if "latitude_deg" not in product or "longitude_deg" not in product:
+                raise HTTPException(status_code=422, detail="Channel product has no location arrays")
+            latitude = np.asarray(product["latitude_deg"], dtype=np.float64)
+            longitude = np.asarray(product["longitude_deg"], dtype=np.float64)
+            metadata = {}
+            if "metadata_json" in product:
+                try:
+                    metadata = json.loads(str(product["metadata_json"].item()))
+                except Exception:
+                    metadata = {}
+            # Load once on the restart fallback path. Normal UI inspection uses
+            # the bounded in-memory product cache populated during plan export.
+            array_items = [
+                (name, np.asarray(product[name]))
+                for name in product.files
+                if name != "metadata_json"
+            ]
+
+    if latitude.size == 0 or longitude.size != latitude.size:
+        raise HTTPException(status_code=422, detail="Channel product location arrays are invalid")
+    cos_lat = max(abs(float(np.cos(np.deg2rad(float(lat))))), 1.0e-6)
+    distance2 = (latitude - float(lat)) ** 2 + ((longitude - float(lon)) * cos_lat) ** 2
+    index = int(np.nanargmin(distance2))
+
+    metrics: Dict[str, Any] = {}
+    for name, raw in array_items:
+        arr = np.asarray(raw)
+        if arr.ndim != 1 or arr.shape[0] != latitude.shape[0]:
+            continue
+        value = arr[index]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and not np.isfinite(value):
+            value = None
+        metrics[name] = value
+
+    summary = metadata.get("summary", {}) if isinstance(metadata, dict) else {}
+    transmitter = summary.get("transmitter") or {}
+    receiver = summary.get("receiver") or {}
+    quality_legend = ((summary.get("isac_quality") or {}).get("code_legend") or {})
+    quality_code = metrics.get("isac_quality_code")
+    quality_label = quality_legend.get(str(quality_code)) if quality_code is not None else None
+    return {
+        "product_id": product_id,
+        "inspection_source": source,
+        "index": index,
+        "requested_location": {"latitude": float(lat), "longitude": float(lon)},
+        "target": {
+            "latitude": float(latitude[index]),
+            "longitude": float(longitude[index]),
+            "isac_quality_label": quality_label,
+        },
+        "transmitter": transmitter,
+        "receiver": receiver,
+        "metrics": metrics,
+        "array_units": metadata.get("array_units", {}) if isinstance(metadata, dict) else {},
+        "quality_legend": quality_legend,
+        "return_path_model": summary.get("return_path_model"),
+    }
+
+
+@app.get("/api/channel-analysis/products/{product_id}")
+async def download_channel_analysis_product(product_id: str):
+    """Download a compressed, machine-readable channel-analysis grid."""
+
+    path = channel_product_path(product_id)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Channel-analysis product not found")
+    from fastapi.responses import FileResponse
+
+    return FileResponse(
+        str(path),
+        media_type="application/octet-stream",
+        filename=f"channel_analysis_{product_id}.npz",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # Serve frontend static files - explicit routes for known files only
@@ -2613,7 +2879,7 @@ if static_dir.exists():
     cesium_dir = repo_root / "Cesium"
     if cesium_dir.exists():
         app.mount("/Cesium", StaticFiles(directory=str(cesium_dir)), name="Cesium")
-    
+
     @app.get("/")
     async def serve_index():
         """Serve the default UI.
@@ -2629,7 +2895,7 @@ if static_dir.exists():
 
         index_path = static_dir / "index.html"
         if index_path.exists():
-            return FileResponse(str(index_path))
+            return FileResponse(str(index_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
@@ -2638,7 +2904,7 @@ if static_dir.exists():
         """Serve the 2D Leaflet UI explicitly."""
         index_path = static_dir / "index.html"
         if index_path.exists():
-            return FileResponse(str(index_path))
+            return FileResponse(str(index_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
 
@@ -2671,10 +2937,19 @@ if static_dir.exists():
     async def serve_index_html():
         index_path = static_dir / "index.html"
         if index_path.exists():
-            return FileResponse(str(index_path))
+            return FileResponse(str(index_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
-    
+
+    @app.get("/waveform_ui.js")
+    async def serve_waveform_ui_js():
+        """Serve the waveform switcher used by both 2D and 3D planners."""
+        file_path = static_dir / "waveform_ui.js"
+        if file_path.exists():
+            return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404)
+
     @app.get("/app.js")
     async def serve_app_js():
         file_path = static_dir / "app.js"
@@ -2698,7 +2973,7 @@ if static_dir.exists():
             return FileResponse(str(file_path), headers={"Cache-Control": "no-store"})
         from fastapi import HTTPException
         raise HTTPException(status_code=404)
-    
+
     @app.get("/style.css")
     async def serve_style_css():
         file_path = static_dir / "style.css"
