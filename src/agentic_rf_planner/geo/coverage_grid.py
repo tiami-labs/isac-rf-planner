@@ -6,7 +6,7 @@ import math
 import logging
 from typing import Any, List, Optional, Tuple
 
-from ..pipeline.schemas import LatLon, RFParams, WorldCell, MaterialType
+from ..pipeline.schemas import BroadcastWorldCell, LatLon, RFParams, WorldCell, MaterialType
 from .physical_spanning import MapProvider
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ def build_coverage_grid(
     """
     from ..rf.sector_config import SectorConfig, create_omnidirectional_sector, validate_sectors
     
-    cells: List[WorldCell] = []
+    cells: List[Any] = []
     max_r = float(rf_params.max_range_m)
     dr = float(rf_params.step_m)
 
@@ -270,9 +270,12 @@ def build_coverage_grid(
         z_tx_ground_m = float(terrain_provider.elevation_m(tx.lat, tx.lon))
         z_tx_abs_m = z_tx_ground_m + float(getattr(rf_params, "tx_height_m", 0.0) or 0.0)
 
+    is_broadcast = (
+        str(getattr(rf_params, "technology", "5g_nr") or "5g_nr").strip().lower() == "dvt"
+    )
     store_building_lists = (
         ray_mode_eff not in ("3d_osm", "3d-osm", "osm3d")
-        and str(getattr(rf_params, "technology", "5g_nr") or "5g_nr").strip().lower() != "dvt"
+        and not is_broadcast
     )
 
     # Generate cells for each sector.
@@ -798,78 +801,128 @@ def build_coverage_grid(
                         )
                         break
 
-                    cells.append(
-                        WorldCell(
-                            lat=lat,
-                            lon=lon,
-                            distance_m=r,
-                            bearing_deg=theta,
-                            dominant_material=(
-                                MaterialType.TREES
-                                if next_forest_start_idx > 0
+                    dominant_material = (
+                        MaterialType.TREES
+                        if next_forest_start_idx > 0
+                        else (
+                            MaterialType.LARGE_STRUCTURE
+                            if next_hit_idx >= 3
+                            else (
+                                MaterialType.BUILDING
+                                if next_hit_idx >= 2
                                 else (
-                                    MaterialType.LARGE_STRUCTURE
-                                    if next_hit_idx >= 3
-                                    else (
-                                        MaterialType.BUILDING
-                                        if next_hit_idx >= 2
-                                        else (MaterialType.HOUSE if next_hit_idx == 1 else MaterialType.UNKNOWN)
-                                    )
+                                    MaterialType.HOUSE
+                                    if next_hit_idx == 1
+                                    else MaterialType.UNKNOWN
                                 )
-                            ),
-                            obstacles_count=next_hit_idx + next_forest_start_idx,
-                            extra_loss_db=extra_loss_db,
-                            sector_id=sector.sector_id,
-                            sector_freq_mhz=sector_freq_mhz,
-                            sector_tx_power_dbm=sector_tx_power_dbm,
-                            sector_channel_bandwidth_mhz=sector.channel_bandwidth_mhz,
-                            sector_azimuth_deg=getattr(sector, "azimuth_deg", None),
-                            sector_beamwidth_h_deg=getattr(sector, "beamwidth_h_deg", None),
-                            sector_beamwidth_v_deg=getattr(sector, "beamwidth_v_deg", None),
-                            sector_electrical_tilt_deg=getattr(sector, "electrical_tilt_deg", None),
-                            sector_mechanical_tilt_deg=getattr(sector, "mechanical_tilt_deg", None),
-                            sector_max_horizontal_attenuation_db=getattr(sector, "max_horizontal_attenuation_db", None),
-                            sector_front_to_back_attenuation_db=getattr(sector, "front_to_back_attenuation_db", None),
-                            sector_max_vertical_attenuation_db=getattr(sector, "max_vertical_attenuation_db", None),
-                            sector_tx_antenna_gain_dbi=getattr(sector, "tx_antenna_gain_dbi", None),
-                            sector_pci=getattr(sector, "pci", None),
-                            is_los=is_los,
-                            actual_path_length_m=r,
-                            num_buildings=next_hit_idx,
-                            num_trees=next_forest_start_idx,
-                            blocking_state=("los" if is_los else ("penetration" if penetration_loss_db > 0.0 else "shadow")),
-                            propagation_mode=(
-                                "los"
-                                if is_los
+                            )
+                        )
+                    )
+                    propagation_mode = (
+                        "los"
+                        if is_los
+                        else (
+                            "reflect"
+                            if mp_is_reflect
+                            else (
+                                "penetration"
+                                if penetration_loss_db > 0.0
                                 else (
-                                    "reflect"
-                                    if mp_is_reflect
+                                    "nlos_recovery"
+                                    if canyon_recovery_db > 0.0
+                                    else "shadow"
+                                )
+                            )
+                        )
+                    )
+                    if is_broadcast:
+                        cells.append(
+                            BroadcastWorldCell(
+                                lat=lat,
+                                lon=lon,
+                                distance_m=r,
+                                bearing_deg=theta,
+                                obstacles_count=next_hit_idx + next_forest_start_idx,
+                                extra_loss_db=extra_loss_db,
+                                is_los=is_los,
+                                propagation_mode=propagation_mode,
+                                penetration_loss_db=penetration_loss_db,
+                                shadow_loss_db=shadow_loss_db,
+                                diffraction_loss_db=diffraction_loss_db,
+                                canyon_recovery_db=canyon_recovery_db,
+                                precomputed_rsrp_dbm=(
+                                    estimated_rsrp_total if multipath_enabled else None
+                                ),
+                                z_ground_m=z_ground_m,
+                                z_rx_abs_m=z_rx_abs_m,
+                                terrain_loss_db=terrain_loss_db,
+                                los_terrain=los_terrain,
+                                terrain_state=terrain_state,
+                            )
+                        )
+                    else:
+                        cells.append(
+                            WorldCell(
+                                lat=lat,
+                                lon=lon,
+                                distance_m=r,
+                                bearing_deg=theta,
+                                dominant_material=dominant_material,
+                                obstacles_count=next_hit_idx + next_forest_start_idx,
+                                extra_loss_db=extra_loss_db,
+                                sector_id=sector.sector_id,
+                                sector_freq_mhz=sector_freq_mhz,
+                                sector_tx_power_dbm=sector_tx_power_dbm,
+                                sector_channel_bandwidth_mhz=sector.channel_bandwidth_mhz,
+                                sector_azimuth_deg=getattr(sector, "azimuth_deg", None),
+                                sector_beamwidth_h_deg=getattr(sector, "beamwidth_h_deg", None),
+                                sector_beamwidth_v_deg=getattr(sector, "beamwidth_v_deg", None),
+                                sector_electrical_tilt_deg=getattr(sector, "electrical_tilt_deg", None),
+                                sector_mechanical_tilt_deg=getattr(sector, "mechanical_tilt_deg", None),
+                                sector_max_horizontal_attenuation_db=getattr(sector, "max_horizontal_attenuation_db", None),
+                                sector_front_to_back_attenuation_db=getattr(sector, "front_to_back_attenuation_db", None),
+                                sector_max_vertical_attenuation_db=getattr(sector, "max_vertical_attenuation_db", None),
+                                sector_tx_antenna_gain_dbi=getattr(sector, "tx_antenna_gain_dbi", None),
+                                sector_pci=getattr(sector, "pci", None),
+                                is_los=is_los,
+                                actual_path_length_m=r,
+                                num_buildings=next_hit_idx,
+                                num_trees=next_forest_start_idx,
+                                blocking_state=(
+                                    "los"
+                                    if is_los
                                     else (
                                         "penetration"
                                         if penetration_loss_db > 0.0
-                                        else ("nlos_recovery" if canyon_recovery_db > 0.0 else "shadow")
+                                        else "shadow"
                                     )
-                                )
-                            ),
-                            first_blocker_distance_m=first_blocker_distance_m,
-                            diffraction_flag=(diffraction_loss_db > 0.0),
-                            penetration_loss_db=penetration_loss_db,
-                            shadow_loss_db=shadow_loss_db,
-                            diffraction_loss_db=diffraction_loss_db,
-                            canyon_recovery_db=canyon_recovery_db,
-                            metal_blocked=metal_blocked,
-                            buildings_along_path=(list(encountered_buildings) if encountered_buildings is not None else []),
-                            coverage_precomputed=True,
-
-                            precomputed_rsrp_dbm=(estimated_rsrp_total if multipath_enabled else None),
-                            z_ground_m=z_ground_m,
-                            z_rx_abs_m=z_rx_abs_m,
-                            terrain_loss_db=terrain_loss_db,
-                            los_terrain=los_terrain,
-                            fresnel_clearance=fresnel_clearance,
-                            terrain_state=terrain_state,
+                                ),
+                                propagation_mode=propagation_mode,
+                                first_blocker_distance_m=first_blocker_distance_m,
+                                diffraction_flag=(diffraction_loss_db > 0.0),
+                                penetration_loss_db=penetration_loss_db,
+                                shadow_loss_db=shadow_loss_db,
+                                diffraction_loss_db=diffraction_loss_db,
+                                canyon_recovery_db=canyon_recovery_db,
+                                metal_blocked=metal_blocked,
+                                buildings_along_path=(
+                                    list(encountered_buildings)
+                                    if encountered_buildings is not None
+                                    else []
+                                ),
+                                coverage_precomputed=True,
+                                precomputed_rsrp_dbm=(
+                                    estimated_rsrp_total if multipath_enabled else None
+                                ),
+                                z_ground_m=z_ground_m,
+                                z_rx_abs_m=z_rx_abs_m,
+                                terrain_loss_db=terrain_loss_db,
+                                los_terrain=los_terrain,
+                                fresnel_clearance=fresnel_clearance,
+                                terrain_state=terrain_state,
+                            )
                         )
-                    )
+
 
                     r += dr
 

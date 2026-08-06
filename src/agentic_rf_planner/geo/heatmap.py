@@ -13,10 +13,15 @@ import math
 from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
+from PIL import Image
 
 from ..pipeline.schemas import AttenuationGrid
 
 logger = logging.getLogger(__name__)
+
+
+def _empty(values: Any) -> bool:
+    return values is None or len(values) == 0
 
 
 def attenuation_grid_to_raster(
@@ -30,7 +35,7 @@ def attenuation_grid_to_raster(
     This is used by non-3D-OSM renderers and for debugging. It is intentionally simple,
     but the point-to-pixel assignment is vectorized for speed.
     """
-    if not grid.cell_lat or not grid.cell_lon or not grid.rsrp_dbm:
+    if _empty(grid.cell_lat) or _empty(grid.cell_lon) or _empty(grid.rsrp_dbm):
         raise ValueError("Empty attenuation grid")
 
     lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
@@ -78,6 +83,150 @@ def attenuation_grid_to_raster(
     return lats_2d, lons_2d, rsrp_filled
 
 
+class EllipseRasterizer:
+    """Reusable map-aligned raster geometry for many RF/ISAC layers.
+
+    Coordinate projection, point-to-pixel mapping, support masks, and edge
+    feathering are invariant across layers.  Preparing them once avoids
+    repeating the most expensive geometry work for every exported heatmap.
+    """
+
+    def __init__(self, grid: AttenuationGrid, size: int = 768) -> None:
+        if len(grid.cell_lat) == 0 or len(grid.cell_lon) == 0:
+            raise ValueError("Empty attenuation grid")
+        if len(grid.cell_lat) != len(grid.cell_lon):
+            raise ValueError("cell_lat and cell_lon lengths must match")
+
+        self.grid = grid
+        self.size = int(size)
+        self.radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
+        if self.radius_m <= 0.0:
+            raise ValueError("rf_params.max_range_m must be > 0 for ellipse PNG")
+
+        tx_lat = float(grid.tx.lat)
+        tx_lon = float(grid.tx.lon)
+        lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
+        lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
+        earth_m = 6_371_000.0
+        lat0 = np.deg2rad(tx_lat)
+        self.dx = np.deg2rad(lon_arr - tx_lon) * np.cos(lat0) * earth_m
+        self.dy = np.deg2rad(lat_arr - tx_lat) * earth_m
+
+        u = (self.dx + self.radius_m) / (2.0 * self.radius_m)
+        v = (self.dy + self.radius_m) / (2.0 * self.radius_m)
+        jj = np.rint(u * (self.size - 1)).astype(np.int32)
+        ii = np.rint((1.0 - v) * (self.size - 1)).astype(np.int32)
+        in_bounds = (
+            (jj >= 0)
+            & (jj < self.size)
+            & (ii >= 0)
+            & (ii < self.size)
+            & (self.dx * self.dx + self.dy * self.dy <= self.radius_m * self.radius_m)
+        )
+        self.point_indices = np.flatnonzero(in_bounds)
+        self.pixel_indices = (
+            ii[in_bounds].astype(np.int64) * self.size + jj[in_bounds].astype(np.int64)
+        )
+
+        yy, xx = np.mgrid[0 : self.size, 0 : self.size]
+        x_m = (xx / (self.size - 1) - 0.5) * (2.0 * self.radius_m)
+        y_m = ((self.size - 1 - yy) / (self.size - 1) - 0.5) * (2.0 * self.radius_m)
+        self.r_pix = np.sqrt(x_m * x_m + y_m * y_m)
+        self.circle_mask = self.r_pix <= self.radius_m
+
+        try:
+            bin_deg = float(getattr(grid.rf_params, "dtheta_deg", 1.0) or 1.0)
+        except Exception:
+            bin_deg = 1.0
+        bin_deg = max(0.25, min(5.0, bin_deg))
+        n_bins = int(max(72, round(360.0 / bin_deg)))
+        theta_s = (np.degrees(np.arctan2(self.dx, self.dy)) + 360.0) % 360.0
+        r_s = np.sqrt(self.dx * self.dx + self.dy * self.dy)
+        bi_s = np.floor(theta_s / (360.0 / n_bins)).astype(np.int32)
+        bi_s = np.clip(bi_s, 0, n_bins - 1)
+        rmax = np.zeros(n_bins, dtype=np.float32)
+        np.maximum.at(rmax, bi_s, r_s.astype(np.float32))
+
+        theta_pix = (np.degrees(np.arctan2(x_m, y_m)) + 360.0) % 360.0
+        bi_pix = np.floor(theta_pix / (360.0 / n_bins)).astype(np.int32)
+        bi_pix = np.clip(bi_pix, 0, n_bins - 1)
+        try:
+            dr_m = float(getattr(grid.rf_params, "step_m", 5.0) or 5.0)
+        except Exception:
+            dr_m = 5.0
+        self.support_mask = (
+            self.circle_mask
+            & (rmax[bi_pix] > 0.0)
+            & (self.r_pix <= rmax[bi_pix] + dr_m)
+        )
+        feather_m = max(30.0, self.radius_m * 0.03)
+        self.fade = np.clip((self.radius_m - self.r_pix) / feather_m, 0.0, 1.0)
+
+    def render(
+        self,
+        values: Any,
+        *,
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+        alpha: float = 0.70,
+    ) -> Dict[str, Any]:
+        val_arr = np.asarray(values, dtype=np.float32)
+        if val_arr.ndim != 1 or val_arr.shape[0] != len(self.grid.cell_lat):
+            raise ValueError("layer values length must match cell_lat / cell_lon")
+
+        selected = val_arr[self.point_indices]
+        finite_points = np.isfinite(selected)
+        flat_size = self.size * self.size
+        if np.any(finite_points):
+            pix = self.pixel_indices[finite_points]
+            vals = selected[finite_points].astype(np.float64, copy=False)
+            sums = np.bincount(pix, weights=vals, minlength=flat_size)
+            counts = np.bincount(pix, minlength=flat_size)
+            raster = np.full(flat_size, np.nan, dtype=np.float32)
+            occupied = counts > 0
+            raster[occupied] = (sums[occupied] / counts[occupied]).astype(np.float32)
+            raster = raster.reshape((self.size, self.size))
+        else:
+            raster = np.full((self.size, self.size), np.nan, dtype=np.float32)
+
+        raster = _fill_nans_nearest(raster, fill_mask=self.support_mask)
+        raster[~self.circle_mask] = np.nan
+        finite = np.isfinite(raster)
+        if not np.any(finite):
+            actual_min = float(vmin) if vmin is not None else -140.0
+            actual_max = float(vmax) if vmax is not None else -60.0
+            vmin_used = actual_min
+            vmax_used = actual_max
+        else:
+            actual_min = float(np.nanmin(raster))
+            actual_max = float(np.nanmax(raster))
+            vmin_used = actual_min if vmin is None else float(vmin)
+            vmax_used = actual_max if vmax is None else float(vmax)
+            if not np.isfinite(vmin_used) or not np.isfinite(vmax_used) or vmax_used <= vmin_used:
+                vmin_used, vmax_used = -140.0, -60.0
+
+        rgba = _colorize_rsrp(raster, vmin_used, vmax_used, alpha=alpha)
+        rgba[..., 3] = np.clip(
+            np.rint(rgba[..., 3].astype(np.float64) * self.fade).astype(np.int32),
+            0,
+            255,
+        ).astype(np.uint8)
+        img = Image.fromarray(rgba, mode="RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        return {
+            "png_b64": data_url,
+            "width": self.size,
+            "height": self.size,
+            "radius_m": self.radius_m,
+            "vmin": vmin_used,
+            "vmax": vmax_used,
+            "actual_min": actual_min,
+            "actual_max": actual_max,
+        }
+
+
 def attenuation_grid_to_png_ellipse(
     grid: AttenuationGrid,
     size: int = 768,
@@ -86,168 +235,17 @@ def attenuation_grid_to_png_ellipse(
     alpha: float = 0.70,
     rsrp_values: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
-    """
-    Create a pre-colored PNG (base64 data URL) for map-aligned draping.
+    """Compatibility wrapper for rendering a single ellipse layer."""
 
-    Mapping:
-      - Square in local East/North meters with edge length 2*max_range_m (texture [-R,R]²).
-      - Cesium should use a geographic rectangle with the same ENU corners as 2D Leaflet;
- a geodesic circle (ellipse) warps this texture and misaligns vs OSM.
-
-    Returns dict:
-      {
-        "png_b64": "data:image/png;base64,...",
-        "width": size,
-        "height": size,
-        "radius_m": max_range_m,
-        "vmin": vmin_used,
-        "vmax": vmax_used,
-        "actual_min": actual_min,
-        "actual_max": actual_max,
-      }
-    """
-    rsrp_src = rsrp_values if rsrp_values is not None else grid.rsrp_dbm
-    if not grid.cell_lat or not grid.cell_lon or not rsrp_src:
+    values = grid.rsrp_dbm if rsrp_values is None else rsrp_values
+    if values is None or len(values) == 0:
         raise ValueError("Empty attenuation grid")
-
-    radius_m = float(getattr(grid.rf_params, "max_range_m", 0.0) or 0.0)
-    if radius_m <= 0.0:
-        raise ValueError("rf_params.max_range_m must be > 0 for ellipse PNG")
-
-    tx_lat = float(grid.tx.lat)
-    tx_lon = float(grid.tx.lon)
-
-    lat_arr = np.asarray(grid.cell_lat, dtype=np.float64)
-    lon_arr = np.asarray(grid.cell_lon, dtype=np.float64)
-    if len(rsrp_src) != len(grid.cell_lat) or len(rsrp_src) != len(grid.cell_lon):
-        raise ValueError("rsrp_values length must match cell_lat / cell_lon")
-    val_arr = np.asarray(rsrp_src, dtype=np.float32)
-    # Propagate non-finite samples as NaF so they do not color wrong bins.
-    val_arr = np.where(np.isfinite(val_arr), val_arr, np.nan)
-
-    # Local EN (meters) via equirectangular approximation.
-    earth_m = 6371000.0
-    lat0 = np.deg2rad(tx_lat)
-    dx = np.deg2rad(lon_arr - tx_lon) * np.cos(lat0) * earth_m  # east
-    dy = np.deg2rad(lat_arr - tx_lat) * earth_m                 # north
-
-    # Map to pixel coords in [0, size-1]
-    u = (dx + radius_m) / (2.0 * radius_m)
-    v = (dy + radius_m) / (2.0 * radius_m)
-
-    jj = np.rint(u * (size - 1)).astype(np.int32)
-    ii = np.rint((1.0 - v) * (size - 1)).astype(np.int32)
-
-    inb = (
-        (jj >= 0) & (jj < size) &
-        (ii >= 0) & (ii < size) &
-        (dx * dx + dy * dy <= (radius_m * radius_m))
+    return EllipseRasterizer(grid, size=size).render(
+        values,
+        vmin=vmin,
+        vmax=vmax,
+        alpha=alpha,
     )
-
-    sums = np.zeros((size, size), dtype=np.float64)
-    cnts = np.zeros((size, size), dtype=np.int32)
-    np.add.at(sums, (ii[inb], jj[inb]), val_arr[inb].astype(np.float64))
-    np.add.at(cnts, (ii[inb], jj[inb]), 1)
-
-    rsrp = np.full((size, size), np.nan, dtype=np.float32)
-    m = cnts > 0
-    rsrp[m] = (sums[m] / cnts[m]).astype(np.float32)
-
-    # Build a "support" mask so we only fill small holes between nearby rays,
-    # and we do NOT smear values into large unsampled regions (e.g. beyond ray termination).
-    yy, xx = np.mgrid[0:size, 0:size]
-    x_m = (xx / (size - 1) - 0.5) * (2.0 * radius_m)          # east
-    y_m = ((size - 1 - yy) / (size - 1) - 0.5) * (2.0 * radius_m)  # north
-    r_pix = np.sqrt(x_m * x_m + y_m * y_m)
-    circle_mask = r_pix <= radius_m
-
-    # Estimate per-bearing reach based on which samples exist.
-    # We bin bearings at the simulation's effective dtheta (or finer) and compute r_max per bin.
-    try:
-        bin_deg = float(getattr(grid.rf_params, "dtheta_deg", 1.0) or 1.0)
-    except Exception:
-        bin_deg = 1.0
-    bin_deg = max(0.25, min(5.0, bin_deg))
-    n_bins = int(max(72, round(360.0 / bin_deg)))
-
-    theta_s = (np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0
-    r_s = np.sqrt(dx * dx + dy * dy)
-
-    bi_s = np.floor(theta_s / (360.0 / n_bins)).astype(np.int32)
-    bi_s = np.clip(bi_s, 0, n_bins - 1)
-
-    rmax = np.zeros((n_bins,), dtype=np.float32)
-    np.maximum.at(rmax, bi_s, r_s.astype(np.float32))
-
-    # Do not smooth rmax across bearings: that inflates reach in adjacent bins and fills the
-    # texture out to max_range in directions where rays actually terminated early (buildings),
-    # which makes far-field coverage ignore blockers in /3d and misalign vs 2D Leaflet.
-
-    # Per-pixel bearing bins
-    theta_pix = (np.degrees(np.arctan2(x_m, y_m)) + 360.0) % 360.0
-    bi_pix = np.floor(theta_pix / (360.0 / n_bins)).astype(np.int32)
-    bi_pix = np.clip(bi_pix, 0, n_bins - 1)
-
-    # Allow fill only where the ray reached (plus one step for softness).
-    try:
-        dr_m = float(getattr(grid.rf_params, "step_m", 5.0) or 5.0)
-    except Exception:
-        dr_m = 5.0
-
-    support_mask = circle_mask & (rmax[bi_pix] > 0.0) & (r_pix <= (rmax[bi_pix] + dr_m))
-
-    # Fill holes within support only (do not fill beyond reach).
-    rsrp = _fill_nans_nearest(rsrp, fill_mask=support_mask)
-
-    # Anything outside the circle stays transparent.
-    rsrp[~circle_mask] = np.nan
-
-    finite = np.isfinite(rsrp)
-    if not np.any(finite):
-        actual_min = float(vmin) if vmin is not None else -140.0
-        actual_max = float(vmax) if vmax is not None else -60.0
-        vmin_used = float(vmin) if vmin is not None else -140.0
-        vmax_used = float(vmax) if vmax is not None else -60.0
-    else:
-        actual_min = float(np.nanmin(rsrp))
-        actual_max = float(np.nanmax(rsrp))
-        vmin_used = float(np.nanmin(rsrp)) if vmin is None else float(vmin)
-        vmax_used = float(np.nanmax(rsrp)) if vmax is None else float(vmax)
-        if not np.isfinite(vmin_used) or not np.isfinite(vmax_used) or vmax_used <= vmin_used:
-            vmin_used, vmax_used = -140.0, -60.0
-
-    rgba = _colorize_rsrp(rsrp, vmin_used, vmax_used, alpha=alpha)
-
-    # Soften the circular boundary to avoid a visible faint circle outline.
-    # Fade alpha to 0 over the last ~3% of the radius so the edge blends into transparent.
-    feather_m = max(30.0, radius_m * 0.03)
-    fade = np.clip((radius_m - r_pix) / feather_m, 0.0, 1.0)
-    rgba[..., 3] = np.clip(
-        np.rint(rgba[..., 3].astype(np.float64) * fade).astype(np.int32), 0, 255
-    ).astype(np.uint8)
-
-    # Encode PNG
-    try:
-        from PIL import Image
-        img = Image.fromarray(rgba, mode="RGBA")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        data_url = f"data:image/png;base64,{b64}"
-    except Exception as e:
-        logger.exception("Failed to encode heatmap PNG: %s", e)
-        raise
-
-    return {
-        "png_b64": data_url,
-        "width": int(size),
-        "height": int(size),
-        "radius_m": radius_m,
-        "vmin": vmin_used,
-        "vmax": vmax_used,
-        "actual_min": actual_min,
-        "actual_max": actual_max,
-    }
 
 
 def attenuation_grid_to_png_metric(
@@ -262,7 +260,7 @@ def attenuation_grid_to_png_metric(
     Render a dense metric-grid coverage field 1:1 (step_m pixels) for map-aligned drape.
     """
     rsrp_src = rsrp_values if rsrp_values is not None else grid.rsrp_dbm
-    if not grid.cell_lat or not grid.cell_lon or not rsrp_src:
+    if _empty(grid.cell_lat) or _empty(grid.cell_lon) or _empty(rsrp_src):
         raise ValueError("Empty attenuation grid")
 
     dr = float(getattr(grid.rf_params, "step_m", 5.0) or 5.0)
