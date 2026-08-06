@@ -1,11 +1,13 @@
 """Core data models for the RF planning pipeline."""
 
+from dataclasses import dataclass, field, fields as dataclass_fields
 from enum import Enum
 from typing import List, Optional, Dict, Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from ..rf.dvt import DVTTransmitter
+from ..rf.channel_analysis import ChannelAnalysisConfig
 
 
 class LatLon(BaseModel):
@@ -66,9 +68,16 @@ class ViewTileDescription(BaseModel):
 class RFParams(BaseModel):
     """RF simulation parameters for 5G NR and DVT transmitters."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     technology: str = "5g_nr"  # 5g_nr | dvt
     waveform: Optional[str] = None  # 5g_nr | atsc1 | atsc3 | dvbt | baseline
     dvt: Optional[DVTTransmitter] = None
+    channel_analysis: Optional[ChannelAnalysisConfig] = Field(
+        default=None,
+        validation_alias=AliasChoices("channel_analysis", "passive_radar"),
+        serialization_alias="channel_analysis",
+    )
 
     freq_mhz: float
     tx_power_dbm: float
@@ -171,6 +180,22 @@ class RFParams(BaseModel):
     coverage_display_layer: str = "rsrp"  # rsrp | sinr | terrain_shadow | field_strength
     compact_output: Optional[bool] = None  # None=auto for large DVT/3D results
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_channel_analysis(cls, values: Any) -> Any:
+        """Accept the previous passive_radar object shape as an input alias only."""
+        if not isinstance(values, dict):
+            return values
+        raw = values.get("channel_analysis", values.get("passive_radar"))
+        if raw is None or isinstance(raw, ChannelAnalysisConfig):
+            return values
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump(by_alias=True)
+        normalized = dict(values)
+        normalized.pop("passive_radar", None)
+        normalized["channel_analysis"] = raw
+        return normalized
+
     @model_validator(mode="after")
     def apply_dvt_transmitter(self) -> "RFParams":
         """Project the typed DVT transmitter into the shared propagation fields."""
@@ -188,12 +213,15 @@ class RFParams(BaseModel):
         requested_waveform = str(self.waveform or self.dvt.waveform).strip().lower()
         if requested_waveform not in ("dvt", str(self.dvt.waveform)):
             raise ValueError("waveform must match dvt.waveform")
+        if self.sectors:
+            raise ValueError("DVT uses one broadcast antenna radiation pattern, not cellular sectors")
+        self.sectors = None
         self.waveform = str(self.dvt.waveform)
         self.freq_mhz = self.dvt.frequency_mhz
         self.channel_bandwidth_mhz = self.dvt.bandwidth_mhz
-        # Project the physical transmitter chain into shared fields. For ERP
-        # input these values are zero by validation; for conducted power they
-        # are applied exactly once by the DVT source-power calculation.
+        # Shared scalar fields carry the physical RF chain and site geometry.
+        # Broadcast directionality remains exclusively in dvt.antenna; it is
+        # not projected into cellular azimuth/beamwidth/sector fields.
         self.tx_power_dbm = self.dvt.power.input_power_dbm
         self.tx_chain_gain_db = self.dvt.power.tx_gain_db
         self.tx_antenna_gain_dbi = self.dvt.power.antenna_gain_dbi
@@ -201,37 +229,84 @@ class RFParams(BaseModel):
         self.reference_signal_offset_db = 0.0
         self.tx_height_m = self.dvt.tx.antenna_height
         self.site_altitude_m = self.dvt.tx.altitude
-        self.azimuth_deg = self.dvt.tx.azimuth_deg
-        self.horizontal_beamwidth_deg = self.dvt.tx.beamwidth_h_deg
-        self.vertical_beamwidth_deg = self.dvt.tx.beamwidth_v_deg
-        self.electrical_tilt_deg = self.dvt.tx.effective_down_tilt_deg
-        self.mechanical_tilt_deg = 0.0
-        self.max_horizontal_attenuation_db = self.dvt.tx.max_horizontal_attenuation_db
-        self.front_to_back_attenuation_db = self.dvt.tx.front_to_back_attenuation_db
-        self.max_vertical_attenuation_db = self.dvt.tx.max_vertical_attenuation_db
+        if self.channel_analysis is not None:
+            # Coverage cells become candidate target locations for any waveform.
+            self.rx_height_m = float(self.channel_analysis.target.height_m_agl)
         self.coverage_display_layer = (
             "field_strength" if self.coverage_display_layer == "rsrp" else self.coverage_display_layer
         )
         return self
 
+    def public_config(self) -> Dict[str, Any]:
+        """Return a technology-specific configuration payload for API/UI output."""
 
-class WorldCell(BaseModel):
-    """
-    One cell in the 2D coverage grid around TX.
-    We stay in 2.5D: no full 3D ray-tracing.
+        if str(self.technology).strip().lower() != "dvt" or self.dvt is None:
+            return self.model_dump()
+
+        return {
+            "technology": "dvt",
+            "waveform": str(self.dvt.waveform),
+            "dvt": self.dvt.model_dump(by_alias=True),
+            "channel_analysis": (
+                self.channel_analysis.model_dump(by_alias=True)
+                if self.channel_analysis is not None
+                else None
+            ),
+            "center_frequency_mhz": self.dvt.frequency_mhz,
+            "sample_rate_mhz": self.dvt.fs / 1.0e6,
+            "channel_bandwidth_mhz": self.dvt.bandwidth_mhz,
+            "source_eirp_dbm": self.dvt.power.source_eirp_dbm,
+            "noise_floor_dbm": self.noise_floor_dbm,
+            "noise_figure_db": self.noise_figure_db,
+            "receiver_antenna_gain_dbi": self.ue_antenna_gain_dbi,
+            "receiver_height_m": self.rx_height_m,
+            "termination_power_dbm": self.termination_rsrp_dbm,
+            "max_range_m": self.max_range_m,
+            "step_m": self.step_m,
+            "dtheta_deg": self.dtheta_deg,
+            "ray_mode": self.ray_mode,
+            "shadow_loss_db": self.shadow_loss_db,
+            "shadow_decay_db_per_100m": self.shadow_decay_db_per_100m,
+            "shadow_loss_cap_db": self.shadow_loss_cap_db,
+            "diffraction_base_loss_db": self.diffraction_base_loss_db,
+            "diffraction_slope_db_per_100m": self.diffraction_slope_db_per_100m,
+            "diffraction_loss_cap_db": self.diffraction_loss_cap_db,
+            "canyon_recovery_max_db": self.canyon_recovery_max_db,
+            "canyon_recovery_slope_db_per_100m": self.canyon_recovery_slope_db_per_100m,
+            "building_attenuation": self.building_attenuation,
+            "terrain_enabled": self.terrain_enabled,
+            "dem_source": self.dem_source,
+            "terrain_resolution_m": self.terrain_resolution_m,
+            "earth_curvature_k": self.earth_curvature_k,
+            "fresnel_min_clearance": self.fresnel_min_clearance,
+            "terrain_clutter_height_m": self.terrain_clutter_height_m,
+            "terrain_loss_cap_db": self.terrain_loss_cap_db,
+            "buildings_on_terrain": self.buildings_on_terrain,
+            "landcover_clutter_enabled": self.landcover_clutter_enabled,
+            "coverage_display_layer": self.coverage_display_layer,
+            "compact_output": self.compact_output,
+        }
+
+
+@dataclass(slots=True)
+class WorldCell:
+    """Compact internal propagation sample.
+
+    This object is created once per polar sample and is intentionally a slotted
+    dataclass instead of a Pydantic model.  Request validation still happens in
+    ``RFParams``; using a validation model for millions of internal samples adds
+    substantial allocation and attribute-access overhead without improving the
+    calculation.
     """
 
     lat: float
     lon: float
-    distance_m: float  # Straight-line distance from TX to cell
+    distance_m: float
     bearing_deg: float
-
-    # aggregated info along LOS from TX to cell
     dominant_material: MaterialType
-    obstacles_count: int  # e.g. number of building "faces" crossed
-    extra_loss_db: float  # precomputed extra attenuation vs free space
+    obstacles_count: int
+    extra_loss_db: float
 
-    # Sector/sample identity.
     sector_id: str = "omnidirectional"
     sector_freq_mhz: Optional[float] = None
     sector_tx_power_dbm: Optional[float] = None
@@ -244,43 +319,26 @@ class WorldCell(BaseModel):
     sector_max_horizontal_attenuation_db: Optional[float] = None
     sector_front_to_back_attenuation_db: Optional[float] = None
     sector_max_vertical_attenuation_db: Optional[float] = None
-    # When set, overrides `RFParams.tx_antenna_gain_dbi` for this sector/candidate; None = use global default.
     sector_tx_antenna_gain_dbi: Optional[float] = None
-    # NR/LTE physical cell id; None = not specified (UIs should not show a placeholder; 0 is valid when set).
     sector_pci: Optional[int] = None
 
-    # LOS / obstruction-state model.
     is_los: bool = True
     actual_path_length_m: float = 0.0
     num_buildings: int = 0
     num_trees: int = 0
-    blocking_state: str = "los"  # los | penetration | shadow
-    propagation_mode: str = "los"  # los | penetration | shadow | nlos_recovery
+    blocking_state: str = "los"
+    propagation_mode: str = "los"
     first_blocker_distance_m: Optional[float] = None
     diffraction_flag: bool = False
-
-    # Split-loss model:
-    # - penetration_loss_db applies only while the current ray segment is actually inside
-    #   a blocker or foliage interval.
-    # - shadow_loss_db represents behind-blocker attenuation after LOS has been lost.
-    # - diffraction_loss_db and canyon_recovery_db are continuation terms used once LOS
-    #   is gone, instead of stacking every prior wall forever.
     penetration_loss_db: float = 0.0
     shadow_loss_db: float = 0.0
     diffraction_loss_db: float = 0.0
     canyon_recovery_db: float = 0.0
     metal_blocked: bool = False
-    buildings_along_path: List[Dict[str, Any]] = []
-    # True when coverage_grid already evaluated all map intersections and loss states.
-    # world_builder uses this to avoid repeating OSM queries for every output cell.
+    buildings_along_path: List[Dict[str, Any]] = field(default_factory=list)
     coverage_precomputed: bool = False
-
-    # Optional precomputed RSRP for this sector candidate.
-    # Used by multipath ray tracing mode to avoid re-deriving RSRP from only
-    # "extra loss" scalars.
     precomputed_rsrp_dbm: Optional[float] = None
 
-    # Terrain-aware sample metadata
     z_ground_m: float = 0.0
     z_rx_abs_m: Optional[float] = None
     terrain_loss_db: float = 0.0
@@ -289,34 +347,59 @@ class WorldCell(BaseModel):
     terrain_state: str = "los"
 
 
+@dataclass(slots=True)
+class BroadcastWorldCell:
+    """Minimal physical-world sample used by one-transmitter broadcast paths."""
+
+    lat: float
+    lon: float
+    distance_m: float
+    bearing_deg: float
+    obstacles_count: int
+    extra_loss_db: float
+    is_los: bool = True
+    propagation_mode: str = "los"
+    penetration_loss_db: float = 0.0
+    shadow_loss_db: float = 0.0
+    diffraction_loss_db: float = 0.0
+    canyon_recovery_db: float = 0.0
+    coverage_precomputed: bool = True
+    precomputed_rsrp_dbm: Optional[float] = None
+    z_ground_m: float = 0.0
+    z_rx_abs_m: Optional[float] = None
+    terrain_loss_db: float = 0.0
+    los_terrain: bool = True
+    terrain_state: str = "los"
+
+
+
 class WorldModel(BaseModel):
     """Complete world model for RF simulation."""
 
     tx: LatLon
     rf_params: RFParams
-    cells: List[WorldCell]
+    cells: List[Any]
     z_tx_ground_m: Optional[float] = None
     z_tx_abs_m: Optional[float] = None
 
 
-class AttenuationGrid(BaseModel):
-    """
-    Final RF result. You can map this directly to a heatmap.
+@dataclass(slots=True)
+class AttenuationGrid:
+    """Array-friendly final propagation result.
 
-    `rsrp_dbm` is the best-server (max) RSRP per map point for SINR/interference math.
-    `rsrp_by_sector` (when present) repeats the same point order as `cell_lat`/`cell_lon`
-    with that sector's RSRP only—use for per-sector heatmaps (true beam shape, not max-composite).
+    Large channel-analysis layers may remain NumPy arrays until the API actually
+    needs JSON.  This avoids constructing millions of boxed Python floats merely
+    to render heatmaps or write an NPZ product.
     """
 
     tx: LatLon
     rf_params: RFParams
-    # parallel to WorldModel.cells
     cell_lat: List[float]
     cell_lon: List[float]
-    rsrp_dbm: List[float]  # Received Signal Received Power (dBm)
-    sinr_db: List[float]  # Signal-to-Interference-plus-Noise Ratio (dB)
-    modulation: List[str]  # Selected modulation scheme per cell
-    throughput_mbps: List[float]  # Estimated throughput (Mbps) per cell
+    rsrp_dbm: List[float]
+    sinr_db: List[float]
+    modulation: List[str]
+    throughput_mbps: List[float]
     serving_sector_id: List[str]
     interferer_count: List[int]
     top_interferer_rsrp_dbm: List[float]
@@ -325,10 +408,81 @@ class AttenuationGrid(BaseModel):
     technology: str = "5g_nr"
     received_power_dbm: Optional[List[float]] = None
     field_strength_dbuv_m: Optional[List[float]] = None
+    carrier_to_noise_db: Optional[List[float]] = None
+    incident_power_isotropic_dbm: Optional[List[float]] = None
+    source_eirp_at_target_dbm: Optional[List[float]] = None
+    tx_target_path_loss_db: Optional[List[float]] = None
+    tx_target_environment_excess_db: Optional[List[float]] = None
+    tx_target_penetration_loss_db: Optional[List[float]] = None
+    tx_target_shadow_loss_db: Optional[List[float]] = None
+    tx_target_diffraction_loss_db: Optional[List[float]] = None
+    tx_target_canyon_recovery_db: Optional[List[float]] = None
+    tx_target_horizontal_pattern_loss_db: Optional[List[float]] = None
+    tx_target_vertical_pattern_loss_db: Optional[List[float]] = None
+    tx_target_obstacles_count: Optional[List[int]] = None
+    tx_target_propagation_mode: Optional[List[str]] = None
+    bistatic_echo_power_dbm: Optional[List[float]] = None
+    bistatic_preprocessing_snr_db: Optional[List[float]] = None
+    bistatic_postprocessing_snr_db: Optional[List[float]] = None
+    bistatic_detection_margin_db: Optional[List[float]] = None
+    bistatic_echo_to_residual_direct_db: Optional[List[float]] = None
+    bistatic_required_dynamic_range_db: Optional[List[float]] = None
+    bistatic_tx_target_range_m: Optional[List[float]] = None
+    bistatic_target_receiver_range_m: Optional[List[float]] = None
+    bistatic_return_path_loss_db: Optional[List[float]] = None
+    bistatic_return_environment_excess_db: Optional[List[float]] = None
+    bistatic_total_path_loss_db: Optional[List[float]] = None
+    bistatic_path_range_m: Optional[List[float]] = None
+    bistatic_excess_path_range_m: Optional[List[float]] = None
+    bistatic_excess_delay_s: Optional[List[float]] = None
+    bistatic_angle_deg: Optional[List[float]] = None
+    bistatic_path_range_rate_mps: Optional[List[float]] = None
+    bistatic_closing_speed_mps: Optional[List[float]] = None
+    bistatic_doppler_hz: Optional[List[float]] = None
+    bistatic_doppler_resolved: Optional[List[bool]] = None
+    bistatic_doppler_ambiguous: Optional[List[bool]] = None
+    bistatic_detectable: Optional[List[bool]] = None
+    bistatic_isac_quality_code: Optional[List[int]] = None
+    channel_analysis_summary: Optional[Dict[str, Any]] = None
     waveform: Optional[str] = None
     terrain_loss_db: Optional[List[float]] = None
     los_terrain: Optional[List[bool]] = None
     terrain_state: Optional[List[str]] = None
     z_ground_m: Optional[List[float]] = None
 
+    def model_dump(self, *, exclude: Optional[set[str]] = None, **_: Any) -> Dict[str, Any]:
+        """Pydantic-compatible dump used by the existing REST layer.
+
+        NumPy arrays are converted only for fields that are actually included.
+        Large compact responses therefore avoid an otherwise expensive array-to-
+        Python-list conversion.
+        """
+
+        excluded = set(exclude or ())
+
+        def dump_value(value: Any) -> Any:
+            if value is None:
+                return None
+            if hasattr(value, "model_dump"):
+                return value.model_dump()
+            if isinstance(value, dict):
+                return {str(k): dump_value(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [dump_value(v) for v in value]
+            tolist = getattr(value, "tolist", None)
+            if callable(tolist):
+                return tolist()
+            item = getattr(value, "item", None)
+            if callable(item):
+                try:
+                    return item()
+                except Exception:
+                    pass
+            return value
+
+        return {
+            f.name: dump_value(getattr(self, f.name))
+            for f in dataclass_fields(self)
+            if f.name not in excluded
+        }
 
