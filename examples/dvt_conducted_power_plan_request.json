@@ -12,15 +12,17 @@
       "longitude": -122.4194,
       "altitude": 18.0,
       "antennaHeight": 320.0,
-      "name": "Example DVT TX",
-      "azimuthDeg": 90.0,
-      "elevationDeg": -1.0,
-      "beamwidthHDeg": 65.0,
-      "beamwidthVDeg": 8.0,
-      "electricalTiltDeg": 0.0,
-      "mechanicalTiltDeg": 0.0,
+      "name": "Example DVT TX"
+    },
+    "antenna": {
+      "patternType": "parametric",
+      "mainAzimuthDeg": 90.0,
+      "horizontalBeamwidthDeg": 65.0,
       "maxHorizontalAttenuationDb": 30.0,
       "frontToBackAttenuationDb": 30.0,
+      "rotationDeg": 0.0,
+      "beamTiltDeg": 1.0,
+      "verticalBeamwidthDeg": 8.0,
       "maxVerticalAttenuationDb": 30.0
     },
     "power": {
@@ -46,6 +48,7 @@
   },
   "max_range_m": 20000,
   "step_m": 20,
+  "dtheta_deg": 0.25,
   "coverage_display_layer": "field_strength",
   "compact_output": true
 }

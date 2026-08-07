@@ -1,0 +1,68 @@
+{
+  "technology": "dvt",
+  "waveform": "atsc1",
+  "dvt": {
+    "fc": 587000000.0,
+    "fs": 10000000.0,
+    "bandwidth": 6000000.0,
+    "waveform": "atsc1",
+    "tx": {
+      "latitude": 38.271667,
+      "longitude": -121.506111,
+      "altitude": 5.0,
+      "antennaHeight": 320.0,
+      "name": "Broadcast TX"
+    },
+    "power": {
+      "erpHKw": 1000.0,
+      "erpVKw": 250.0,
+      "polarization": "DA (E)"
+    },
+    "antenna": {
+      "patternType": "omnidirectional",
+      "rotationDeg": 0.0,
+      "beamTiltDeg": 1.5,
+      "verticalBeamwidthDeg": 8.0,
+      "maxVerticalAttenuationDb": 30.0
+    }
+  },
+  "max_range_m": 20000.0,
+  "step_m": 20.0,
+  "dtheta_deg": 0.25,
+  "termination_power_dbm": -140.0,
+  "coverage_display_layer": "bistatic_margin",
+  "channel_analysis": {
+    "receiver": {
+      "latitude": 38.40,
+      "longitude": -121.50,
+      "altitudeMamsl": 10.0,
+      "antennaHeightMagl": 15.0,
+      "directAntennaGainDbi": 8.0,
+      "echoAntennaGainDbi": 12.0,
+      "feederLossDb": 1.0,
+      "noiseFigureDb": 5.0,
+      "directPathExcessLossDb": 0.0,
+      "returnPathExcessLossDb": 0.0
+    },
+    "target": {
+      "heightMagl": 1000.0,
+      "bistaticRcsM2": 10.0
+    },
+    "motion": {
+      "speedMps": 120.0,
+      "headingDegTrue": 45.0,
+      "climbRateMps": 0.0
+    },
+    "processing": {
+      "coherentIntegrationS": 1.0,
+      "processingLossDb": 3.0,
+      "systemLossDb": 3.0,
+      "requiredSnrDb": 10.0,
+      "directPathCancellationDb": 60.0,
+      "pulseRepetitionFrequencyHz": 1000.0,
+      "clutterNotchHz": 2.0,
+      "minimumDetectableDopplerHz": 1.0
+    },
+    "returnPathModel": "free_space_plus_excess"
+  }
+}

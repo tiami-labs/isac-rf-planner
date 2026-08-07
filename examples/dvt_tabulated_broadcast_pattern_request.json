@@ -1,0 +1,60 @@
+{
+  "technology": "dvt",
+  "waveform": "atsc3",
+  "ray_mode": "2d",
+  "dvt": {
+    "fc": 587000000,
+    "fs": 10000000,
+    "bandwidth": 6000000,
+    "waveform": "atsc3",
+    "tx": {
+      "latitude": 38.271667,
+      "longitude": -121.506111,
+      "altitude": 5.0,
+      "antennaHeight": 320.0,
+      "name": "Example Directional Broadcast TX"
+    },
+    "antenna": {
+      "patternType": "tabulated",
+      "manufacturer": "Example manufacturer",
+      "model": "Example filed antenna",
+      "rotationDeg": 345.0,
+      "beamTiltDeg": 1.5,
+      "verticalBeamwidthDeg": 8.0,
+      "maxVerticalAttenuationDb": 30.0,
+      "azimuthPattern": [
+        {"azimuthDeg": 0.0, "relativeFieldH": 1.0, "relativeFieldV": 0.5},
+        {"azimuthDeg": 45.0, "relativeFieldH": 0.9, "relativeFieldV": 0.45},
+        {"azimuthDeg": 90.0, "relativeFieldH": 0.8, "relativeFieldV": 0.4},
+        {"azimuthDeg": 135.0, "relativeFieldH": 0.95, "relativeFieldV": 0.48},
+        {"azimuthDeg": 180.0, "relativeFieldH": 0.25, "relativeFieldV": 0.15},
+        {"azimuthDeg": 225.0, "relativeFieldH": 0.1, "relativeFieldV": 0.08},
+        {"azimuthDeg": 270.0, "relativeFieldH": 0.12, "relativeFieldV": 0.1},
+        {"azimuthDeg": 315.0, "relativeFieldH": 0.6, "relativeFieldV": 0.3}
+      ]
+    },
+    "power": {
+      "erpHKw": 1000.0,
+      "erpVKw": 250.0,
+      "polarization": "DA (E)"
+    },
+    "station": {
+      "callSign": "KEXAMPLE",
+      "virtualChannel": "40.1",
+      "rfChannel": 22,
+      "physicalChannel": 22,
+      "facilityId": 99999,
+      "city": "Example City",
+      "network": "Example Network",
+      "standard": "ATSC 3.0",
+      "band": "UHF",
+      "source": "example",
+      "sourceUrl": "https://example.invalid/station/99999"
+    }
+  },
+  "max_range_m": 20000,
+  "step_m": 20,
+  "dtheta_deg": 0.25,
+  "coverage_display_layer": "field_strength",
+  "compact_output": true
+}
