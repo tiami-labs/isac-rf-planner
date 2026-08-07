@@ -21,6 +21,145 @@
    * Used only when the plan payload is missing a field. Global link defaults are not per-sector; see
    * `sector_export_rows` and `out.sectors` when carriers differ.
    */
+  const HEATMAP_EXPORTS = {
+    heatmap: "primary_coverage",
+    heatmap_terrain: "terrain_shadow_loss",
+    heatmap_sinr: "sinr",
+    heatmap_carrier_to_noise: "carrier_to_noise",
+    heatmap_received_power: "received_power",
+    heatmap_incident_power: "incident_power_at_target",
+    heatmap_bistatic_echo: "bistatic_echo_power",
+    heatmap_bistatic_snr: "bistatic_postprocessing_snr",
+    heatmap_bistatic_margin: "bistatic_detection_margin",
+    heatmap_bistatic_doppler: "bistatic_doppler",
+    heatmap_bistatic_excess_delay: "bistatic_excess_delay",
+    heatmap_bistatic_path_range: "bistatic_total_path_range",
+    heatmap_bistatic_angle: "bistatic_angle",
+    heatmap_bistatic_detectable: "bistatic_detectability",
+    heatmap_bistatic_return_path_loss: "target_to_receiver_path_loss",
+    heatmap_bistatic_total_path_loss: "total_bistatic_path_loss",
+    heatmap_isac_quality: "isac_target_quality",
+  };
+
+  function sanitizeFilename(value) {
+    return String(value || "item").replace(/[^a-zA-Z0-9_.-]/g, "_");
+  }
+
+  function jsonWithoutEmbeddedImages(value) {
+    const seen = new WeakSet();
+    return JSON.parse(JSON.stringify(value, (key, item) => {
+      if (key === "png_b64" && typeof item === "string") {
+        return `[embedded image omitted from JSON; exported as PNG, ${item.length} characters]`;
+      }
+      if (item && typeof item === "object") {
+        if (seen.has(item)) return "[circular reference omitted]";
+        seen.add(item);
+      }
+      return item;
+    }));
+  }
+
+  function heatmapManifest(out, planIndex) {
+    const rows = [];
+    for (const [key, stem] of Object.entries(HEATMAP_EXPORTS)) {
+      const hm = out && out[key];
+      if (!hm || !hm.png_b64) continue;
+      rows.push({
+        response_key: key,
+        layer: hm.layer || stem,
+        units: hm.units || null,
+        file: `heatmaps/TX${planIndex}/${stem}.png`,
+        width: hm.width ?? null,
+        height: hm.height ?? null,
+        radius_m: hm.radius_m ?? null,
+        scale_min: hm.vmin ?? null,
+        scale_max: hm.vmax ?? null,
+        actual_min: hm.actual_min ?? null,
+        actual_max: hm.actual_max ?? null,
+      });
+    }
+    return rows;
+  }
+
+  async function collectPlanExportArtifacts(planResults) {
+    const files = {};
+    const plans = [];
+    for (let index = 0; index < (planResults || []).length; index++) {
+      const pr = planResults[index] || {};
+      const out = pr.out || pr.data || {};
+      const planIndex = index + 1;
+      const planDir = `plans/TX${planIndex}`;
+      const heatmaps = heatmapManifest(out, planIndex);
+      for (const row of heatmaps) {
+        const hm = out[row.response_key];
+        const blob = base64DataUrlToBlob(hm && hm.png_b64);
+        if (blob) files[row.file] = blob;
+      }
+
+      const perSector = out.heatmap_by_sector;
+      const sectorFiles = [];
+      if (perSector && typeof perSector === "object") {
+        for (const [sectorId, hm] of Object.entries(perSector)) {
+          if (!hm || !hm.png_b64) continue;
+          const name = `heatmaps/TX${planIndex}/sectors/${sanitizeFilename(sectorId)}.png`;
+          const blob = base64DataUrlToBlob(hm.png_b64);
+          if (blob) {
+            files[name] = blob;
+            sectorFiles.push({ sector_id: String(sectorId), file: name, layer: hm.layer || "rsrp", units: hm.units || "dBm" });
+          }
+        }
+      }
+
+      const product = out.channel_analysis_product || out.channel_analysis?.data_product || null;
+      let productFile = null;
+      let productError = null;
+      if (out.channel_analysis && (!product || !product.download_url)) {
+        throw new Error(`TX${planIndex} has channel analysis but no machine-readable product URL; export stopped rather than producing a partial archive.`);
+      }
+      if (product && product.download_url) {
+        try {
+          const response = await fetch(product.download_url);
+          if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+          productFile = `channel/TX${planIndex}_complete_rf_channel_grid.npz`;
+          files[productFile] = await response.blob();
+        } catch (error) {
+          productError = String(error && error.message ? error.message : error);
+          throw new Error(`TX${planIndex} machine-readable channel product could not be included: ${productError}`);
+        }
+      }
+
+      const planJsonFile = `${planDir}/complete_plan_response.json`;
+      files[planJsonFile] = new Blob([JSON.stringify(jsonWithoutEmbeddedImages(out), null, 2)], { type: "application/json" });
+      const settingsFile = `${planDir}/complete_settings.json`;
+      files[settingsFile] = new Blob([JSON.stringify({
+        requested_tx: { latitude: pr.lat ?? null, longitude: pr.lon ?? null },
+        rf_config_used: out.rf_config_used || out.grid?.rf_params || null,
+        channel_analysis: out.channel_analysis || null,
+        geometry_source: out.geometry_source || null,
+      }, null, 2)], { type: "application/json" });
+
+      plans.push({
+        plan_index: planIndex,
+        response_file: planJsonFile,
+        settings_file: settingsFile,
+        heatmaps,
+        sector_heatmaps: sectorFiles,
+        machine_grid_file: productFile,
+        machine_grid_download_error: productError,
+        machine_grid_descriptor: product,
+      });
+    }
+    const manifest = {
+      schema: "rf_planner_complete_ui_export",
+      schema_version: "2.0",
+      export_scope: "all settings, every available heatmap layer, full plan responses, and machine-readable per-target RF/channel arrays",
+      generated_at_iso: new Date().toISOString(),
+      plans,
+    };
+    files["export_manifest.json"] = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" });
+    return { files, manifest };
+  }
+
   const RF_PARAMS_EXPORT_DEFAULTS = {
     noise_figure_db: 7.0,
     subcarrier_spacing_khz: 15.0,
@@ -195,7 +334,15 @@
         building_area_sqm: out.building_area_sqm ?? null,
         clutter_type: out.clutter_type ?? null,
         ray_mode: out.ray_mode ?? "2d",
+        technology: String(r.technology || out.grid?.technology || "5g_nr"),
+        waveform: String(out.grid?.waveform || r.dvt?.waveform || (r.technology === "dvt" ? "baseline" : "5g_nr")),
         sectors: out.sectors || [],
+        broadcast_antenna: out.broadcast_antenna || r.dvt?.antenna || null,
+        complete_settings: fromServer || fromGrid || null,
+        channel_analysis: out.channel_analysis || grid.channel_analysis_summary || null,
+        channel_analysis_product: out.channel_analysis_product || out.channel_analysis?.data_product || null,
+        geometry_source: out.geometry_source || null,
+        available_heatmaps: heatmapManifest(out, idx + 1),
         tx_phy_params: advancedRf,
         nr_params: {
           subcarrier_spacing_khz: advancedRf.subcarrier_spacing_khz,
@@ -212,6 +359,9 @@
     const vmax = firstPlan?.heatmap_scale?.vmax ?? -60;
 
     return {
+      schema: "rf_planner_ui_export_metadata",
+      schema_version: "2.0",
+      export_scope: "all settings, all available heatmap layers, full plan response JSON, and machine-readable channel products",
       export_timestamp_iso: new Date().toISOString(),
       planner_version: plannerVersion,
       view_state: viewState,
@@ -277,6 +427,7 @@
   global.RFExportUtils = {
     base64DataUrlToBlob,
     buildExportMetadata,
+    collectPlanExportArtifacts,
     createExportZip,
   };
 })(typeof window !== "undefined" ? window : this);

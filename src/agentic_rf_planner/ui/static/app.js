@@ -57,6 +57,7 @@ L.tileLayer.bingAerial().addTo(map);
 
 let currentLayerGroup = L.layerGroup().addTo(map);
 let sectorLayerGroup = L.layerGroup().addTo(map); // Separate layer for sectors (can be toggled)
+let channelInspectorLayerGroup = L.layerGroup().addTo(map);
 let heatmapLayerGroups = []; // Array to store multiple heatmap layer groups (one per RF plan)
 let planResults = []; // Successful RF plan results for export (lat, lon, data)
 
@@ -504,8 +505,12 @@ function applyServerPlanTo2dView(data, { requestLat, requestLng, statusMessage }
   if (statusMessage) {
     setStatus(statusMessage);
   } else {
+    const totalSeconds = Number(data?.pipeline_metrics?.stage_seconds?.total_to_response);
+    const timingText = Number.isFinite(totalSeconds)
+      ? ` Total pipeline: ${totalSeconds.toFixed(1)} s.`
+      : "";
     setStatus(
-      "RF plan computed. Click another point or enter coordinates to re-run. (Results saved - will persist after refresh)"
+      `RF plan computed.${timingText} Click another point or enter coordinates to re-run. (Results saved - will persist after refresh)`
     );
   }
 }
@@ -828,6 +833,7 @@ async function clearMap() {
   // Remove and recreate the layer groups to ensure everything is cleared
   map.removeLayer(currentLayerGroup);
   map.removeLayer(sectorLayerGroup);
+  map.removeLayer(channelInspectorLayerGroup);
   
   // Remove all heatmap layer groups
   heatmapLayerGroups.forEach(layerGroup => {
@@ -838,6 +844,7 @@ async function clearMap() {
   planResults = [];
   currentLayerGroup = L.layerGroup().addTo(map);
   sectorLayerGroup = L.layerGroup().addTo(map);
+  channelInspectorLayerGroup = L.layerGroup().addTo(map);
   window.txMarker = null; // Reset TX marker reference
   window.currentHeatmapLayerGroup = null; // Reset current heatmap layer group
   currentTxLocation = null; // Reset TX location
@@ -942,12 +949,17 @@ async function exportCurrentView() {
       }
     }
 
+    const artifacts = window.RFExportUtils?.collectPlanExportArtifacts
+      ? await window.RFExportUtils.collectPlanExportArtifacts(planResults)
+      : { files: {}, manifest: null };
+    if (artifacts.manifest) metadata.complete_export_manifest = artifacts.manifest;
+
     const ts = new Date();
     const filename = `rf_planner_export_${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, "0")}-${String(ts.getDate()).padStart(2, "0")}_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}.zip`;
 
     if (window.RFExportUtils && typeof JSZip !== "undefined") {
-      await window.RFExportUtils.createExportZip(fullViewBlob, heatmapBlobs, metadata, filename);
-      setStatus("Exported ZIP with full view and metadata.");
+      await window.RFExportUtils.createExportZip(fullViewBlob, heatmapBlobs, metadata, filename, artifacts.files);
+      setStatus("Exported ZIP with every heatmap, all settings, full plan JSON, and complete machine-readable RF/channel grids.");
     } else {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(fullViewBlob);
@@ -1826,11 +1838,144 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 });
 
+function channelProductInfo(result) {
+  const channel = result?.channel_analysis;
+  return result?.channel_analysis_product || channel?.data_product || null;
+}
+
+function channelInspectorEnabled() {
+  return !!document.getElementById("channel-analysis-enabled")?.checked &&
+    document.getElementById("channel-target-inspector-enabled")?.checked !== false;
+}
+
+function localMeters(lat, lon, originLat, originLon) {
+  const R = 6371000;
+  const rad = Math.PI / 180;
+  return {
+    x: (lon - originLon) * rad * R * Math.cos(originLat * rad),
+    y: (lat - originLat) * rad * R,
+  };
+}
+
+function localLatLon(x, y, originLat, originLon) {
+  const R = 6371000;
+  const rad = Math.PI / 180;
+  return {
+    lat: originLat + (y / R) / rad,
+    lon: originLon + (x / (R * Math.cos(originLat * rad))) / rad,
+  };
+}
+
+function bistaticEllipseCoordinates(tx, rx, totalPathM) {
+  const originLat = (Number(tx.latitude) + Number(rx.latitude)) / 2;
+  const originLon = (Number(tx.longitude) + Number(rx.longitude)) / 2;
+  const p1 = localMeters(Number(tx.latitude), Number(tx.longitude), originLat, originLon);
+  const p2 = localMeters(Number(rx.latitude), Number(rx.longitude), originLat, originLon);
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const focusDistance = Math.hypot(dx, dy);
+  const a = Number(totalPathM) / 2;
+  const c = focusDistance / 2;
+  if (!Number.isFinite(a) || a <= c || a <= 0) return [];
+  const b = Math.sqrt(Math.max(a * a - c * c, 0));
+  const centerX = (p1.x + p2.x) / 2;
+  const centerY = (p1.y + p2.y) / 2;
+  const angle = Math.atan2(dy, dx);
+  const ca = Math.cos(angle);
+  const sa = Math.sin(angle);
+  const points = [];
+  for (let i = 0; i <= 180; i++) {
+    const t = (i / 180) * Math.PI * 2;
+    const ex = a * Math.cos(t);
+    const ey = b * Math.sin(t);
+    const x = centerX + ex * ca - ey * sa;
+    const y = centerY + ex * sa + ey * ca;
+    const ll = localLatLon(x, y, originLat, originLon);
+    points.push([ll.lat, ll.lon]);
+  }
+  return points;
+}
+
+function numberOrDash(value, digits = 1) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : "—";
+}
+
+function renderChannelTargetInspector(payload) {
+  const target = payload?.target || {};
+  const tx = payload?.transmitter || {};
+  const rx = payload?.receiver || {};
+  const m = payload?.metrics || {};
+  channelInspectorLayerGroup.clearLayers();
+
+  const txPoint = [Number(tx.latitude), Number(tx.longitude)];
+  const rxPoint = [Number(rx.latitude), Number(rx.longitude)];
+  const targetPoint = [Number(target.latitude), Number(target.longitude)];
+  if (txPoint.every(Number.isFinite) && rxPoint.every(Number.isFinite) && targetPoint.every(Number.isFinite)) {
+    L.polyline([txPoint, targetPoint], { color: "#ff9800", weight: 3, opacity: 0.95 })
+      .addTo(channelInspectorLayerGroup).bindTooltip("TX → target");
+    L.polyline([targetPoint, rxPoint], { color: "#00bcd4", weight: 3, opacity: 0.95 })
+      .addTo(channelInspectorLayerGroup).bindTooltip("target → RX");
+    L.circleMarker(targetPoint, { radius: 7, color: "#fff", weight: 2, fillColor: "#e91e63", fillOpacity: 1 })
+      .addTo(channelInspectorLayerGroup).bindPopup("Candidate target").openPopup();
+    L.circleMarker(rxPoint, { radius: 6, color: "#fff", weight: 2, fillColor: "#00bcd4", fillOpacity: 1 })
+      .addTo(channelInspectorLayerGroup).bindTooltip("Analysis RX");
+    const ellipse = bistaticEllipseCoordinates(tx, rx, m.bistatic_path_range_m);
+    if (ellipse.length) {
+      L.polyline(ellipse, { color: "#ffffff", weight: 2, opacity: 0.85, dashArray: "7 5" })
+        .addTo(channelInspectorLayerGroup).bindTooltip("Iso-bistatic-range ellipse through selected target");
+    }
+  }
+
+  const panel = document.getElementById("channel-target-inspector");
+  if (panel) {
+    panel.style.display = "block";
+    panel.innerHTML = `
+      <div style="font-weight:600;margin-bottom:5px;">Selected target ${numberOrDash(target.latitude, 6)}, ${numberOrDash(target.longitude, 6)}</div>
+      <div>ISAC quality: <strong>${target.isac_quality_label || "—"}</strong> (class ${m.isac_quality_code ?? "—"})</div>
+      <div>TX→target loss: <strong>${numberOrDash(m.tx_target_path_loss_db)} dB</strong></div>
+      <div>TX→target environment: excess=${numberOrDash(m.tx_target_environment_excess_db)} dB; penetration=${numberOrDash(m.tx_target_penetration_loss_db)}; shadow=${numberOrDash(m.tx_target_shadow_loss_db)}; diffraction=${numberOrDash(m.tx_target_diffraction_loss_db)}; terrain=${numberOrDash(m.terrain_loss_db)}; canyon recovery=${numberOrDash(m.tx_target_canyon_recovery_db)} dB</div>
+      <div>TX pattern losses: horizontal=${numberOrDash(m.tx_target_horizontal_pattern_loss_db)} dB; vertical=${numberOrDash(m.tx_target_vertical_pattern_loss_db)} dB; obstacles=${m.tx_target_obstacles_count ?? "—"}; mode=${m.tx_target_propagation_mode || "—"}</div>
+      <div>Target→RX loss: <strong>${numberOrDash(m.return_path_loss_db)} dB</strong> (${numberOrDash(m.return_environment_excess_db)} dB environment excess)</div>
+      <div>Total bistatic loss: <strong>${numberOrDash(m.total_bistatic_path_loss_db)} dB</strong></div>
+      <div>Incident power: <strong>${numberOrDash(m.incident_isotropic_power_dbm)} dBm</strong></div>
+      <div>Expected echo: <strong>${numberOrDash(m.echo_power_dbm)} dBm</strong></div>
+      <div>Post-processing SNR / margin: <strong>${numberOrDash(m.postprocessing_snr_db)} / ${numberOrDash(m.detection_margin_db)} dB</strong></div>
+      <div>Doppler: <strong>${numberOrDash(m.doppler_hz)} Hz</strong>; resolved=${m.doppler_resolved ? "yes" : "no"}; ambiguous=${m.doppler_ambiguous ? "yes" : "no"}</div>
+      <div>Bistatic path: <strong>${numberOrDash(Number(m.bistatic_path_range_m) / 1000, 3)} km</strong>; excess delay=${numberOrDash(Number(m.excess_delay_s) * 1e6, 3)} µs; angle=${numberOrDash(m.bistatic_angle_deg)}°</div>
+      <div>Detectable under configured thresholds: <strong>${m.detectable ? "yes" : "no"}</strong></div>
+    `;
+  }
+}
+
+async function inspectChannelTarget(lat, lon) {
+  if (!channelInspectorEnabled()) return false;
+  const result = window._lastPlanResult;
+  const product = channelProductInfo(result);
+  if (!product?.product_id && !product?.download_url) return false;
+  const productId = product.product_id || String(product.download_url).split("/").filter(Boolean).pop();
+  if (!productId) return false;
+  setStatus(`Inspecting candidate target at ${lat.toFixed(6)}, ${lon.toFixed(6)}...`);
+  const response = await fetch(`/api/channel-analysis/products/${encodeURIComponent(productId)}/nearest?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`);
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  renderChannelTargetInspector(payload);
+  setStatus(`Target inspected: quality=${payload.target?.isac_quality_label || "unknown"}, echo=${numberOrDash(payload.metrics?.echo_power_dbm)} dBm, margin=${numberOrDash(payload.metrics?.detection_margin_db)} dB.`);
+  return true;
+}
+
 // Map click handler - handle polygon drawing or TX point setting
 // NOTE: Map clicks NO LONGER trigger RF planning automatically
 // User must explicitly click "Plan RF" button
-map.on("click", (e) => {
+map.on("click", async (e) => {
   const { lat, lng } = e.latlng;
+  try {
+    if (await inspectChannelTarget(lat, lng)) return;
+  } catch (error) {
+    console.error("Channel target inspection failed:", error);
+    setStatus(`Target inspection failed: ${error}`);
+    return;
+  }
   
   // Check if we're in polygon drawing mode
   if (polygonDrawingMode) {
@@ -1911,10 +2056,10 @@ function renderHeatmap(result) {
   const grid = (result && result.grid) || {};
   const lats = grid.cell_lat;
   const lons = grid.cell_lon;
-  const rsrp = grid.rsrp_dbm;
+  const rsrp = grid.rsrp_dbm || grid.received_power_dbm || grid.field_strength_dbuv_m;
   let layer = (window.RFTerrainParams && RFTerrainParams.getCoverageDisplayLayer()) || "rsrp";
   const h = result.heatmap;
-  if (h && h.layer === "field_strength_dbuv_m") {
+  if (h && h.layer === "field_strength_dbuv_m" && (layer === "rsrp" || !layer)) {
     layer = "field_strength";
     const layerEl = document.getElementById("coverage-display-layer");
     if (layerEl) layerEl.value = "field_strength";
@@ -1931,13 +2076,55 @@ function renderHeatmap(result) {
     hasCells &&
     (layer === "rsrp" ||
       (layer === "sinr" && Array.isArray(grid.sinr_db)) ||
+      (layer === "carrier_to_noise" && (Array.isArray(grid.carrier_to_noise_db) || Array.isArray(grid.sinr_db))) ||
       (layer === "terrain_shadow" && (Array.isArray(grid.terrain_loss_db) || Array.isArray(grid.los_terrain))) ||
-      (layer === "field_strength" && Array.isArray(grid.field_strength_dbuv_m)));
+      (layer === "field_strength" && Array.isArray(grid.field_strength_dbuv_m)) ||
+      (layer === "received_power" && Array.isArray(grid.received_power_dbm)) ||
+      (layer === "incident_power" && Array.isArray(grid.incident_power_isotropic_dbm)) ||
+      (layer === "bistatic_echo" && Array.isArray(grid.bistatic_echo_power_dbm)) ||
+      (layer === "bistatic_return_loss" && Array.isArray(grid.bistatic_return_path_loss_db)) ||
+      (layer === "bistatic_total_loss" && Array.isArray(grid.bistatic_total_path_loss_db)) ||
+      (layer === "isac_quality" && Array.isArray(grid.bistatic_isac_quality_code)) ||
+      (layer === "bistatic_snr" && Array.isArray(grid.bistatic_postprocessing_snr_db)) ||
+      (layer === "bistatic_margin" && Array.isArray(grid.bistatic_detection_margin_db)) ||
+      (layer === "bistatic_doppler" && Array.isArray(grid.bistatic_doppler_hz)) ||
+      (layer === "bistatic_range" && Array.isArray(grid.bistatic_path_range_m)) ||
+      (layer === "bistatic_delay" && Array.isArray(grid.bistatic_excess_delay_s)) ||
+      (layer === "bistatic_angle" && Array.isArray(grid.bistatic_angle_deg)) ||
+      (layer === "bistatic_detectable" && Array.isArray(grid.bistatic_detectable)));
   let layerHeatmap = h;
-  if (layer === "terrain_shadow" && result.heatmap_terrain && result.heatmap_terrain.png_b64) {
+  if (layer === "terrain_shadow" && result.heatmap_terrain?.png_b64) {
     layerHeatmap = result.heatmap_terrain;
-  } else if (layer === "sinr" && result.heatmap_sinr && result.heatmap_sinr.png_b64) {
+  } else if (layer === "sinr" && result.heatmap_sinr?.png_b64) {
     layerHeatmap = result.heatmap_sinr;
+  } else if (layer === "carrier_to_noise" && result.heatmap_carrier_to_noise?.png_b64) {
+    layerHeatmap = result.heatmap_carrier_to_noise;
+  } else if (layer === "received_power" && result.heatmap_received_power?.png_b64) {
+    layerHeatmap = result.heatmap_received_power;
+  } else if (layer === "incident_power" && result.heatmap_incident_power?.png_b64) {
+    layerHeatmap = result.heatmap_incident_power;
+  } else if (layer === "bistatic_echo" && result.heatmap_bistatic_echo?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_echo;
+  } else if (layer === "bistatic_return_loss" && result.heatmap_bistatic_return_path_loss?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_return_path_loss;
+  } else if (layer === "bistatic_total_loss" && result.heatmap_bistatic_total_path_loss?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_total_path_loss;
+  } else if (layer === "isac_quality" && result.heatmap_isac_quality?.png_b64) {
+    layerHeatmap = result.heatmap_isac_quality;
+  } else if (layer === "bistatic_snr" && result.heatmap_bistatic_snr?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_snr;
+  } else if (layer === "bistatic_margin" && result.heatmap_bistatic_margin?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_margin;
+  } else if (layer === "bistatic_doppler" && result.heatmap_bistatic_doppler?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_doppler;
+  } else if (layer === "bistatic_range" && result.heatmap_bistatic_path_range?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_path_range;
+  } else if (layer === "bistatic_delay" && result.heatmap_bistatic_excess_delay?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_excess_delay;
+  } else if (layer === "bistatic_angle" && result.heatmap_bistatic_angle?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_angle;
+  } else if (layer === "bistatic_detectable" && result.heatmap_bistatic_detectable?.png_b64) {
+    layerHeatmap = result.heatmap_bistatic_detectable;
   }
   const layerPngSrc = layerHeatmap && layerHeatmap.png_b64 ? layerHeatmap.png_b64 : null;
   if (layerHeatmap && Number.isFinite(layerHeatmap.radius_m)) {
@@ -1978,9 +2165,45 @@ function renderHeatmap(result) {
     } else if (layer === "field_strength") {
       actualMin = 20;
       actualMax = 120;
-    } else if (layer === "sinr") {
+    } else if (layer === "sinr" || layer === "carrier_to_noise") {
       actualMin = -5;
       actualMax = 30;
+    } else if (layer === "received_power" || layer === "incident_power") {
+      actualMin = -140;
+      actualMax = -20;
+    } else if (layer === "bistatic_echo") {
+      actualMin = -200;
+      actualMax = -80;
+    } else if (layer === "bistatic_return_loss") {
+      actualMin = 60;
+      actualMax = 180;
+    } else if (layer === "bistatic_total_loss") {
+      actualMin = 120;
+      actualMax = 300;
+    } else if (layer === "isac_quality") {
+      actualMin = 0;
+      actualMax = 5;
+    } else if (layer === "bistatic_snr") {
+      actualMin = -40;
+      actualMax = 30;
+    } else if (layer === "bistatic_margin") {
+      actualMin = -40;
+      actualMax = 20;
+    } else if (layer === "bistatic_doppler") {
+      actualMin = -500;
+      actualMax = 500;
+    } else if (layer === "bistatic_range") {
+      actualMin = 0;
+      actualMax = 50;
+    } else if (layer === "bistatic_delay") {
+      actualMin = 0;
+      actualMax = 100;
+    } else if (layer === "bistatic_angle") {
+      actualMin = 0;
+      actualMax = 180;
+    } else if (layer === "bistatic_detectable") {
+      actualMin = 0;
+      actualMax = 1;
     } else {
       actualMin = FIXED_RSRP_MIN;
       actualMax = FIXED_RSRP_MAX;
@@ -1991,8 +2214,33 @@ function renderHeatmap(result) {
     updateRSRPLegend(0, 40, actualMin, actualMax);
   } else if (layer === "field_strength") {
     updateRSRPLegend(20, 120, actualMin, actualMax);
-  } else if (layer === "sinr") {
+  } else if (layer === "sinr" || layer === "carrier_to_noise") {
     updateRSRPLegend(-5, 30, actualMin, actualMax);
+  } else if (layer === "received_power" || layer === "incident_power") {
+    updateRSRPLegend(-140, -20, actualMin, actualMax);
+  } else if (layer === "bistatic_echo") {
+    updateRSRPLegend(-200, -80, actualMin, actualMax);
+  } else if (layer === "bistatic_return_loss") {
+    updateRSRPLegend(Math.min(actualMin, actualMax), Math.max(actualMax, actualMin + 0.001), actualMin, actualMax);
+  } else if (layer === "bistatic_total_loss") {
+    updateRSRPLegend(Math.min(actualMin, actualMax), Math.max(actualMax, actualMin + 0.001), actualMin, actualMax);
+  } else if (layer === "isac_quality") {
+    updateRSRPLegend(0, 5, actualMin, actualMax);
+  } else if (layer === "bistatic_snr") {
+    updateRSRPLegend(-40, 30, actualMin, actualMax);
+  } else if (layer === "bistatic_margin") {
+    updateRSRPLegend(-40, 20, actualMin, actualMax);
+  } else if (layer === "bistatic_doppler") {
+    const limit = Math.max(Math.abs(actualMin), Math.abs(actualMax), 1);
+    updateRSRPLegend(-limit, limit, actualMin, actualMax);
+  } else if (layer === "bistatic_range") {
+    updateRSRPLegend(Math.min(actualMin, actualMax), Math.max(actualMax, actualMin + 0.001), actualMin, actualMax);
+  } else if (layer === "bistatic_delay") {
+    updateRSRPLegend(0, Math.max(actualMax, 1), actualMin, actualMax);
+  } else if (layer === "bistatic_angle") {
+    updateRSRPLegend(0, 180, actualMin, actualMax);
+  } else if (layer === "bistatic_detectable") {
+    updateRSRPLegend(0, 1, actualMin, actualMax);
   } else {
     updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, actualMin, actualMax);
   }
@@ -2286,7 +2534,12 @@ function updateRSRPLegend(scaleMinRSRP, scaleMaxRSRP, actualMinRSRP, actualMaxRS
     ? RFTerrainParams.getCoverageDisplayLayer()
     : "rsrp";
   const legendUnit = selectedLayer === "field_strength" ? "dBµV/m"
-    : selectedLayer === "rsrp" ? "dBm"
+    : ["rsrp", "received_power", "incident_power", "bistatic_echo"].includes(selectedLayer) ? "dBm"
+    : selectedLayer === "bistatic_doppler" ? "Hz"
+    : selectedLayer === "bistatic_range" ? "km"
+    : selectedLayer === "bistatic_delay" ? "µs"
+    : selectedLayer === "bistatic_angle" ? "deg"
+    : selectedLayer === "bistatic_detectable" ? "flag"
     : "dB";
   const maxUnit = document.getElementById("legend-unit-max");
   const minUnit = document.getElementById("legend-unit-min");
@@ -2328,6 +2581,64 @@ function displayMetadata(data) {
     ? '<span style="color: #4CAF50;">●</span> Geometry + VLM'
     : '<span style="color: #FFA500;">●</span> Geometry only';
   
+  const channel = data.channel_analysis;
+  const direct = channel?.direct_path;
+  const best = channel?.best_detectable_point || channel?.best_margin_point;
+  const product = channel?.data_product || data.channel_analysis_product;
+  const productLink = document.getElementById("channel-product-download");
+  if (productLink) {
+    if (product?.download_url) {
+      productLink.href = product.download_url;
+      productLink.hidden = false;
+      productLink.style.display = "inline-block";
+    } else {
+      productLink.hidden = true;
+      productLink.style.display = "none";
+    }
+  }
+  const productHtml = product?.download_url
+    ? `<div style="margin-top:4px;"><a href="${product.download_url}" download>Download complete RF + environment + channel grid (.npz)</a> <span class="rf-sidebar-muted-sm">(${Number(product.size_bytes || 0).toLocaleString()} bytes)</span></div>`
+    : "";
+  const pipelineMetrics = data.pipeline_metrics || null;
+  const stageSeconds = pipelineMetrics?.stage_seconds || {};
+  const stageOrder = [
+    ["physical_world", "Physical world"],
+    ["forward_coverage", "Forward coverage"],
+    ["return_environment", "Return environment"],
+    ["channel_analysis", "Channel analysis"],
+    ["heatmap", "Heatmaps"],
+    ["channel_product_export", "NPZ export"],
+  ];
+  const stageRows = stageOrder
+    .filter(([key]) => Number.isFinite(Number(stageSeconds[key])))
+    .map(([key, label]) => `<div>${label}: <strong>${Number(stageSeconds[key]).toFixed(2)} s</strong></div>`)
+    .join("");
+  const rss = pipelineMetrics?.memory_rss_mb || {};
+  const peakSnapshots = Object.values(rss).map(Number).filter(Number.isFinite);
+  const peakRss = peakSnapshots.length ? Math.max(...peakSnapshots) : NaN;
+  const pipelineHtml = pipelineMetrics ? `
+    <div style="font-weight:bold; margin-top:8px; margin-bottom:4px;">Pipeline performance</div>
+    ${stageRows}
+    <div>Total: <strong>${Number(stageSeconds.total_to_response || 0).toFixed(2)} s</strong></div>
+    <div>Candidate points: <strong>${Number(pipelineMetrics.candidate_world_cells || 0).toLocaleString()}</strong></div>
+    <div>Output points: <strong>${Number(pipelineMetrics.output_points || 0).toLocaleString()}</strong></div>
+    ${Number.isFinite(peakRss) ? `<div>Highest recorded RSS snapshot: <strong>${peakRss.toFixed(1)} MB</strong></div>` : ""}
+    <div class="rf-sidebar-muted-sm">Forward cells released before return path: ${Number(pipelineMetrics.forward_world_cells_released_before_return_path || 0).toLocaleString()}.</div>
+  ` : "";
+
+  const channelHtml = channel ? `
+    <div style="font-weight:bold; margin-top:8px; margin-bottom:4px;">Channel and bistatic analysis</div>
+    <div>Direct path RX: <strong>${Number(direct?.received_power_dbm).toFixed(1)} dBm</strong></div>
+    <div>Direct path C/N: <strong>${Number(direct?.carrier_to_noise_db).toFixed(1)} dB</strong></div>
+    <div>Best echo: <strong>${Number(best?.echo_power_dbm).toFixed(1)} dBm</strong></div>
+    <div>Best margin: <strong>${Number(best?.detection_margin_db).toFixed(1)} dB</strong></div>
+    <div>Signed Doppler: <strong>${Number(best?.doppler_hz).toFixed(1)} Hz</strong></div>
+    <div>Doppler resolved: <strong>${best?.doppler_resolved ? "yes" : "no"}</strong></div>
+    <div>Detectable: <strong>${best?.detectable ? "yes" : "no"}</strong></div>
+    <div class="rf-sidebar-muted-sm">${channel?.counts?.detectable_points || 0} detectable target locations; return model=${channel?.return_path_model || "unknown"}; environmental return samples=${channel?.counts?.return_environment_samples_used || 0}.</div>
+    ${productHtml}
+  ` : "";
+
   metaDiv.innerHTML = `
     <div style="font-weight: bold; margin-bottom: 6px;">Model Status</div>
     <div style="margin-bottom: 4px;">${sourceBadge}</div>
@@ -2335,6 +2646,8 @@ function displayMetadata(data) {
     <div style="margin-bottom: 4px;">Clutter: <strong>${clutterType}</strong></div>
     <div style="margin-bottom: 4px;">Street View: ${svAvailable ? "✓ Available" : "✗ Not available"}</div>
     <div>VLM Refinement: ${vlmUsed ? "✓ Used" : "✗ Not used"}</div>
+    ${channelHtml}
+    ${pipelineHtml}
   `;
 }
 
