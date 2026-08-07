@@ -1,14 +1,20 @@
 # DVT planning support
 
-The planner accepts DVT transmitter data through the existing `POST /api/plan` endpoint.
-DVT is a separate RF technology path; existing 5G NR requests retain their current defaults and link-budget behavior.
+The planner accepts terrestrial digital television transmitters through `POST /api/plan` using `technology: "dvt"` and one of these waveform presets:
 
-## Example request
+- `atsc1`
+- `atsc3`
+- `dvbt`
+- `baseline`
+
+## Broadcast transmitter versus cellular sectors
+
+A DVT plan contains **one station transmitter and one broadcast antenna radiation system**. It does not create cellular sectors, serving-sector selection, sector overlays, per-sector heatmaps, or same-site sector interference.
+
+The DVT transmitter object is split into independent physical components:
 
 ```json
 {
-  "technology": "dvt",
-  "ray_mode": "2d_osm",
   "dvt": {
     "fc": 587000000,
     "fs": 10000000,
@@ -19,111 +25,158 @@ DVT is a separate RF technology path; existing 5G NR requests retain their curre
       "longitude": -122.4194,
       "altitude": 18.0,
       "antennaHeight": 320.0,
-      "name": "Example DVT TX",
-      "azimuthDeg": 90.0,
-      "elevationDeg": -1.0,
-      "beamwidthHDeg": 65.0,
-      "beamwidthVDeg": 8.0,
-      "electricalTiltDeg": 0.0,
-      "mechanicalTiltDeg": 0.0,
-      "maxHorizontalAttenuationDb": 30.0,
-      "frontToBackAttenuationDb": 30.0,
-      "maxVerticalAttenuationDb": 30.0
+      "name": "Example TV TX"
+    },
+    "antenna": {
+      "patternType": "tabulated",
+      "manufacturer": "Example manufacturer",
+      "model": "Example antenna",
+      "rotationDeg": 345.0,
+      "beamTiltDeg": 1.5,
+      "verticalBeamwidthDeg": 8.0,
+      "maxVerticalAttenuationDb": 30.0,
+      "azimuthPattern": [
+        {"azimuthDeg": 0.0, "relativeFieldH": 1.0, "relativeFieldV": 0.5},
+        {"azimuthDeg": 90.0, "relativeFieldH": 0.8, "relativeFieldV": 0.4},
+        {"azimuthDeg": 180.0, "relativeFieldH": 0.1, "relativeFieldV": 0.1},
+        {"azimuthDeg": 270.0, "relativeFieldH": 0.2, "relativeFieldV": 0.2}
+      ]
     },
     "power": {
-      "erpKw": 50.0,
+      "erpHKw": 1000.0,
+      "erpVKw": 250.0,
       "polarization": "DA (E)"
-    },
-    "station": {
-      "callSign": "KEXAMPLE",
-      "virtualChannel": "7.1",
-      "rfChannel": 33,
-      "physicalChannel": 33,
-      "facilityId": "12345",
-      "city": "San Francisco",
-      "network": "Example Network",
-      "standard": "ATSC 3.0",
-      "band": "UHF",
-      "source": "internal",
-      "sourceUrl": "https://example.invalid/station/12345"
     }
-  },
-  "max_range_m": 20000,
-  "step_m": 20,
-  "coverage_display_layer": "field_strength",
-  "compact_output": true
-}
-```
-
-`lat` and `lon` may be omitted for DVT requests because they are taken from `dvt.tx`. When both forms are supplied, they must match.
-
-## Link-budget semantics
-
-- Supply exactly one source-power form:
-  - `erpKw`: effective radiated power; antenna-system gain and feeder effects are already included, and ERP is converted to EIRP by adding 2.15 dB once.
-  - `conductedPowerKw`: transmitter output before the antenna system; the source EIRP is `conducted power + txGainDb + antennaGainDbi - feederLossDb`.
-- TX-chain gain, feeder loss, antenna gain, receiver gain, frequency/wavelength, bandwidth/noise, and directional antenna patterns are physical terms shared across waveform families.
-- DVT omits only NR-specific occupied-resource-element spreading and NR reference-signal offsets.
-- Transmitter absolute height is `tx.altitude + tx.antennaHeight`.
-- Directional attenuation uses the supplied azimuth, horizontal/vertical beamwidth, tilt, and attenuation limits.
-- `polarization` and all `station` fields are metadata only.
-- The returned grid includes `received_power_dbm` and `field_strength_dbuv_m`.
-- `rsrp_dbm` remains populated with received carrier power for compatibility with existing rendering and result consumers.
-
-## Large-area OSM behavior
-
-Requests above 7.5 km are split into exact cached OSM tiles rather than one large Overpass bounding box. The implementation deduplicates features across tile boundaries and parses outer rings from OSM multipolygon relations. Cached regions are reused only when they fully contain the new request.
-
-No coarse solver, spatial interpolation, or distant-building simplification is introduced by this change.
-
-## Large-result serialization
-
-For DVT plans, `compact_output` controls whether raw per-cell arrays are returned:
-
-- `true`: return the full-resolution heatmap PNG, configuration, summaries, and `num_points`, but omit the large JSON cell arrays.
-- `false`: return every raw cell array.
-- omitted: automatically compact DVT results above 100,000 points.
-
-The DVT heatmap texture supports up to 2048 pixels. A 40 km diameter plan at 20 m spacing therefore renders at approximately the requested 20 m display resolution.
-
-The solver uses an exact interval-event sweep and reuses the coverage grid's precomputed OSM intersection state; it does not query buildings and forests again for every output cell. The single-transmitter DVT attenuation path also bypasses the 5G serving-sector/interference grouping allocation.
-
-## Current propagation boundary
-
-This change implements the supplied DVT transmitter model with either direct ERP or conducted-power RF-chain input, using frequency-dependent path loss plus the planner's existing terrain, building, vegetation, diffraction, shadow, receiver-gain, bandwidth/noise, and antenna-pattern terms. The waveform preset is modeled and returned, but it does not yet select waveform-specific receiver thresholds or regulatory service-contour criteria. Polarization and station identity remain metadata, as specified.
-
-
-## Conducted-power example
-
-See `examples/dvt_conducted_power_plan_request.json` for a request where feeder loss and antenna gain are calculated explicitly. The original `examples/dvt_plan_request.json` remains the direct-ERP form.
-
-
-## UI waveform selection
-
-Both planner surfaces expose a **Waveform and transmitter** section:
-
-- `5G NR`
-- `DVT — ATSC 1.0`
-- `DVT — ATSC 3.0`
-- `DVT — DVB-T`
-- `DVT — baseline`
-
-For DVT selections, the UI sends both an explicit top-level waveform and the typed nested transmitter waveform:
-
-```json
-{
-  "technology": "dvt",
-  "waveform": "atsc3",
-  "dvt": {
-    "waveform": "atsc3"
   }
 }
 ```
 
-The API rejects a mismatch between `waveform` and `dvt.waveform`. The DVT panel exposes `fc` through the shared frequency control, `bandwidth` through the shared bandwidth control, `fs`, site altitude, antenna height, azimuth/elevation, horizontal and vertical beamwidth, ERP or conducted-power RF-chain inputs, polarization, range/dR, and station identity metadata. The 3D UI keeps DVT on `3d_osm`; Google-mesh RT modes are disabled for large-area DVT plans.
+`tx` contains site geometry only. Directionality belongs in `antenna`.
 
-## Waveform-isolated UI
+## Broadcast antenna pattern types
 
-Selecting ATSC 1.0, ATSC 3.0, DVB-T, or the baseline DVT profile switches both planner surfaces to a DVT-only transmitter form. NR-only controls (SCS, resource blocks, RSRP termination, MIMO, link adaptation, 3GPP scenario selection, and sector configuration) are hidden and removed from the submitted request. DVT frequency, channel bandwidth, receiver noise figure/gain, termination power, antenna pattern, ERP/conducted-power chain, and station identity use dedicated controls.
+### `omnidirectional`
 
-The coverage selector disables RSRP for DVT and defaults to field strength. The legend title and units follow the active layer; DVT field strength is displayed in dBµV/m.
+No horizontal pattern attenuation is applied. Vertical beam tilt and vertical HPBW remain active.
+
+### `parametric`
+
+A broadcast-pattern approximation using:
+
+- `mainAzimuthDeg`
+- `horizontalBeamwidthDeg`
+- `maxHorizontalAttenuationDb`
+- `frontToBackAttenuationDb`
+- `rotationDeg`
+
+These are properties of one broadcast radiation pattern, not cellular sector definitions.
+
+### `tabulated`
+
+A circular filed/manufacturer pattern made of azimuth samples. Each sample may contain:
+
+- `relativeField` or `attenuationDb` for one common pattern
+- `relativeFieldH` / `attenuationDbH`
+- `relativeFieldV` / `attenuationDbV`
+
+Relative-field values are linear electric-field ratios. The solver converts them to ERP attenuation with `20 log10(field)`, interpolates circularly between azimuth samples, and applies `rotationDeg` clockwise.
+
+## Power references
+
+Three mutually exclusive input forms are supported:
+
+1. `erpKw`: one maximum ERP value.
+2. `erpHKw` and/or `erpVKw`: maximum horizontal and vertical ERP components for elliptical polarization.
+3. `conductedPowerKw`: transmitter output before the antenna system, combined with `txGainDb`, `feederLossDb`, and `antennaGainDbi`.
+
+ERP already includes antenna-system gain and feeder effects, so ERP cannot be combined with explicit feeder or antenna gain. Conducted power applies those terms once.
+
+For separate H/V ERP components, the solver applies the H and V azimuth patterns independently and then sums their received powers in the linear domain.
+
+## Physical terms
+
+The DVT calculation uses:
+
+- center frequency and wavelength-dependent path loss
+- channel bandwidth and receiver noise figure
+- ERP or conducted transmitter power
+- transmitter-chain gain
+- feeder loss
+- antenna gain
+- broadcast horizontal radiation pattern
+- pattern rotation
+- vertical beam tilt and vertical HPBW
+- receiver antenna gain
+- terrain, buildings, vegetation, diffraction, and shadow losses
+
+It does not use NR resource blocks, subcarrier spacing, reference-signal spreading, MIMO, link adaptation, RSRP caps, 3GPP UMi/UMa scenarios, or sectors.
+
+## UI behavior
+
+Selecting ATSC 1.0, ATSC 3.0, DVB-T, or baseline DVT:
+
+- hides the complete NR advanced panel
+- hides NR sector configuration and sector overlays
+- shows the broadcast antenna radiation-pattern editor
+- supports omnidirectional, parametric, and tabulated patterns
+- supports separate maximum H/V ERP values
+- sends no `sectors` field
+- defaults the display layer to received carrier power in dBm
+
+## Large-area execution
+
+DVT defaults to 20 km range and 20 m radial spacing when those fields are omitted. Large OSM requests are tiled and cached. The solver reuses precomputed obstacle intervals, performs interval-event sweeps, and returns compact raster output for large plans without coarsening the configured propagation sampling.
+
+Examples:
+
+- `examples/dvt_plan_request.json`
+- `examples/dvt_conducted_power_plan_request.json`
+- `examples/dvt_tabulated_broadcast_pattern_request.json`
+
+## Automatic OSM AOI cache for large-area DVT planning
+
+The execution surface is unchanged:
+
+```bash
+uvicorn agentic_rf_planner.api.rest:app --reload
+```
+
+Then select a DVT waveform, select the transmitter, set the radius, and run.
+No PBF download or preparation command is required.
+
+For each DVT request the planner:
+
+1. Computes the requested AOI around the configured broadcast transmitter.
+2. Opens or creates `data/osm/rf_geometry.sqlite`.
+3. Checks `aoi_cache` for a completed region that contains the requested AOI.
+4. On a cache hit, loads buildings and land use using the SQLite R*Tree only.
+5. On a cache miss, first attempts one complete Overpass AOI request.
+6. If the complete request is rejected or too large, falls back to bounded tiles.
+7. Commits every successful tile to SQLite immediately and marks the AOI complete
+   only when all required tiles succeed.
+8. Continues the same RF planning request using the newly cached geometry.
+
+A later request inside the cached AOI makes zero OSM network requests. Successful
+fallback tiles are resumable after a failed or interrupted first run.
+
+The cache path can be overridden with `DVT_OSM_DATABASE` or `RF_OSM_DATABASE`;
+otherwise it is created automatically at `data/osm/rf_geometry.sqlite` relative
+to the directory where Uvicorn is started.
+
+`agentic-rf-prepare-region` remains an optional offline pre-seeding tool. It is
+not part of the normal click-and-run workflow.
+
+Broadcast-site coordinates are used directly. DVT planning skips street
+snapping, Street View discovery, panorama retrieval, and VLM refinement.
+
+## Shared link budget and bistatic channel analysis
+
+Link budget, receiver geometry, target-return power, delay, Doppler, and
+detectability are implemented by the shared waveform-agnostic channel layer.
+They are not owned by the DVT transmitter model. The same UI and API contract
+operate with 5G NR, ATSC 1.0, ATSC 3.0, DVB-T, and baseline DVT.
+
+See `CHANNEL_ANALYSIS.md` and the concrete requests in:
+
+- `examples/channel_analysis_5g_nr.json`
+- `examples/channel_analysis_atsc1.json`
