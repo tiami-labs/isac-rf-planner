@@ -4,21 +4,22 @@ from __future__ import annotations
 
 import logging
 import math
-
-import numpy as np
 from collections import defaultdict
 from typing import Any, Dict
+
+import numpy as np
 
 from ..pipeline.schemas import WorldModel, AttenuationGrid, MaterialType, RFParams
 from .material_models import DEFAULT_MATERIAL_DB
 from .modulation_schemes import get_modulation_by_name, select_modulation
 from .ofdm_params import MIMOConfig, OFDMParams
 from .dvt import received_power_to_field_strength_dbuv_m
+from .bistatic_field import compute_bistatic_field_arrays
+from .channel_arrays import LARGE_ARRAY_THRESHOLD_POINTS, terrain_state_label
 from .channel_analysis import (
     SPEED_OF_LIGHT_M_S,
     bistatic_echo_power_dbm,
     bistatic_geometry,
-    bistatic_geometry_arrays,
     coherent_processing_gain_db,
     free_space_path_loss_db as channel_free_space_path_loss_db,
     thermal_noise_power_dbm,
@@ -29,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 def compute_attenuation_grid(
     world: WorldModel,
-    channel_context: Dict[str, Any] | None = None,
     *,
-    include_channel_analysis: bool = True,
+    apply_channel: bool = True,
+    reciprocal_field: Any | None = None,
 ) -> AttenuationGrid:
     """
     Given a WorldModel (cells with obstacles), compute RSRP, SINR, and link adaptation per cell.
@@ -59,12 +60,8 @@ def compute_attenuation_grid(
     """
 
     if _is_dvt(world.rf_params):
-        base_grid = _compute_single_dvt_grid(world)
-        return (
-            _apply_channel_analysis(world, base_grid, channel_context)
-            if include_channel_analysis
-            else base_grid
-        )
+        grid = _compute_single_dvt_grid(world)
+        return _apply_channel_analysis(world, grid, reciprocal_field=reciprocal_field) if apply_channel else grid
 
     max_rsrp_dbm = float(getattr(world.rf_params, "max_rsrp_dbm", -62.0) or -62.0)
     tx_h = float(getattr(world.rf_params, "tx_height_m", 0.0) or 0.0)
@@ -186,17 +183,7 @@ def compute_attenuation_grid(
                 "freq_mhz": sector_freq_mhz,
                 "channel_bandwidth_mhz": sector_bandwidth_mhz,
                 "incident_power_isotropic_dbm": carrier_incident_isotropic_dbm,
-                "source_eirp_at_target_dbm": (
-                    carrier_eirp_dbm - horizontal_pattern_loss_db - vertical_pattern_loss_db
-                ),
                 "extra_loss_db": extra_loss_db,
-                "penetration_loss_db": penetration_loss_db,
-                "shadow_loss_db": shadow_loss_db,
-                "diffraction_loss_db": diffraction_loss_db,
-                "canyon_recovery_db": canyon_recovery_db,
-                "horizontal_pattern_loss_db": horizontal_pattern_loss_db,
-                "vertical_pattern_loss_db": vertical_pattern_loss_db,
-                "obstacles_count": int(getattr(cell, "obstacles_count", 0) or 0),
                 "propagation_mode": str(getattr(cell, "propagation_mode", "los") or "los"),
             }
         )
@@ -242,17 +229,6 @@ def compute_attenuation_grid(
     terrain_state_out: list[str] = []
     z_ground_out: list[float] = []
     incident_power_isotropic_dbm: list[float] = []
-    source_eirp_at_target_dbm: list[float] = []
-    tx_target_path_loss_db: list[float] = []
-    tx_target_environment_excess_db: list[float] = []
-    tx_target_penetration_loss_db: list[float] = []
-    tx_target_shadow_loss_db: list[float] = []
-    tx_target_diffraction_loss_db: list[float] = []
-    tx_target_canyon_recovery_db: list[float] = []
-    tx_target_horizontal_pattern_loss_db: list[float] = []
-    tx_target_vertical_pattern_loss_db: list[float] = []
-    tx_target_obstacles_count: list[int] = []
-    tx_target_propagation_mode: list[str] = []
 
     for samples in sample_groups.values():
         samples_sorted = sorted(samples, key=lambda sample: sample["rsrp_dbm"], reverse=True)
@@ -307,20 +283,7 @@ def compute_attenuation_grid(
         interferer_count.append(len(same_carrier_interferers))
         top_interferer_rsrp_dbm.append(top_interferer_dbm)
         pilot_pollution_metric_db.append(pollution_metric_db)
-        incident_value = float(serving["incident_power_isotropic_dbm"])
-        source_value = float(serving["source_eirp_at_target_dbm"])
-        incident_power_isotropic_dbm.append(incident_value)
-        source_eirp_at_target_dbm.append(source_value)
-        tx_target_path_loss_db.append(source_value - incident_value)
-        tx_target_environment_excess_db.append(float(serving["extra_loss_db"]))
-        tx_target_penetration_loss_db.append(float(serving["penetration_loss_db"]))
-        tx_target_shadow_loss_db.append(float(serving["shadow_loss_db"]))
-        tx_target_diffraction_loss_db.append(float(serving["diffraction_loss_db"]))
-        tx_target_canyon_recovery_db.append(float(serving["canyon_recovery_db"]))
-        tx_target_horizontal_pattern_loss_db.append(float(serving["horizontal_pattern_loss_db"]))
-        tx_target_vertical_pattern_loss_db.append(float(serving["vertical_pattern_loss_db"]))
-        tx_target_obstacles_count.append(int(serving["obstacles_count"]))
-        tx_target_propagation_mode.append(str(serving["propagation_mode"]))
+        incident_power_isotropic_dbm.append(float(serving["incident_power_isotropic_dbm"]))
         modulation_counts[mod_name_out] = modulation_counts.get(mod_name_out, 0) + 1
 
         if rsrp_by_sector_lists is not None:
@@ -378,7 +341,9 @@ def compute_attenuation_grid(
             100.0 * nlos_count / len(world.cells),
         )
 
-    grid = AttenuationGrid(
+    # Solver outputs are already type-normalized. model_construct avoids Pydantic
+    # cloning every large list before the grid is immediately consumed internally.
+    grid = AttenuationGrid.model_construct(
         tx=world.tx,
         rf_params=world.rf_params,
         cell_lat=cell_lat,
@@ -396,47 +361,22 @@ def compute_attenuation_grid(
         received_power_dbm=None,
         field_strength_dbuv_m=None,
         incident_power_isotropic_dbm=incident_power_isotropic_dbm,
-        source_eirp_at_target_dbm=source_eirp_at_target_dbm,
-        tx_target_path_loss_db=tx_target_path_loss_db,
-        tx_target_environment_excess_db=tx_target_environment_excess_db,
-        tx_target_penetration_loss_db=tx_target_penetration_loss_db,
-        tx_target_shadow_loss_db=tx_target_shadow_loss_db,
-        tx_target_diffraction_loss_db=tx_target_diffraction_loss_db,
-        tx_target_canyon_recovery_db=tx_target_canyon_recovery_db,
-        tx_target_horizontal_pattern_loss_db=tx_target_horizontal_pattern_loss_db,
-        tx_target_vertical_pattern_loss_db=tx_target_vertical_pattern_loss_db,
-        tx_target_obstacles_count=tx_target_obstacles_count,
-        tx_target_propagation_mode=tx_target_propagation_mode,
         waveform="5g_nr",
         terrain_loss_db=terrain_loss_out if terrain_loss_out else None,
         los_terrain=los_terrain_out if los_terrain_out else None,
         terrain_state=terrain_state_out if terrain_state_out else None,
         z_ground_m=z_ground_out if z_ground_out else None,
     )
-    return (
-        _apply_channel_analysis(world, grid, channel_context)
-        if include_channel_analysis
-        else grid
-    )
+    return _apply_channel_analysis(world, grid, reciprocal_field=reciprocal_field) if apply_channel else grid
 
 
-def apply_channel_analysis(
-    world: WorldModel,
-    grid: AttenuationGrid,
-    channel_context: Dict[str, Any] | None = None,
-) -> AttenuationGrid:
-    """Apply the optional waveform-agnostic sensing stage to a completed coverage grid.
+def _compute_single_dvt_grid(world: WorldModel, *, capture_path_components: bool = False) -> AttenuationGrid | tuple[AttenuationGrid, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute one-transmitter broadcast coverage.
 
-    Keeping this as a separate public stage allows the orchestrator to release
-    the large forward ``WorldCell`` collection before it builds the reciprocal
-    receiver environment.
+    Large compact plans write directly into NumPy arrays so the one-way field does
+    not first exist as millions of boxed Python floats only to be converted later
+    by ISAC and export stages. Small/debug plans retain the historical list surface.
     """
-
-    return _apply_channel_analysis(world, grid, channel_context)
-
-
-def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
-    """Compute one-transmitter broadcast coverage into preallocated arrays."""
 
     rf_params = world.rf_params
     dvt = rf_params.dvt
@@ -449,28 +389,43 @@ def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
     bandwidth_mhz = float(dvt.bandwidth_mhz)
     waveform = str(dvt.waveform)
     count = len(world.cells)
+    array_backed = (
+        count > LARGE_ARRAY_THRESHOLD_POINTS
+        and getattr(rf_params, "compact_output", None) is not False
+    )
 
-    cell_lat = np.empty(count, dtype=np.float64)
-    cell_lon = np.empty(count, dtype=np.float64)
-    received_power_dbm = np.empty(count, dtype=np.float64)
-    incident_power_isotropic_dbm = np.empty(count, dtype=np.float64)
-    source_eirp_at_target_dbm = np.empty(count, dtype=np.float64)
-    tx_target_path_loss_db = np.empty(count, dtype=np.float64)
-    tx_target_environment_excess_db = np.empty(count, dtype=np.float32)
-    tx_target_penetration_loss_db = np.empty(count, dtype=np.float32)
-    tx_target_shadow_loss_db = np.empty(count, dtype=np.float32)
-    tx_target_diffraction_loss_db = np.empty(count, dtype=np.float32)
-    tx_target_canyon_recovery_db = np.empty(count, dtype=np.float32)
-    tx_target_horizontal_pattern_loss_db = np.empty(count, dtype=np.float32)
-    tx_target_vertical_pattern_loss_db = np.empty(count, dtype=np.float32)
-    tx_target_obstacles_count = np.empty(count, dtype=np.int32)
-    field_strength_dbuv_m = np.empty(count, dtype=np.float32)
-    carrier_to_noise_db = np.empty(count, dtype=np.float32)
-    terrain_loss_out = np.empty(count, dtype=np.float32)
-    los_terrain_out = np.empty(count, dtype=np.bool_)
-    z_ground_out = np.empty(count, dtype=np.float32)
-    tx_target_propagation_mode: list[str] = ["los"] * count
-    terrain_state_out: list[str] = ["los"] * count
+    if array_backed:
+        cell_lat: Any = np.empty(count, dtype=np.float64)
+        cell_lon: Any = np.empty(count, dtype=np.float64)
+        received_power_dbm: Any = np.empty(count, dtype=np.float32)
+        incident_power_isotropic_dbm: Any = np.empty(count, dtype=np.float32)
+        field_strength_dbuv_m: Any = np.empty(count, dtype=np.float32)
+        carrier_to_noise_db: Any = np.empty(count, dtype=np.float32)
+        terrain_loss_out: Any = np.empty(count, dtype=np.float32)
+        los_terrain_out: Any = np.empty(count, dtype=np.bool_)
+        z_ground_out: Any = np.empty(count, dtype=np.float32)
+        modulation: list[str] = []
+        throughput_mbps: list[float] = []
+        terrain_state_out: Any = None
+    else:
+        cell_lat = []
+        cell_lon = []
+        received_power_dbm = []
+        incident_power_isotropic_dbm = []
+        field_strength_dbuv_m = []
+        carrier_to_noise_db = []
+        modulation = []
+        throughput_mbps = []
+        terrain_loss_out = []
+        los_terrain_out = []
+        terrain_state_out = []
+        z_ground_out = []
+
+    # Optional target-height ISAC capture: emit path/environment/LOS terms from
+    # this exact DVT pass so callers do not need to walk every WorldCell twice.
+    captured_path = np.empty(count, dtype=np.float32) if capture_path_components else None
+    captured_environment = np.empty(count, dtype=np.float32) if capture_path_components else None
+    captured_los = np.empty(count, dtype=np.bool_) if capture_path_components else None
 
     noise_floor_dbm = _noise_floor_dbm_for_bandwidth(rf_params, bandwidth_mhz)
     rx_gain_dbi = float(getattr(rf_params, "ue_antenna_gain_dbi", 0.0) or 0.0)
@@ -495,6 +450,7 @@ def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
             is_los=bool(getattr(cell, "is_los", True)),
             rf_params=rf_params,
         )
+
         penetration_loss_db = float(getattr(cell, "penetration_loss_db", 0.0) or 0.0)
         shadow_loss_db = float(getattr(cell, "shadow_loss_db", 0.0) or 0.0)
         diffraction_loss_db = float(getattr(cell, "diffraction_loss_db", 0.0) or 0.0)
@@ -510,9 +466,6 @@ def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
         )
 
         source_eirp_dbm = dvt.effective_source_eirp_dbm(float(cell.bearing_deg))
-        horizontal_pattern_loss_db = max(
-            0.0, float(dvt.power.source_eirp_dbm) - source_eirp_dbm
-        )
         vertical_pattern_loss_db = _dvt_vertical_pattern_attenuation_db(
             distance_m=d2,
             tx_height_m=tx_h,
@@ -520,58 +473,64 @@ def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
             rf_params=rf_params,
         )
         precomputed = getattr(cell, "precomputed_rsrp_dbm", None)
-        power_dbm = (
-            float(precomputed)
-            if precomputed is not None
-            else (
+        if precomputed is not None:
+            power_dbm = float(precomputed)
+        else:
+            power_dbm = (
                 source_eirp_dbm
                 - path_loss_db
                 - extra_loss_db
                 - vertical_pattern_loss_db
                 + rx_gain_dbi
             )
-        )
-        incident_isotropic_dbm = power_dbm - rx_gain_dbi
-        source_after_pattern_dbm = source_eirp_dbm - vertical_pattern_loss_db
 
-        cell.extra_loss_db = extra_loss_db
-        cell_lat[index] = float(cell.lat)
-        cell_lon[index] = float(cell.lon)
-        received_power_dbm[index] = power_dbm
-        incident_power_isotropic_dbm[index] = incident_isotropic_dbm
-        source_eirp_at_target_dbm[index] = source_after_pattern_dbm
-        tx_target_path_loss_db[index] = source_after_pattern_dbm - incident_isotropic_dbm
-        tx_target_environment_excess_db[index] = extra_loss_db
-        tx_target_penetration_loss_db[index] = penetration_loss_db
-        tx_target_shadow_loss_db[index] = shadow_loss_db
-        tx_target_diffraction_loss_db[index] = diffraction_loss_db
-        tx_target_canyon_recovery_db[index] = canyon_recovery_db
-        tx_target_horizontal_pattern_loss_db[index] = horizontal_pattern_loss_db
-        tx_target_vertical_pattern_loss_db[index] = vertical_pattern_loss_db
-        tx_target_obstacles_count[index] = int(getattr(cell, "obstacles_count", 0) or 0)
-        tx_target_propagation_mode[index] = str(
-            getattr(cell, "propagation_mode", "los") or "los"
-        )
-        field_strength_dbuv_m[index] = received_power_to_field_strength_dbuv_m(
+        incident_isotropic_dbm = power_dbm - rx_gain_dbi
+        field_dbuv_m = received_power_to_field_strength_dbuv_m(
             power_dbm,
             freq_mhz,
             rx_gain_dbi=rx_gain_dbi,
         )
-        carrier_to_noise_db[index] = power_dbm - noise_floor_dbm
-        terrain_loss_out[index] = terrain_loss_db
-        los_terrain_out[index] = bool(getattr(cell, "los_terrain", True))
-        terrain_state_out[index] = str(getattr(cell, "terrain_state", "los") or "los")
-        z_ground_out[index] = float(getattr(cell, "z_ground_m", 0.0) or 0.0)
 
-    return AttenuationGrid(
+        cell.extra_loss_db = extra_loss_db
+        if capture_path_components:
+            captured_path[index] = path_loss_db + extra_loss_db
+            captured_environment[index] = extra_loss_db
+            captured_los[index] = bool(getattr(cell, "is_los", True)) and bool(getattr(cell, "los_terrain", True))
+        if array_backed:
+            cell_lat[index] = float(cell.lat)
+            cell_lon[index] = float(cell.lon)
+            received_power_dbm[index] = power_dbm
+            incident_power_isotropic_dbm[index] = incident_isotropic_dbm
+            field_strength_dbuv_m[index] = field_dbuv_m
+            carrier_to_noise_db[index] = power_dbm - noise_floor_dbm
+            terrain_loss_out[index] = terrain_loss_db
+            los_terrain_out[index] = bool(getattr(cell, "los_terrain", True))
+            z_ground_out[index] = float(getattr(cell, "z_ground_m", 0.0) or 0.0)
+        else:
+            cell_lat.append(float(cell.lat))
+            cell_lon.append(float(cell.lon))
+            received_power_dbm.append(power_dbm)
+            incident_power_isotropic_dbm.append(incident_isotropic_dbm)
+            field_strength_dbuv_m.append(field_dbuv_m)
+            carrier_to_noise_db.append(power_dbm - noise_floor_dbm)
+            modulation.append(waveform)
+            throughput_mbps.append(0.0)
+            terrain_loss_out.append(terrain_loss_db)
+            los_terrain_out.append(bool(getattr(cell, "los_terrain", True)))
+            terrain_state_out.append(str(getattr(cell, "terrain_state", "los") or "los"))
+            z_ground_out.append(float(getattr(cell, "z_ground_m", 0.0) or 0.0))
+
+    # Internal trusted construction keeps DVT legacy aliases on the same storage:
+    # rsrp_dbm == received_power_dbm and sinr_db == carrier_to_noise_db.
+    grid = AttenuationGrid.model_construct(
         tx=world.tx,
         rf_params=rf_params,
         cell_lat=cell_lat,
         cell_lon=cell_lon,
         rsrp_dbm=received_power_dbm,
         sinr_db=carrier_to_noise_db,
-        modulation=[waveform] * count,
-        throughput_mbps=[0.0] * count,
+        modulation=modulation,
+        throughput_mbps=throughput_mbps,
         serving_sector_id=[],
         interferer_count=[],
         top_interferer_rsrp_dbm=[],
@@ -582,23 +541,16 @@ def _compute_single_dvt_grid(world: WorldModel) -> AttenuationGrid:
         field_strength_dbuv_m=field_strength_dbuv_m,
         carrier_to_noise_db=carrier_to_noise_db,
         incident_power_isotropic_dbm=incident_power_isotropic_dbm,
-        source_eirp_at_target_dbm=source_eirp_at_target_dbm,
-        tx_target_path_loss_db=tx_target_path_loss_db,
-        tx_target_environment_excess_db=tx_target_environment_excess_db,
-        tx_target_penetration_loss_db=tx_target_penetration_loss_db,
-        tx_target_shadow_loss_db=tx_target_shadow_loss_db,
-        tx_target_diffraction_loss_db=tx_target_diffraction_loss_db,
-        tx_target_canyon_recovery_db=tx_target_canyon_recovery_db,
-        tx_target_horizontal_pattern_loss_db=tx_target_horizontal_pattern_loss_db,
-        tx_target_vertical_pattern_loss_db=tx_target_vertical_pattern_loss_db,
-        tx_target_obstacles_count=tx_target_obstacles_count,
-        tx_target_propagation_mode=tx_target_propagation_mode,
         waveform=waveform,
-        terrain_loss_db=terrain_loss_out if count else None,
-        los_terrain=los_terrain_out if count else None,
-        terrain_state=terrain_state_out if count else None,
-        z_ground_m=z_ground_out if count else None,
+        terrain_loss_db=terrain_loss_out,
+        los_terrain=los_terrain_out,
+        terrain_state=terrain_state_out,
+        z_ground_m=z_ground_out,
     )
+    if capture_path_components:
+        assert captured_path is not None and captured_environment is not None and captured_los is not None
+        return grid, captured_path, captured_environment, captured_los
+    return grid
 
 
 
@@ -762,65 +714,50 @@ def _carrier_source_toward_receiver(
     return best
 
 
+
+def apply_channel_analysis(
+    world: WorldModel,
+    grid: AttenuationGrid,
+    *,
+    reciprocal_field: Any | None = None,
+    illumination_field: Any | None = None,
+) -> AttenuationGrid:
+    """Public fusion step for adding waveform-agnostic bistatic outputs to a one-way field."""
+
+    return _apply_channel_analysis(
+        world, grid, reciprocal_field=reciprocal_field, illumination_field=illumination_field
+    )
+
 def _apply_channel_analysis(
     world: WorldModel,
     grid: AttenuationGrid,
-    channel_context: Dict[str, Any] | None = None,
+    *,
+    reciprocal_field: Any | None = None,
+    illumination_field: Any | None = None,
 ) -> AttenuationGrid:
-    """Attach per-target link-budget, bistatic geometry, Doppler and quality outputs.
+    """Attach waveform-agnostic one-way and bistatic channel outputs.
 
-    Geometry, reciprocal-environment sampling, and link-budget arithmetic are
-    vectorized.  Large numeric layers stay as compact NumPy arrays until JSON is
-    explicitly requested by the REST layer.
+    Large plans keep derived layers in compact NumPy arrays attached to the grid's
+    private channel store.  Only small/debug responses materialize those arrays as
+    Python lists.  This prevents ISAC analysis from multiplying memory use by the
+    number of output layers.
     """
 
     config = getattr(world.rf_params, "channel_analysis", None)
     if config is None:
         return grid
-
-    point_count = len(grid.cell_lat)
-    incident_raw = grid.incident_power_isotropic_dbm
-    if incident_raw is None or len(incident_raw) != point_count:
+    communication_incident = grid.channel_array("incident_power_isotropic_dbm")
+    incident = (
+        getattr(illumination_field, "incident_power_dbm", None)
+        if illumination_field is not None else communication_incident
+    )
+    if incident is None or len(incident) != len(grid.cell_lat):
         raise ValueError(
             "channel analysis requires one incident_power_isotropic_dbm value per grid point"
         )
-    incident = np.asarray(incident_raw, dtype=np.float64)
-
-    path_loss_raw = grid.tx_target_path_loss_db
-    if path_loss_raw is not None and len(path_loss_raw) == point_count:
-        tx_target_path_loss = np.asarray(path_loss_raw, dtype=np.float64)
-    else:
-        source_raw = grid.source_eirp_at_target_dbm
-        if source_raw is None or len(source_raw) != point_count:
-            tx_target_path_loss = np.full(point_count, np.nan, dtype=np.float64)
-        else:
-            tx_target_path_loss = np.asarray(source_raw, dtype=np.float64) - incident
 
     frequency_hz, waveform_bandwidth_hz = _active_frequency_and_bandwidth_hz(world.rf_params)
-    processing = config.processing
     receiver = config.receiver
-    target = config.target
-    processing_bandwidth_hz = float(
-        processing.processing_bandwidth_hz or waveform_bandwidth_hz
-    )
-    noise_power_dbm = thermal_noise_power_dbm(
-        processing_bandwidth_hz,
-        receiver.noise_figure_db,
-    )
-    processing_gain_db = coherent_processing_gain_db(
-        processing_bandwidth_hz,
-        processing.coherent_integration_s,
-    )
-    doppler_resolution_hz = 1.0 / float(processing.coherent_integration_s)
-    doppler_detection_threshold_hz = max(
-        doppler_resolution_hz,
-        float(processing.clutter_notch_hz),
-        float(processing.minimum_detectable_doppler_hz),
-    )
-    prf_hz = processing.pulse_repetition_frequency_hz
-    max_unambiguous_doppler_hz = float(prf_hz) / 2.0 if prf_hz is not None else None
-    delay_resolution_s = 1.0 / processing_bandwidth_hz
-    bistatic_path_resolution_m = SPEED_OF_LIGHT_M_S * delay_resolution_s
 
     tx_abs_m = float(
         world.z_tx_abs_m
@@ -841,9 +778,7 @@ def _apply_channel_analysis(
         receiver_latitude_deg=receiver.latitude,
         receiver_longitude_deg=receiver.longitude,
         receiver_altitude_m=receiver_abs_m,
-        target_motion=config.motion.model_copy(
-            update={"speed_mps": 0.0, "climb_rate_mps": 0.0}
-        ),
+        target_motion=config.motion.model_copy(update={"speed_mps": 0.0, "climb_rate_mps": 0.0}),
         frequency_hz=frequency_hz,
     )
     direct_source_eirp_dbm, direct_source_id, direct_h_loss_db, direct_v_loss_db = (
@@ -855,236 +790,222 @@ def _apply_channel_analysis(
             direct_range_m=direct_geometry.direct_tx_receiver_range_m,
         )
     )
-
-    return_lookup = (channel_context or {}).get("return_path_lookup")
-    requested_return_model = str(config.return_path_model)
-    use_environment_lookup = (
-        requested_return_model == "environmental_reciprocal_grid"
-        and return_lookup is not None
-    )
-    direct_environment_excess_db = 0.0
-    direct_environment_valid = False
-    if use_environment_lookup:
-        direct_environment_excess_db, _, _, direct_environment_valid = return_lookup.sample(
-            world.tx.lat,
-            world.tx.lon,
-        )
     direct_fspl_db = channel_free_space_path_loss_db(
         direct_geometry.direct_tx_receiver_range_m,
         frequency_hz,
     )
-    direct_total_path_loss_db = (
-        direct_fspl_db
-        + float(direct_environment_excess_db)
-        + float(receiver.direct_path_excess_loss_db)
+    # When an RX-centered environmental field exists, reuse its sampled direct
+    # RX<->TX environmental penalties by reciprocity, but recompute the baseline
+    # free-space/scenario term with the actual TX and analysis-RX endpoint heights.
+    # This avoids a third large world solve while making direct-path cancellation
+    # depend on the same mapped environment as the return field.
+    use_environment_direct = (
+        reciprocal_field is not None
+        and str(config.return_path_model) == "environment_reciprocal"
+        and math.isfinite(float(getattr(reciprocal_field, "direct_environment_loss_db", math.nan)))
     )
+    if use_environment_direct:
+        dz_m = tx_abs_m - receiver_abs_m
+        d3_m = float(direct_geometry.direct_tx_receiver_range_m)
+        d2_m = math.sqrt(max(1.0, d3_m * d3_m - dz_m * dz_m))
+        direct_environment_loss_db = float(reciprocal_field.direct_environment_loss_db)
+        direct_terrain_loss_db = float(reciprocal_field.direct_terrain_loss_db)
+        direct_los = bool(reciprocal_field.direct_los)
+        direct_sample_error_m = float(reciprocal_field.direct_sample_error_m)
+        direct_scenario_db = _scenario_path_loss_db(
+            distance_2d_m=d2_m,
+            distance_3d_m=d3_m,
+            freq_mhz=frequency_hz / 1.0e6,
+            tx_height_m=float(world.rf_params.tx_height_m),
+            rx_height_m=float(receiver.antenna_height_m_agl),
+            is_los=direct_los,
+            rf_params=world.rf_params,
+        )
+        direct_propagation_loss_db = direct_scenario_db + direct_environment_loss_db
+        direct_model = "environment_reciprocal_direct_sample"
+    else:
+        direct_environment_loss_db = 0.0
+        direct_terrain_loss_db = 0.0
+        direct_los = True
+        direct_sample_error_m = 0.0
+        direct_scenario_db = direct_fspl_db
+        direct_propagation_loss_db = direct_fspl_db
+        direct_model = "free_space_plus_excess"
     direct_received_power_dbm = (
         direct_source_eirp_dbm
-        - direct_total_path_loss_db
+        - direct_propagation_loss_db
+        - float(receiver.direct_path_excess_loss_db)
         + float(receiver.direct_antenna_gain_dbi)
         - float(receiver.feeder_loss_db)
     )
     residual_direct_power_dbm = (
-        direct_received_power_dbm - float(processing.direct_path_cancellation_db)
+        direct_received_power_dbm - float(config.processing.direct_path_cancellation_db)
     )
 
-    lat = np.asarray(grid.cell_lat, dtype=np.float64)
-    lon = np.asarray(grid.cell_lon, dtype=np.float64)
-    z_ground_raw = grid.z_ground_m
-    if z_ground_raw is None or len(z_ground_raw) != point_count:
-        z_ground = np.zeros(point_count, dtype=np.float64)
-    else:
-        z_ground = np.asarray(z_ground_raw, dtype=np.float64)
-    target_altitude = z_ground + float(target.height_m_agl)
+    point_count = len(grid.cell_lat)
+    # Default large-plan behavior is compact.  Explicit compact_output=False keeps
+    # legacy JSON/list materialization for callers that knowingly accept the memory cost.
+    materialize_public_lists = (
+        point_count <= LARGE_ARRAY_THRESHOLD_POINTS
+        or getattr(world.rf_params, "compact_output", None) is False
+    )
 
-    geometry = bistatic_geometry_arrays(
+    target_latitudes: Any = grid.cell_lat
+    target_longitudes: Any = grid.cell_lon
+    target_ground: Any = grid.z_ground_m
+    incident_values: Any = incident
+    if not materialize_public_lists:
+        # Cache authoritative aligned numerical sources once.  Downstream heatmaps
+        # and NPZ export consume these arrays directly instead of reconverting lists.
+        target_latitudes = np.asarray(grid.cell_lat, dtype=np.float64)
+        target_longitudes = np.asarray(grid.cell_lon, dtype=np.float64)
+        incident_values = np.asarray(incident, dtype=np.float32)
+        target_ground = (
+            np.asarray(grid.z_ground_m, dtype=np.float32)
+            if grid.z_ground_m is not None and len(grid.z_ground_m) == point_count
+            else None
+        )
+        grid.set_channel_array("cell_lat", target_latitudes)
+        grid.set_channel_array("cell_lon", target_longitudes)
+        grid.set_channel_array("incident_power_isotropic_dbm", incident_values)
+        if target_ground is not None:
+            grid.set_channel_array("z_ground_m", target_ground)
+
+    # Keep communications coverage and target-height illumination distinct. ISAC
+    # fusion consumes the target-height field; communications layers retain their
+    # original receiver-height values.
+    grid.set_channel_array("isac_incident_power_isotropic_dbm", np.asarray(incident_values, dtype=np.float32))
+    if illumination_field is not None:
+        grid.set_channel_array("isac_tx_target_path_loss_db", np.asarray(illumination_field.path_loss_db, dtype=np.float32))
+        grid.set_channel_array("isac_tx_target_environment_loss_db", np.asarray(illumination_field.environment_loss_db, dtype=np.float32))
+        grid.set_channel_array("isac_tx_target_terrain_loss_db", np.asarray(illumination_field.terrain_loss_db, dtype=np.float32))
+        grid.set_channel_array("isac_tx_target_los", np.asarray(illumination_field.los, dtype=np.bool_))
+        grid.set_channel_array("isac_tx_target_sample_error_m", np.asarray(illumination_field.sample_error_m, dtype=np.float32))
+
+    field = compute_bistatic_field_arrays(
+        target_latitude_deg=target_latitudes,
+        target_longitude_deg=target_longitudes,
+        target_ground_m=target_ground,
+        incident_isotropic_power_dbm=incident_values,
         tx_latitude_deg=world.tx.lat,
         tx_longitude_deg=world.tx.lon,
         tx_altitude_m=tx_abs_m,
-        target_latitude_deg=lat,
-        target_longitude_deg=lon,
-        target_altitude_m=target_altitude,
-        receiver_latitude_deg=receiver.latitude,
-        receiver_longitude_deg=receiver.longitude,
-        receiver_altitude_m=receiver_abs_m,
-        target_motion=config.motion,
+        config=config,
         frequency_hz=frequency_hz,
+        waveform_bandwidth_hz=waveform_bandwidth_hz,
+        direct_received_power_dbm=direct_received_power_dbm,
+        residual_direct_power_dbm=residual_direct_power_dbm,
+        reciprocal_field=reciprocal_field,
     )
+    arrays = field.arrays
+    for name, values in arrays.mapping().items():
+        grid.set_channel_array(name, values)
 
-    if use_environment_lookup and hasattr(return_lookup, "sample_many"):
-        return_environment_excess_db, _, _, environment_valid = return_lookup.sample_many(
-            lat, lon
-        )
-        return_environment_excess_db = np.asarray(
-            return_environment_excess_db, dtype=np.float64
-        )
-        environment_valid = np.asarray(environment_valid, dtype=np.bool_)
-    elif use_environment_lookup:
-        sampled = [return_lookup.sample(float(a), float(b)) for a, b in zip(lat, lon, strict=True)]
-        return_environment_excess_db = np.fromiter(
-            (float(item[0]) for item in sampled), dtype=np.float64, count=point_count
-        )
-        environment_valid = np.fromiter(
-            (bool(item[3]) for item in sampled), dtype=np.bool_, count=point_count
-        )
+    if materialize_public_lists:
+        for name, values in arrays.mapping().items():
+            if name == "return_terrain_state_code":
+                continue
+            setattr(grid, name, values.tolist())
+        grid.return_terrain_state = [
+            terrain_state_label(v) for v in arrays.return_terrain_state_code.tolist()
+        ]
     else:
-        return_environment_excess_db = np.zeros(point_count, dtype=np.float64)
-        environment_valid = np.zeros(point_count, dtype=np.bool_)
-
-    target_receiver_range = np.asarray(
-        geometry["target_receiver_range_m"], dtype=np.float64
-    )
-    wavelength_m = SPEED_OF_LIGHT_M_S / max(float(frequency_hz), 1.0)
-    return_fspl_db = 20.0 * np.log10(
-        4.0 * math.pi * np.maximum(target_receiver_range, 1.0) / wavelength_m
-    )
-    return_loss_db = (
-        return_fspl_db
-        + return_environment_excess_db
-        + float(receiver.return_path_excess_loss_db)
-    )
-    scattering_term_db = (
-        10.0 * math.log10(max(float(target.bistatic_rcs_m2), 1.0e-18))
-        + 10.0 * math.log10(4.0 * math.pi)
-        - 20.0 * math.log10(wavelength_m)
-    )
-    echo_power = (
-        incident
-        - return_loss_db
-        + float(receiver.echo_antenna_gain_dbi)
-        - float(receiver.feeder_loss_db)
-        + scattering_term_db
-        - float(processing.system_loss_db)
-    )
-    pre_snr = echo_power - noise_power_dbm
-    post_snr = pre_snr + processing_gain_db - float(processing.processing_loss_db)
-    detection_margin = post_snr - float(processing.required_snr_db)
-    doppler = np.asarray(geometry["doppler_hz"], dtype=np.float64)
-    resolved = np.abs(doppler) >= doppler_detection_threshold_hz
-    if max_unambiguous_doppler_hz is None:
-        ambiguous = np.zeros(point_count, dtype=np.bool_)
-    else:
-        ambiguous = np.abs(doppler) > max_unambiguous_doppler_hz
-    detectable = (detection_margin >= 0.0) & resolved & ~ambiguous
-
-    quality = np.full(point_count, 5, dtype=np.uint8)
-    quality[(detection_margin >= 0.0) & resolved & ~ambiguous & (detection_margin < 15.0)] = 4
-    quality[(detection_margin >= 0.0) & resolved & ~ambiguous & (detection_margin < 6.0)] = 3
-    quality[(detection_margin >= 0.0) & resolved & ambiguous] = 2
-    quality[(detection_margin >= 0.0) & ~resolved] = 1
-    quality[detection_margin < 0.0] = 0
-
-    total_path_loss = tx_target_path_loss + return_loss_db
-    echo_to_residual = echo_power - residual_direct_power_dbm
-    required_dynamic_range = direct_received_power_dbm - echo_power
-
-    best_margin_index = int(np.nanargmax(detection_margin)) if point_count else None
-    detectable_indices = np.flatnonzero(detectable)
-    best_detectable_index = (
-        int(detectable_indices[np.argmax(detection_margin[detectable_indices])])
-        if detectable_indices.size
-        else None
-    )
-
-    quality_labels = {
-        0: "below_required_snr",
-        1: "doppler_unresolved",
-        2: "doppler_ambiguous",
-        3: "detectable_low_margin",
-        4: "detectable_moderate_margin",
-        5: "detectable_high_margin",
-    }
+        # Do not keep stale/duplicate large public lists if this grid is reused.
+        for name in arrays.mapping():
+            if name != "return_terrain_state_code" and hasattr(grid, name):
+                setattr(grid, name, None)
+        grid.return_terrain_state = None
 
     def point_payload(index: int | None) -> dict[str, Any] | None:
         if index is None:
             return None
         return {
             "index": index,
-            "latitude": float(lat[index]),
-            "longitude": float(lon[index]),
-            "incident_power_isotropic_dbm": float(incident[index]),
-            "tx_target_path_loss_db": float(tx_target_path_loss[index]),
-            "return_path_loss_db": float(return_loss_db[index]),
-            "return_environment_excess_db": float(return_environment_excess_db[index]),
-            "total_bistatic_path_loss_db": float(total_path_loss[index]),
-            "echo_power_dbm": float(echo_power[index]),
-            "preprocessing_snr_db": float(pre_snr[index]),
-            "postprocessing_snr_db": float(post_snr[index]),
-            "detection_margin_db": float(detection_margin[index]),
-            "echo_to_residual_direct_db": float(echo_to_residual[index]),
-            "required_dynamic_range_db": float(required_dynamic_range[index]),
-            "tx_target_range_m": float(geometry["tx_target_range_m"][index]),
-            "target_receiver_range_m": float(target_receiver_range[index]),
-            "bistatic_path_range_m": float(geometry["bistatic_path_range_m"][index]),
-            "excess_path_range_m": float(geometry["excess_path_range_m"][index]),
-            "excess_delay_s": float(geometry["excess_delay_s"][index]),
-            "bistatic_angle_deg": float(geometry["bistatic_angle_deg"][index]),
-            "path_range_rate_mps": float(geometry["path_range_rate_mps"][index]),
-            "closing_speed_mps": float(geometry["closing_speed_mps"][index]),
-            "doppler_hz": float(doppler[index]),
-            "doppler_resolved": bool(resolved[index]),
-            "doppler_ambiguous": bool(ambiguous[index]),
-            "detectable": bool(detectable[index]),
-            "isac_quality_code": int(quality[index]),
-            "isac_quality_label": quality_labels[int(quality[index])],
+            "latitude": float(target_latitudes[index]),
+            "longitude": float(target_longitudes[index]),
+            "incident_power_isotropic_dbm": float(incident_values[index]),
+            "tx_target_path_loss_db": (float(illumination_field.path_loss_db[index]) if illumination_field is not None else None),
+            "tx_target_environment_loss_db": (float(illumination_field.environment_loss_db[index]) if illumination_field is not None else None),
+            "tx_target_terrain_loss_db": (float(illumination_field.terrain_loss_db[index]) if illumination_field is not None else None),
+            "tx_target_los": (bool(illumination_field.los[index]) if illumination_field is not None else None),
+            "tx_target_sample_error_m": (float(illumination_field.sample_error_m[index]) if illumination_field is not None else None),
+            "echo_power_dbm": float(arrays.echo_power_dbm[index]),
+            "preprocessing_snr_db": float(arrays.preprocessing_snr_db[index]),
+            "postprocessing_snr_db": float(arrays.postprocessing_snr_db[index]),
+            "detection_margin_db": float(arrays.detection_margin_db[index]),
+            "tx_target_range_m": float(arrays.tx_target_range_m[index]),
+            "target_receiver_range_m": float(arrays.target_receiver_range_m[index]),
+            "bistatic_path_range_m": float(arrays.bistatic_path_range_m[index]),
+            "excess_path_range_m": float(arrays.excess_path_range_m[index]),
+            "excess_delay_s": float(arrays.excess_delay_s[index]),
+            "bistatic_angle_deg": float(arrays.bistatic_angle_deg[index]),
+            "path_range_rate_mps": float(arrays.path_range_rate_mps[index]),
+            "closing_speed_mps": float(arrays.closing_speed_mps[index]),
+            "doppler_hz": float(arrays.doppler_hz[index]),
+            "doppler_sensitivity_hz_per_mps": float(arrays.doppler_sensitivity_hz_per_mps[index]),
+            "motion_doppler_sensitivity_hz_per_mps": float(arrays.motion_doppler_sensitivity_hz_per_mps[index]),
+            "minimum_detectable_speed_mps": float(arrays.minimum_detectable_speed_mps[index]),
+            "doppler_resolved": bool(arrays.doppler_resolved[index]),
+            "doppler_ambiguous": bool(arrays.doppler_ambiguous[index]),
+            "snr_noise_interference_ok": bool(arrays.thermal_snr_ok[index]),
+            "direct_residual_margin_db": float(arrays.direct_residual_margin_db[index]),
+            "direct_residual_ok": bool(arrays.direct_residual_ok[index]),
+            "required_cancellation_db": float(arrays.required_cancellation_db[index]),
+            "required_dynamic_range_db": float(arrays.required_dynamic_range_db[index]),
+            "dynamic_range_margin_db": float(arrays.dynamic_range_margin_db[index]),
+            "dynamic_range_ok": bool(arrays.dynamic_range_ok[index]),
+            "minimum_detectable_rcs_m2": float(arrays.minimum_detectable_rcs_m2[index]),
+            "rcs_margin_db": float(arrays.rcs_margin_db[index]),
+            "return_environment_valid": bool(arrays.return_environment_valid[index]),
+            "detectable_screening": bool(arrays.detectable_screening[index]),
+            "detectable_qualified": bool(arrays.detectable_qualified[index]),
+            "detectable": bool(arrays.detectable[index]),
+            "constraint_failure_code": int(arrays.constraint_failure_code[index]),
+            "return_path_loss_db": float(arrays.return_path_loss_db[index]),
+            "return_environment_loss_db": float(arrays.return_environment_loss_db[index]),
+            "return_terrain_loss_db": float(arrays.return_terrain_loss_db[index]),
+            "return_los": bool(arrays.return_los[index]),
+            "return_terrain_state": terrain_state_label(arrays.return_terrain_state_code[index]),
+            "return_sample_error_m": float(arrays.return_sample_error_m[index]),
         }
 
-    def f32(values: Any) -> np.ndarray:
-        return np.asarray(values, dtype=np.float32)
-
-    grid.bistatic_echo_power_dbm = f32(echo_power)
-    grid.bistatic_preprocessing_snr_db = f32(pre_snr)
-    grid.bistatic_postprocessing_snr_db = f32(post_snr)
-    grid.bistatic_detection_margin_db = f32(detection_margin)
-    grid.bistatic_echo_to_residual_direct_db = f32(echo_to_residual)
-    grid.bistatic_required_dynamic_range_db = f32(required_dynamic_range)
-    grid.bistatic_tx_target_range_m = f32(geometry["tx_target_range_m"])
-    grid.bistatic_target_receiver_range_m = f32(target_receiver_range)
-    grid.bistatic_return_path_loss_db = f32(return_loss_db)
-    grid.bistatic_return_environment_excess_db = f32(return_environment_excess_db)
-    grid.bistatic_total_path_loss_db = f32(total_path_loss)
-    grid.bistatic_path_range_m = f32(geometry["bistatic_path_range_m"])
-    grid.bistatic_excess_path_range_m = f32(geometry["excess_path_range_m"])
-    grid.bistatic_excess_delay_s = f32(geometry["excess_delay_s"])
-    grid.bistatic_angle_deg = f32(geometry["bistatic_angle_deg"])
-    grid.bistatic_path_range_rate_mps = f32(geometry["path_range_rate_mps"])
-    grid.bistatic_closing_speed_mps = f32(geometry["closing_speed_mps"])
-    grid.bistatic_doppler_hz = f32(doppler)
-    grid.bistatic_doppler_resolved = resolved
-    grid.bistatic_doppler_ambiguous = ambiguous
-    grid.bistatic_detectable = detectable
-    grid.bistatic_isac_quality_code = quality
-
-    environment_samples_used = int(np.count_nonzero(environment_valid))
-    effective_return_model = (
-        "environmental_reciprocal_grid"
-        if use_environment_lookup and environment_samples_used > 0
-        else "free_space_plus_excess"
-    )
-    return_lookup_metadata = (
-        return_lookup.metadata()
-        if use_environment_lookup and hasattr(return_lookup, "metadata")
-        else None
-    )
-    quality_counts_raw = np.bincount(quality, minlength=6)
+    use_environment_return = field.return_path_model == "environment_reciprocal"
     grid.channel_analysis_summary = {
-        "schema_version": "2.1",
+        "schema_version": "2.0",
         "model": "waveform_agnostic_bistatic_channel",
         "technology": str(grid.technology),
         "waveform": str(grid.waveform or world.rf_params.waveform or "unknown"),
         "frequency_hz": frequency_hz,
         "waveform_bandwidth_hz": waveform_bandwidth_hz,
-        "processing_bandwidth_hz": processing_bandwidth_hz,
+        "processing_bandwidth_hz": field.processing_bandwidth_hz,
+        "thermal_noise_power_dbm": field.thermal_noise_power_dbm,
+        "interference_plus_clutter_power_dbm": field.interference_plus_clutter_power_dbm,
+        "effective_noise_plus_interference_dbm": field.noise_power_dbm,
+        "ideal_processing_gain_db": field.ideal_processing_gain_db,
+        "effective_processing_gain_db": field.processing_gain_db,
+        "processing_gain_source": field.processing_gain_source,
+        "processing_qualified": field.processing_qualified,
         "source_power_basis": "total_carrier_eirp",
-        "transmitter": {
-            "latitude": world.tx.lat,
-            "longitude": world.tx.lon,
-            "absolute_height_m": tx_abs_m,
+        "pipeline": {
+            "execution": "sequential_memory_bounded",
+            "stages": [
+                "physical_world", "communications_tx_field", "release_communications_world_cells",
+                "target_height_tx_field", "release_target_height_world_cells",
+                "rx_reciprocal_field", "direct_path_sample", "isac_scene_fusion",
+                "release_reciprocal_field", "render_and_export",
+            ],
+            "interactive_reanalysis": "reusable_scene_basis_O(N)_without_world_rebuild",
         },
         "receiver": receiver.model_dump(by_alias=True),
-        "target": target.model_dump(by_alias=True),
+        "target": config.target.model_dump(by_alias=True),
         "motion": config.motion.model_dump(by_alias=True),
-        "processing": processing.model_dump(by_alias=True),
+        "processing": config.processing.model_dump(by_alias=True),
+        "storage": {
+            "array_backed": not materialize_public_lists,
+            "float_dtype": "float32",
+            "coordinate_dtype": "float64",
+            "terrain_state_encoding": field.terrain_state_encoding,
+        },
         "direct_path": {
             "source_id": direct_source_id,
             "distance_m": direct_geometry.direct_tx_receiver_range_m,
@@ -1092,68 +1013,107 @@ def _apply_channel_analysis(
             "horizontal_pattern_loss_db": direct_h_loss_db,
             "vertical_pattern_loss_db": direct_v_loss_db,
             "free_space_path_loss_db": direct_fspl_db,
-            "environment_excess_loss_db": float(direct_environment_excess_db),
-            "environment_sample_valid": bool(direct_environment_valid),
+            "scenario_path_loss_db": direct_scenario_db,
+            "propagation_path_loss_db": direct_propagation_loss_db,
+            "model": direct_model,
+            "environment_loss_db": direct_environment_loss_db,
+            "terrain_loss_db": direct_terrain_loss_db,
+            "los": direct_los,
+            "sample_error_m": direct_sample_error_m,
+            "environment_sample_endpoint_height_note": (
+                "environment/terrain obstruction terms are sampled from the reciprocal lattice at candidate-target height; "
+                "the baseline scenario term is recomputed with actual TX/RX endpoint heights"
+                if use_environment_direct else None
+            ),
             "configured_excess_loss_db": float(receiver.direct_path_excess_loss_db),
-            "total_path_loss_db": direct_total_path_loss_db,
             "receiver_antenna_gain_dbi": float(receiver.direct_antenna_gain_dbi),
             "receiver_feeder_loss_db": float(receiver.feeder_loss_db),
             "received_power_dbm": direct_received_power_dbm,
-            "noise_power_dbm": noise_power_dbm,
-            "carrier_to_noise_db": direct_received_power_dbm - noise_power_dbm,
+            "thermal_noise_power_dbm": field.thermal_noise_power_dbm,
+            "interference_plus_clutter_power_dbm": field.interference_plus_clutter_power_dbm,
+            "effective_noise_plus_interference_dbm": field.noise_power_dbm,
+            "carrier_to_noise_db": direct_received_power_dbm - field.thermal_noise_power_dbm,
+            "carrier_to_noise_plus_interference_db": direct_received_power_dbm - field.noise_power_dbm,
             "residual_after_cancellation_dbm": residual_direct_power_dbm,
         },
         "resolution": {
-            "delay_resolution_s": delay_resolution_s,
-            "bistatic_path_resolution_m": bistatic_path_resolution_m,
-            "doppler_resolution_hz": doppler_resolution_hz,
-            "doppler_detection_threshold_hz": doppler_detection_threshold_hz,
-            "max_unambiguous_doppler_hz": max_unambiguous_doppler_hz,
+            "delay_resolution_s": field.delay_resolution_s,
+            "bistatic_path_resolution_m": field.bistatic_path_resolution_m,
+            "doppler_resolution_hz": field.doppler_resolution_hz,
+            "doppler_detection_threshold_hz": field.doppler_detection_threshold_hz,
+            "max_unambiguous_doppler_hz": field.max_unambiguous_doppler_hz,
             "max_unambiguous_path_rate_mps": (
-                SPEED_OF_LIGHT_M_S * max_unambiguous_doppler_hz / frequency_hz
-                if max_unambiguous_doppler_hz is not None
+                SPEED_OF_LIGHT_M_S * field.max_unambiguous_doppler_hz / frequency_hz
+                if field.max_unambiguous_doppler_hz is not None
                 else None
             ),
-            "return_path_environment": return_lookup_metadata,
         },
         "counts": {
             "grid_points": point_count,
-            "return_environment_samples_used": environment_samples_used,
-            "doppler_resolved_points": int(np.count_nonzero(resolved)),
-            "doppler_ambiguous_points": int(np.count_nonzero(ambiguous)),
-            "detectable_points": int(np.count_nonzero(detectable)),
-            "quality_counts": {
-                quality_labels[code]: int(quality_counts_raw[code])
-                for code in sorted(quality_labels)
-            },
+            "doppler_resolved_points": field.doppler_resolved_count,
+            "doppler_ambiguous_points": field.doppler_ambiguous_count,
+            "direct_residual_ok_points": field.direct_residual_ok_count,
+            "dynamic_range_ok_points": field.dynamic_range_ok_count,
+            "environment_return_valid_points": field.return_environment_valid_count,
+            "screening_detectable_points": field.screening_count,
+            "qualified_detectable_points": field.detectable_count,
+            "detectable_points": field.detectable_count,
         },
-        "isac_quality": {
-            "type": "planner_defined_categorical_quality",
-            "code_legend": {str(code): label for code, label in quality_labels.items()},
-            "margin_bands_db": {
-                "low": [0.0, 6.0],
-                "moderate": [6.0, 15.0],
-                "high": [15.0, None],
-            },
-            "note": "This is a deterministic status class, not probability of detection.",
+        "best_margin_point": point_payload(field.best_margin_index),
+        "best_screening_point": point_payload(field.best_screening_index),
+        "best_detectable_point": point_payload(field.best_detectable_index),
+        "tx_target_illumination": (dict(illumination_field.metadata) if illumination_field is not None else {
+            "model": "communications_receiver_height_field_fallback",
+            "target_height_m_agl": float(config.target.height_m_agl),
+        }),
+        "model_fidelity": {
+            "target_height_tx_environment_field": illumination_field is not None,
+            "target_to_rx_environment_field": use_environment_return,
+            "direct_path_exact_environment_ray": False,
+            "direct_path_environment_method": (
+                "reciprocal_lattice_sample_with_actual_endpoint_scenario_term"
+                if use_environment_direct else "free_space_plus_configured_excess"
+            ),
+            "building_clearance_model": "existing_2d_footprint_ray_with_provider_slice_height_when_available",
+            "note": (
+                "Terrain and endpoint heights are represented in the dedicated target-height and reciprocal solves; "
+                "the current building obstruction model is not a general 3D building-clearance ray tracer."
+            ),
         },
-        "best_margin_point": point_payload(best_margin_index),
-        "best_detectable_point": point_payload(best_detectable_index),
-        "requested_return_path_model": requested_return_model,
-        "return_path_model": effective_return_model,
+        "return_path_model": field.return_path_model,
+        "return_path": (
+            dict(reciprocal_field.metadata) if use_environment_return else {
+                "model": "free_space_plus_excess",
+                "fallback_reason": (
+                    "reciprocal field was not supplied"
+                    if str(config.return_path_model) == "environment_reciprocal"
+                    else None
+                ),
+            }
+        ),
         "assumptions": [
-            "transmitter-to-target power uses the active waveform's total-carrier environment-aware one-way propagation result",
             (
-                "target-to-receiver and direct paths use a receiver-centered OSM/terrain reciprocal polar lookup plus configured excess loss"
-                if effective_return_model == "environmental_reciprocal_grid"
-                else "target-to-receiver and direct paths use free-space loss plus configured excess loss because no environmental lookup was available"
+                "transmitter-to-target power uses a dedicated target-height environmental propagation field"
+                if illumination_field is not None
+                else "transmitter-to-target power falls back to the communications receiver-height one-way field"
+            ),
+            (
+                "target-to-receiver path uses an RX-centered reciprocal environmental propagation field plus configured excess loss"
+                if use_environment_return
+                else "target-to-receiver path uses free-space loss plus configured excess loss"
+            ),
+            (
+                "the direct transmitter-to-analysis-receiver baseline uses the RX-centered environmental sample plus the actual direct endpoint-height scenario term"
+                if use_environment_direct
+                else "the direct transmitter-to-analysis-receiver baseline uses free-space loss plus configured direct excess loss"
             ),
             "positive Doppler means the total transmitter-target-receiver path is shortening",
-            "detectable requires non-negative SNR margin, resolved Doppler, and no configured PRF ambiguity",
+            "Doppler sensitivity is exported as local ENU Hz/(m/s), so motion hypotheses can be changed without rebuilding propagation",
+            "screening detectability requires SNR, Doppler, direct-residual, optional dynamic-range, and requested environmental-return constraints",
+            "processing-qualified detectability requires explicit effectiveProcessingGainDb and, by default, an explicit interferencePlusClutterPowerDbm; otherwise results are screening-only",
         ],
     }
     return grid
-
 
 def _dvt_vertical_pattern_attenuation_db(
     *,
