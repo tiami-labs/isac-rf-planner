@@ -11,8 +11,6 @@ from the active RF configuration unless the processing bandwidth is overridden.
 from __future__ import annotations
 
 import math
-
-import numpy as np
 from dataclasses import dataclass
 from typing import Literal
 
@@ -106,6 +104,44 @@ class ChannelProcessing(BaseModel):
     system_loss_db: float = Field(3.0, alias="systemLossDb", ge=0.0)
     required_snr_db: float = Field(10.0, alias="requiredSnrDb")
     direct_path_cancellation_db: float = Field(60.0, alias="directPathCancellationDb", ge=0.0)
+    effective_processing_gain_db: float | None = Field(
+        None,
+        alias="effectiveProcessingGainDb",
+        ge=0.0,
+        description=(
+            "Measured/validated effective coherent processing gain. When omitted, "
+            "the planner may show ideal time-bandwidth screening results but does "
+            "not label them processing-qualified detectability."
+        ),
+    )
+    required_echo_to_residual_direct_db: float = Field(
+        0.0,
+        alias="requiredEchoToResidualDirectDb",
+        description="Required echo margin above the residual direct/reference signal.",
+    )
+    max_receiver_dynamic_range_db: float | None = Field(
+        None,
+        alias="maxReceiverDynamicRangeDb",
+        gt=0.0,
+        description="Optional simultaneous direct-to-echo dynamic-range capability.",
+    )
+    require_direct_path_constraint: bool = Field(
+        True, alias="requireDirectPathConstraint"
+    )
+    require_dynamic_range_constraint: bool = Field(
+        False, alias="requireDynamicRangeConstraint"
+    )
+    interference_plus_clutter_power_dbm: float | None = Field(
+        None,
+        alias="interferencePlusClutterPowerDbm",
+        description=(
+            "Measured or scenario-assumed aggregate in-band surveillance-channel "
+            "interference plus clutter power at the receiver input. Omit for thermal-only screening."
+        ),
+    )
+    require_interference_input_for_qualification: bool = Field(
+        True, alias="requireInterferenceInputForQualification"
+    )
     pulse_repetition_frequency_hz: float | None = Field(
         None,
         alias="pulseRepetitionFrequencyHz",
@@ -127,11 +163,12 @@ class ChannelAnalysisConfig(BaseModel):
     target: ChannelTarget = Field(default_factory=ChannelTarget)
     motion: TargetMotion = Field(default_factory=TargetMotion)
     processing: ChannelProcessing = Field(default_factory=ChannelProcessing)
-    return_path_model: Literal[
-        "environmental_reciprocal_grid",
-        "free_space_plus_excess",
-    ] = Field(
-        "environmental_reciprocal_grid", alias="returnPathModel"
+    return_path_model: Literal["environment_reciprocal", "free_space_plus_excess"] = Field(
+        "environment_reciprocal", alias="returnPathModel"
+    )
+    return_path_resolution_m: float = Field(
+        50.0, alias="returnPathResolutionM", ge=5.0, le=1000.0,
+        description="RX-centered environmental propagation lattice spacing before resampling to target points.",
     )
 
 
@@ -329,105 +366,3 @@ def bistatic_geometry(
         closing_speed_mps=closing_speed_mps,
         doppler_hz=doppler_hz,
     )
-
-
-def bistatic_geometry_arrays(
-    *,
-    tx_latitude_deg: float,
-    tx_longitude_deg: float,
-    tx_altitude_m: float,
-    target_latitude_deg: np.ndarray,
-    target_longitude_deg: np.ndarray,
-    target_altitude_m: np.ndarray,
-    receiver_latitude_deg: float,
-    receiver_longitude_deg: float,
-    receiver_altitude_m: float,
-    target_motion: TargetMotion,
-    frequency_hz: float,
-) -> dict[str, np.ndarray | float]:
-    """Vectorized equivalent of :func:`bistatic_geometry`.
-
-    All per-target outputs use float64 during geometry evaluation so the result
-    matches the scalar WGS-84 implementation while avoiding millions of Python
-    function calls.
-    """
-
-    lat = np.asarray(target_latitude_deg, dtype=np.float64)
-    lon = np.asarray(target_longitude_deg, dtype=np.float64)
-    alt = np.asarray(target_altitude_m, dtype=np.float64)
-    if lat.shape != lon.shape or lat.shape != alt.shape:
-        raise ValueError("target latitude, longitude, and altitude arrays must have matching shapes")
-
-    def ecef_many(lat_deg: np.ndarray, lon_deg: np.ndarray, altitude_m: np.ndarray) -> np.ndarray:
-        lat_rad = np.deg2rad(lat_deg)
-        lon_rad = np.deg2rad(lon_deg)
-        sin_lat = np.sin(lat_rad)
-        cos_lat = np.cos(lat_rad)
-        n = WGS84_A_M / np.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
-        x = (n + altitude_m) * cos_lat * np.cos(lon_rad)
-        y = (n + altitude_m) * cos_lat * np.sin(lon_rad)
-        z = (n * (1.0 - WGS84_E2) + altitude_m) * sin_lat
-        return np.column_stack((x, y, z))
-
-    tx = np.asarray(geodetic_to_ecef_m(tx_latitude_deg, tx_longitude_deg, tx_altitude_m), dtype=np.float64)
-    receiver = np.asarray(
-        geodetic_to_ecef_m(receiver_latitude_deg, receiver_longitude_deg, receiver_altitude_m),
-        dtype=np.float64,
-    )
-    target = ecef_many(lat, lon, alt)
-
-    tx_to_target = target - tx
-    receiver_to_target = target - receiver
-    target_to_tx = -tx_to_target
-    target_to_receiver = -receiver_to_target
-
-    r_tx_target = np.linalg.norm(tx_to_target, axis=1)
-    r_target_receiver = np.linalg.norm(target_to_receiver, axis=1)
-    direct_range = float(np.linalg.norm(receiver - tx))
-    safe_tx = np.maximum(r_tx_target, 1.0e-12)
-    safe_rx = np.maximum(r_target_receiver, 1.0e-12)
-    u_tx_to_target = tx_to_target / safe_tx[:, None]
-    u_receiver_to_target = receiver_to_target / safe_rx[:, None]
-    u_target_to_tx = target_to_tx / safe_tx[:, None]
-    u_target_to_receiver = target_to_receiver / safe_rx[:, None]
-
-    cos_beta = np.clip(np.einsum("ij,ij->i", u_target_to_tx, u_target_to_receiver), -1.0, 1.0)
-    beta_deg = np.rad2deg(np.arccos(cos_beta))
-
-    heading = math.radians(float(target_motion.heading_deg_true))
-    east = float(target_motion.speed_mps) * math.sin(heading)
-    north = float(target_motion.speed_mps) * math.cos(heading)
-    up = float(target_motion.climb_rate_mps)
-    lat_rad = np.deg2rad(lat)
-    lon_rad = np.deg2rad(lon)
-    sin_lat = np.sin(lat_rad)
-    cos_lat = np.cos(lat_rad)
-    sin_lon = np.sin(lon_rad)
-    cos_lon = np.cos(lon_rad)
-    velocity = np.column_stack(
-        (
-            -sin_lon * east - sin_lat * cos_lon * north + cos_lat * cos_lon * up,
-            cos_lon * east - sin_lat * sin_lon * north + cos_lat * sin_lon * up,
-            cos_lat * north + sin_lat * up,
-        )
-    )
-    path_rate = np.einsum(
-        "ij,ij->i", velocity, u_tx_to_target + u_receiver_to_target
-    )
-    bistatic_path = r_tx_target + r_target_receiver
-    excess_path = bistatic_path - direct_range
-    doppler = -(float(frequency_hz) / SPEED_OF_LIGHT_M_S) * path_rate
-
-    return {
-        "tx_target_range_m": r_tx_target,
-        "target_receiver_range_m": r_target_receiver,
-        "direct_tx_receiver_range_m": direct_range,
-        "bistatic_path_range_m": bistatic_path,
-        "excess_path_range_m": excess_path,
-        "total_delay_s": bistatic_path / SPEED_OF_LIGHT_M_S,
-        "excess_delay_s": excess_path / SPEED_OF_LIGHT_M_S,
-        "bistatic_angle_deg": beta_deg,
-        "path_range_rate_mps": path_rate,
-        "closing_speed_mps": -path_rate,
-        "doppler_hz": doppler,
-    }
