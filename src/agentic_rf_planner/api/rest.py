@@ -24,7 +24,8 @@ from ..config import load_rf_config
 from ..pipeline.schemas import RFParams, LatLon
 from ..rf.dvt import DVTTransmitter
 from ..rf.channel_analysis import ChannelAnalysisConfig
-from ..rf.channel_products import channel_product_path, get_cached_channel_product
+from ..rf.channel_products import channel_product_path, probe_channel_product
+from ..rf.isac_reanalysis import evaluate_channel_product, evaluate_channel_product_bundle, SUPPORTED_LAYERS as ISAC_REANALYSIS_LAYERS
 from ..agents.rf_planning_agent import run_rf_planning_for_point
 
 from ..geo.google_mesh import RayProfileSet, MeshProfileStore, PROFILE_VERSION
@@ -2768,88 +2769,95 @@ async def clear_cache(req: Request) -> Dict[str, Any]:
     return result
 
 
-@app.get("/api/channel-analysis/products/{product_id}/nearest")
-async def inspect_channel_analysis_target(
-    product_id: str,
-    lat: float,
-    lon: float,
-):
-    """Return all stored metrics for the grid point nearest a clicked target location."""
+class ISACReanalysisRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    import numpy as np
+    receiver: Optional[Dict[str, Any]] = None
+    target: Optional[Dict[str, Any]] = None
+    motion: Optional[Dict[str, Any]] = None
+    processing: Optional[Dict[str, Any]] = None
+    layer: str = "qualified_detectable"
+    selected_latitude: Optional[float] = Field(None, alias="selectedLatitude", ge=-90.0, le=90.0)
+    selected_longitude: Optional[float] = Field(None, alias="selectedLongitude", ge=-180.0, le=180.0)
+    image_size: int = Field(1024, alias="imageSize", ge=256, le=1536)
 
-    cached = get_cached_channel_product(product_id)
-    source = "memory" if cached is not None else "npz"
-    if cached is not None:
-        arrays = cached.get("arrays", {})
-        metadata = cached.get("metadata", {})
-        latitude = np.asarray(arrays.get("latitude_deg"), dtype=np.float64)
-        longitude = np.asarray(arrays.get("longitude_deg"), dtype=np.float64)
-        array_items = list(arrays.items())
-    else:
-        path = channel_product_path(product_id)
-        if path is None or not path.is_file():
-            raise HTTPException(status_code=404, detail="Channel-analysis product not found")
-        with np.load(path, allow_pickle=False) as product:
-            if "latitude_deg" not in product or "longitude_deg" not in product:
-                raise HTTPException(status_code=422, detail="Channel product has no location arrays")
-            latitude = np.asarray(product["latitude_deg"], dtype=np.float64)
-            longitude = np.asarray(product["longitude_deg"], dtype=np.float64)
-            metadata = {}
-            if "metadata_json" in product:
-                try:
-                    metadata = json.loads(str(product["metadata_json"].item()))
-                except Exception:
-                    metadata = {}
-            # Load once on the restart fallback path. Normal UI inspection uses
-            # the bounded in-memory product cache populated during plan export.
-            array_items = [
-                (name, np.asarray(product[name]))
-                for name in product.files
-                if name != "metadata_json"
-            ]
 
-    if latitude.size == 0 or longitude.size != latitude.size:
-        raise HTTPException(status_code=422, detail="Channel product location arrays are invalid")
-    cos_lat = max(abs(float(np.cos(np.deg2rad(float(lat))))), 1.0e-6)
-    distance2 = (latitude - float(lat)) ** 2 + ((longitude - float(lon)) * cos_lat) ** 2
-    index = int(np.nanargmin(distance2))
+@app.post("/api/channel-analysis/products/{product_id}/evaluate")
+async def evaluate_channel_analysis_product(product_id: str, req: ISACReanalysisRequest):
+    """Reevaluate RCS/motion/processing against the persisted physical ISAC scene."""
 
-    metrics: Dict[str, Any] = {}
-    for name, raw in array_items:
-        arr = np.asarray(raw)
-        if arr.ndim != 1 or arr.shape[0] != latitude.shape[0]:
-            continue
-        value = arr[index]
-        if isinstance(value, np.generic):
-            value = value.item()
-        if isinstance(value, float) and not np.isfinite(value):
-            value = None
-        metrics[name] = value
+    if req.layer not in ISAC_REANALYSIS_LAYERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported ISAC layer: {req.layer}")
+    try:
+        return evaluate_channel_product(
+            product_id,
+            receiver_override=req.receiver,
+            target_override=req.target,
+            motion_override=req.motion,
+            processing_override=req.processing,
+            layer=req.layer,
+            selected_latitude=req.selected_latitude,
+            selected_longitude=req.selected_longitude,
+            image_size=req.image_size,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Channel-analysis product not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    summary = metadata.get("summary", {}) if isinstance(metadata, dict) else {}
-    transmitter = summary.get("transmitter") or {}
-    receiver = summary.get("receiver") or {}
-    quality_legend = ((summary.get("isac_quality") or {}).get("code_legend") or {})
-    quality_code = metrics.get("isac_quality_code")
-    quality_label = quality_legend.get(str(quality_code)) if quality_code is not None else None
-    return {
-        "product_id": product_id,
-        "inspection_source": source,
-        "index": index,
-        "requested_location": {"latitude": float(lat), "longitude": float(lon)},
-        "target": {
-            "latitude": float(latitude[index]),
-            "longitude": float(longitude[index]),
-            "isac_quality_label": quality_label,
-        },
-        "transmitter": transmitter,
-        "receiver": receiver,
-        "metrics": metrics,
-        "array_units": metadata.get("array_units", {}) if isinstance(metadata, dict) else {},
-        "quality_legend": quality_legend,
-        "return_path_model": summary.get("return_path_model"),
-    }
+
+
+
+class ISACBundleReanalysisRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    receiver: Optional[Dict[str, Any]] = None
+    target: Optional[Dict[str, Any]] = None
+    motion: Optional[Dict[str, Any]] = None
+    processing: Optional[Dict[str, Any]] = None
+    layers: list[str] = Field(default_factory=lambda: [
+        "bistatic_echo", "bistatic_snr", "bistatic_margin", "rcs_margin",
+        "minimum_detectable_rcs", "bistatic_doppler", "doppler_sensitivity",
+        "minimum_detectable_speed", "required_cancellation", "direct_residual_margin",
+        "static_clutter_delay_separation", "static_clutter_overlap", "static_clutter_path_count",
+        "screening_detectable", "qualified_detectable",
+    ])
+    image_size: int = Field(1024, alias="imageSize", ge=256, le=1536)
+
+
+@app.post("/api/channel-analysis/products/{product_id}/evaluate-bundle")
+async def evaluate_channel_analysis_product_bundle(product_id: str, req: ISACBundleReanalysisRequest):
+    """Render a complete current-hypothesis ISAC capability bundle in one scene read."""
+
+    invalid = [name for name in req.layers if name not in ISAC_REANALYSIS_LAYERS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unsupported ISAC layer(s): {', '.join(invalid)}")
+    try:
+        return evaluate_channel_product_bundle(
+            product_id,
+            receiver_override=req.receiver,
+            target_override=req.target,
+            motion_override=req.motion,
+            processing_override=req.processing,
+            layers=req.layers,
+            image_size=req.image_size,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Channel-analysis product not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/channel-analysis/products/{product_id}/probe")
+async def probe_channel_analysis_product(product_id: str, lat: float, lon: float):
+    """Probe the nearest candidate target in a persisted ISAC/channel grid."""
+
+    if not (-90.0 <= float(lat) <= 90.0 and -180.0 <= float(lon) <= 180.0):
+        raise HTTPException(status_code=400, detail="Invalid probe latitude/longitude")
+    payload = probe_channel_product(product_id, latitude=float(lat), longitude=float(lon))
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Channel-analysis product not found")
+    return payload
 
 
 @app.get("/api/channel-analysis/products/{product_id}")
