@@ -4,9 +4,6 @@ import base64
 import io
 import logging
 import math
-import os
-from time import perf_counter
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
@@ -28,28 +25,14 @@ from ..vision.materials_extraction import return_static_material
 from ..vision.models.base_vlm import BaseVLM
 from ..pipeline.world_builder import build_world_model
 from ..rf.attenuation_models import apply_channel_analysis, compute_attenuation_grid
+from ..rf.reciprocal_propagation import build_reciprocal_propagation_field, build_target_illumination_field
 from ..rf.channel_products import write_channel_product
-from ..rf.channel_environment import lookup_from_world, return_path_rf_params
-from ..geo.google_mesh.utils import haversine_m
+from ..rf.background_scatter import build_static_background_channel, attach_static_background_summary
+from ..rf.channel_arrays import LARGE_ARRAY_THRESHOLD_POINTS
 from ..rf.sector_config import SectorConfig, create_omnidirectional_sector
-from ..geo.heatmap import EllipseRasterizer
+from ..geo.heatmap import attenuation_grid_to_png_ellipse, prepare_ellipse_heatmap_geometry
 
 logger = logging.getLogger(__name__)
-
-
-def _current_rss_mb() -> float | None:
-    """Return current process resident memory on Linux without extra dependencies."""
-
-    try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
-        return resident_pages * page_size / (1024.0 * 1024.0)
-    except Exception:
-        return None
-
-
-def _has_values(values: Any) -> bool:
-    return values is not None and len(values) > 0
 
 
 def _osm_buildings_for_client_from_map_provider(map_provider: Any) -> Optional[Dict[str, Any]]:
@@ -62,7 +45,10 @@ def _osm_buildings_for_client_from_map_provider(map_provider: Any) -> Optional[D
         osm = inner
     if not isinstance(osm, OSMMapProvider):
         return None
-    buildings = list(getattr(osm, "_cached_buildings", None) or [])
+    # Do not duplicate the potentially very large cached-building reference list.
+    # The response builder either consumes this cache directly or omits it for
+    # large compact plans.
+    buildings = getattr(osm, "_cached_buildings", None) or []
     if not buildings:
         return None
     cc = getattr(osm, "_cache_center", None)
@@ -85,119 +71,233 @@ def _is_dvt(rf_params: RFParams) -> bool:
     return str(getattr(rf_params, "technology", "") or "").strip().lower() == "dvt"
 
 
-def _channel_product_arrays(grid: AttenuationGrid) -> Dict[str, Any]:
-    """Return the complete per-point RF, environment and bistatic data product."""
+def _grid_series(grid: AttenuationGrid, name: str) -> Any:
+    """Read a numerical layer from compact internal storage or its public field."""
 
-    arrays: Dict[str, Any] = {
-        "latitude_deg": grid.cell_lat,
-        "longitude_deg": grid.cell_lon,
-        "ground_elevation_m_amsl": grid.z_ground_m,
-        "terrain_loss_db": grid.terrain_loss_db,
-        "terrain_los": grid.los_terrain,
-        "terrain_state": grid.terrain_state,
-        "rsrp_dbm": grid.rsrp_dbm,
-        "sinr_db": grid.sinr_db,
-        "received_power_dbm": grid.received_power_dbm,
-        "field_strength_dbuv_m": grid.field_strength_dbuv_m,
-        "carrier_to_noise_db": grid.carrier_to_noise_db,
-        "modulation": grid.modulation,
-        "throughput_mbps": grid.throughput_mbps,
-        "serving_sector_id": grid.serving_sector_id,
-        "interferer_count": grid.interferer_count,
-        "top_interferer_rsrp_dbm": grid.top_interferer_rsrp_dbm,
-        "pilot_pollution_metric_db": grid.pilot_pollution_metric_db,
-        "source_eirp_at_target_dbm": grid.source_eirp_at_target_dbm,
-        "incident_isotropic_power_dbm": grid.incident_power_isotropic_dbm,
-        "tx_target_path_loss_db": grid.tx_target_path_loss_db,
-        "tx_target_environment_excess_db": grid.tx_target_environment_excess_db,
-        "tx_target_penetration_loss_db": grid.tx_target_penetration_loss_db,
-        "tx_target_shadow_loss_db": grid.tx_target_shadow_loss_db,
-        "tx_target_diffraction_loss_db": grid.tx_target_diffraction_loss_db,
-        "tx_target_canyon_recovery_db": grid.tx_target_canyon_recovery_db,
-        "tx_target_horizontal_pattern_loss_db": grid.tx_target_horizontal_pattern_loss_db,
-        "tx_target_vertical_pattern_loss_db": grid.tx_target_vertical_pattern_loss_db,
-        "tx_target_obstacles_count": grid.tx_target_obstacles_count,
-        "tx_target_propagation_mode": grid.tx_target_propagation_mode,
-        "echo_power_dbm": grid.bistatic_echo_power_dbm,
-        "preprocessing_snr_db": grid.bistatic_preprocessing_snr_db,
-        "postprocessing_snr_db": grid.bistatic_postprocessing_snr_db,
-        "detection_margin_db": grid.bistatic_detection_margin_db,
-        "echo_to_residual_direct_db": grid.bistatic_echo_to_residual_direct_db,
-        "required_dynamic_range_db": grid.bistatic_required_dynamic_range_db,
-        "tx_target_range_m": grid.bistatic_tx_target_range_m,
-        "target_receiver_range_m": grid.bistatic_target_receiver_range_m,
-        "return_path_loss_db": grid.bistatic_return_path_loss_db,
-        "return_environment_excess_db": grid.bistatic_return_environment_excess_db,
-        "total_bistatic_path_loss_db": grid.bistatic_total_path_loss_db,
-        "bistatic_path_range_m": grid.bistatic_path_range_m,
-        "excess_path_range_m": grid.bistatic_excess_path_range_m,
-        "excess_delay_s": grid.bistatic_excess_delay_s,
-        "bistatic_angle_deg": grid.bistatic_angle_deg,
-        "path_range_rate_mps": grid.bistatic_path_range_rate_mps,
-        "closing_speed_mps": grid.bistatic_closing_speed_mps,
-        "doppler_hz": grid.bistatic_doppler_hz,
-        "doppler_resolved": grid.bistatic_doppler_resolved,
-        "doppler_ambiguous": grid.bistatic_doppler_ambiguous,
-        "detectable": grid.bistatic_detectable,
-        "isac_quality_code": grid.bistatic_isac_quality_code,
+    return grid.channel_array(name)
+
+
+def _has_series(values: Any) -> bool:
+    return values is not None and len(values) > 0
+
+
+def _grid_point_count(grid: AttenuationGrid) -> int:
+    values = _grid_series(grid, "cell_lat")
+    return len(values) if values is not None else 0
+
+
+def _compact_internal_grid_storage(grid: AttenuationGrid) -> None:
+    """Move large solver lists into compact arrays and release Python containers.
+
+    The API already compacts large DVT/ISAC responses, so retaining millions of
+    Python float/bool/string objects after attenuation only increases peak memory.
+    Aliased DVT layers reuse the same ndarray instead of being copied twice.
+    """
+
+    float64_fields = {"cell_lat", "cell_lon"}
+    bool_fields = {"los_terrain"}
+    numeric_fields = (
+        "cell_lat", "cell_lon", "rsrp_dbm", "sinr_db", "received_power_dbm",
+        "field_strength_dbuv_m", "carrier_to_noise_db", "incident_power_isotropic_dbm",
+        "terrain_loss_db", "z_ground_m",
+    )
+    array_by_source_id: dict[int, np.ndarray] = {}
+    for name in (*numeric_fields, *bool_fields):
+        current = grid.channel_array(name)
+        if not _has_series(current):
+            continue
+        source_id = id(current)
+        arr = array_by_source_id.get(source_id)
+        if arr is None:
+            dtype = np.float64 if name in float64_fields else np.bool_ if name in bool_fields else np.float32
+            arr = np.asarray(current, dtype=dtype)
+            array_by_source_id[source_id] = arr
+        grid.set_channel_array(name, arr)
+
+    # Replace, do not mutate, because DVT aliases can point to the same source list.
+    required_list_fields = {
+        "cell_lat", "cell_lon", "rsrp_dbm", "sinr_db", "modulation",
+        "throughput_mbps", "serving_sector_id", "interferer_count",
+        "top_interferer_rsrp_dbm", "pilot_pollution_metric_db",
     }
-    if grid.rsrp_by_sector:
-        for sector_id, values in grid.rsrp_by_sector.items():
-            safe = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(sector_id))
-            arrays[f"rsrp_by_sector__{safe}"] = values
-    return arrays
+    for name in (
+        *numeric_fields,
+        *bool_fields,
+        "terrain_state", "modulation", "throughput_mbps", "serving_sector_id",
+        "interferer_count", "top_interferer_rsrp_dbm", "pilot_pollution_metric_db",
+    ):
+        if hasattr(grid, name):
+            setattr(grid, name, [] if name in required_list_fields else None)
 
 
-def _build_channel_return_path_lookup(
-    *,
-    forward_world: WorldModel,
-    map_provider: Any,
-    terrain_provider: Any,
-    progress: Callable[[str, str], None],
-) -> Any:
-    """Build the environment-aware target-to-receiver reciprocal lookup."""
+def _channel_product_arrays(grid: AttenuationGrid) -> Dict[str, Any]:
+    """Return stable, documented per-target arrays for the NPZ data product."""
 
-    config = getattr(forward_world.rf_params, "channel_analysis", None)
-    if config is None or str(config.return_path_model) != "environmental_reciprocal_grid":
-        return None
-    receiver = config.receiver
-    receiver_point = LatLon(lat=float(receiver.latitude), lon=float(receiver.longitude))
-    direct_distance_m = float(haversine_m(forward_world.tx, receiver_point))
-    max_return_range_m = (
-        direct_distance_m
-        + float(forward_world.rf_params.max_range_m)
-        + 50.0
+    return {
+        "latitude_deg": _grid_series(grid, "cell_lat"),
+        "longitude_deg": _grid_series(grid, "cell_lon"),
+        # Primary one-way communication / illumination field.
+        "rsrp_dbm": _grid_series(grid, "rsrp_dbm") if grid.technology != "dvt" else None,
+        "sinr_db": _grid_series(grid, "sinr_db") if grid.technology != "dvt" else None,
+        "received_power_dbm": _grid_series(grid, "received_power_dbm"),
+        "field_strength_dbuv_m": _grid_series(grid, "field_strength_dbuv_m"),
+        "carrier_to_noise_db": _grid_series(grid, "carrier_to_noise_db"),
+        "tx_terrain_loss_db": _grid_series(grid, "terrain_loss_db"),
+        "tx_los_terrain": _grid_series(grid, "los_terrain"),
+        "z_ground_m": _grid_series(grid, "z_ground_m"),
+        "incident_isotropic_power_dbm": (
+            _grid_series(grid, "isac_incident_power_isotropic_dbm")
+            if _grid_series(grid, "isac_incident_power_isotropic_dbm") is not None
+            else _grid_series(grid, "incident_power_isotropic_dbm")
+        ),
+        "tx_target_path_loss_db": _grid_series(grid, "isac_tx_target_path_loss_db"),
+        "tx_target_environment_loss_db": _grid_series(grid, "isac_tx_target_environment_loss_db"),
+        "tx_target_terrain_loss_db": _grid_series(grid, "isac_tx_target_terrain_loss_db"),
+        "tx_target_los": _grid_series(grid, "isac_tx_target_los"),
+        "tx_target_sample_error_m": _grid_series(grid, "isac_tx_target_sample_error_m"),
+        # Reusable ISAC scene basis: target RCS/motion/processing changes do not
+        # require rebuilding OSM/terrain/propagation.
+        "echo_geometry_base_dbm": _grid_series(grid, "isac_echo_geometry_base_dbm"),
+        "doppler_east_hz_per_mps": _grid_series(grid, "bistatic_doppler_east_hz_per_mps"),
+        "doppler_north_hz_per_mps": _grid_series(grid, "bistatic_doppler_north_hz_per_mps"),
+        "doppler_up_hz_per_mps": _grid_series(grid, "bistatic_doppler_up_hz_per_mps"),
+        "doppler_sensitivity_hz_per_mps": _grid_series(grid, "bistatic_doppler_sensitivity_hz_per_mps"),
+        "motion_doppler_sensitivity_hz_per_mps": _grid_series(grid, "bistatic_motion_doppler_sensitivity_hz_per_mps"),
+        "minimum_detectable_speed_mps": _grid_series(grid, "bistatic_minimum_detectable_speed_mps"),
+        "echo_power_dbm": _grid_series(grid, "bistatic_echo_power_dbm"),
+        "preprocessing_snr_db": _grid_series(grid, "bistatic_preprocessing_snr_db"),
+        "postprocessing_snr_db": _grid_series(grid, "bistatic_postprocessing_snr_db"),
+        "detection_margin_db": _grid_series(grid, "bistatic_detection_margin_db"),
+        "echo_to_residual_direct_db": _grid_series(grid, "bistatic_echo_to_residual_direct_db"),
+        "direct_residual_margin_db": _grid_series(grid, "bistatic_direct_residual_margin_db"),
+        "required_cancellation_db": _grid_series(grid, "bistatic_required_cancellation_db"),
+        "required_dynamic_range_db": _grid_series(grid, "bistatic_required_dynamic_range_db"),
+        "dynamic_range_margin_db": _grid_series(grid, "bistatic_dynamic_range_margin_db"),
+        "minimum_detectable_rcs_m2": _grid_series(grid, "bistatic_minimum_detectable_rcs_m2"),
+        "rcs_margin_db": _grid_series(grid, "bistatic_rcs_margin_db"),
+        "tx_target_range_m": _grid_series(grid, "bistatic_tx_target_range_m"),
+        "target_receiver_range_m": _grid_series(grid, "bistatic_target_receiver_range_m"),
+        "bistatic_path_range_m": _grid_series(grid, "bistatic_path_range_m"),
+        "excess_path_range_m": _grid_series(grid, "bistatic_excess_path_range_m"),
+        "excess_delay_s": _grid_series(grid, "bistatic_excess_delay_s"),
+        "bistatic_angle_deg": _grid_series(grid, "bistatic_angle_deg"),
+        "path_range_rate_mps": _grid_series(grid, "bistatic_path_range_rate_mps"),
+        "closing_speed_mps": _grid_series(grid, "bistatic_closing_speed_mps"),
+        "doppler_hz": _grid_series(grid, "bistatic_doppler_hz"),
+        "snr_noise_interference_ok": _grid_series(grid, "bistatic_snr_noise_interference_ok"),
+        "doppler_resolved": _grid_series(grid, "bistatic_doppler_resolved"),
+        "doppler_ambiguous": _grid_series(grid, "bistatic_doppler_ambiguous"),
+        "direct_residual_ok": _grid_series(grid, "bistatic_direct_residual_ok"),
+        "dynamic_range_ok": _grid_series(grid, "bistatic_dynamic_range_ok"),
+        "return_environment_valid": _grid_series(grid, "return_environment_valid"),
+        "detectable_screening": _grid_series(grid, "bistatic_detectable_screening"),
+        "detectable_qualified": _grid_series(grid, "bistatic_detectable_qualified"),
+        "detectable": _grid_series(grid, "bistatic_detectable"),
+        "constraint_failure_code": _grid_series(grid, "bistatic_constraint_failure_code"),
+        "return_path_loss_db": _grid_series(grid, "return_path_loss_db"),
+        "return_environment_loss_db": _grid_series(grid, "return_environment_loss_db"),
+        "return_terrain_loss_db": _grid_series(grid, "return_terrain_loss_db"),
+        "return_los": _grid_series(grid, "return_los"),
+        "return_terrain_state_code": _grid_series(grid, "return_terrain_state_code"),
+        "return_sample_error_m": _grid_series(grid, "return_sample_error_m"),
+    }
+
+
+def _iter_channel_product_arrays(grid: AttenuationGrid, *, release_after_write: bool = False):
+    """Yield NPZ members in the historical order without retaining a second ref table.
+
+    When ``release_after_write`` is true, each private solver array is removed from
+    the grid only after the writer resumes the generator, i.e. after that member has
+    been fully encoded. This keeps the external NPZ schema/values unchanged while
+    making export a consuming final stage for compact large plans.
+    """
+
+    is_dvt = grid.technology == "dvt"
+    specs = (
+        ("latitude_deg", "cell_lat", True),
+        ("longitude_deg", "cell_lon", True),
+        ("rsrp_dbm", "rsrp_dbm", not is_dvt),
+        ("sinr_db", "sinr_db", not is_dvt),
+        ("received_power_dbm", "received_power_dbm", True),
+        ("field_strength_dbuv_m", "field_strength_dbuv_m", True),
+        ("carrier_to_noise_db", "carrier_to_noise_db", True),
+        ("tx_terrain_loss_db", "terrain_loss_db", True),
+        ("tx_los_terrain", "los_terrain", True),
+        ("z_ground_m", "z_ground_m", True),
+        ("tx_target_path_loss_db", "isac_tx_target_path_loss_db", True),
+        ("tx_target_environment_loss_db", "isac_tx_target_environment_loss_db", True),
+        ("tx_target_terrain_loss_db", "isac_tx_target_terrain_loss_db", True),
+        ("tx_target_los", "isac_tx_target_los", True),
+        ("tx_target_sample_error_m", "isac_tx_target_sample_error_m", True),
+        ("echo_geometry_base_dbm", "isac_echo_geometry_base_dbm", True),
+        ("doppler_east_hz_per_mps", "bistatic_doppler_east_hz_per_mps", True),
+        ("doppler_north_hz_per_mps", "bistatic_doppler_north_hz_per_mps", True),
+        ("doppler_up_hz_per_mps", "bistatic_doppler_up_hz_per_mps", True),
+        ("doppler_sensitivity_hz_per_mps", "bistatic_doppler_sensitivity_hz_per_mps", True),
+        ("motion_doppler_sensitivity_hz_per_mps", "bistatic_motion_doppler_sensitivity_hz_per_mps", True),
+        ("minimum_detectable_speed_mps", "bistatic_minimum_detectable_speed_mps", True),
+        ("echo_power_dbm", "bistatic_echo_power_dbm", True),
+        ("preprocessing_snr_db", "bistatic_preprocessing_snr_db", True),
+        ("postprocessing_snr_db", "bistatic_postprocessing_snr_db", True),
+        ("detection_margin_db", "bistatic_detection_margin_db", True),
+        ("echo_to_residual_direct_db", "bistatic_echo_to_residual_direct_db", True),
+        ("direct_residual_margin_db", "bistatic_direct_residual_margin_db", True),
+        ("required_cancellation_db", "bistatic_required_cancellation_db", True),
+        ("required_dynamic_range_db", "bistatic_required_dynamic_range_db", True),
+        ("dynamic_range_margin_db", "bistatic_dynamic_range_margin_db", True),
+        ("minimum_detectable_rcs_m2", "bistatic_minimum_detectable_rcs_m2", True),
+        ("rcs_margin_db", "bistatic_rcs_margin_db", True),
+        ("tx_target_range_m", "bistatic_tx_target_range_m", True),
+        ("target_receiver_range_m", "bistatic_target_receiver_range_m", True),
+        ("bistatic_path_range_m", "bistatic_path_range_m", True),
+        ("excess_path_range_m", "bistatic_excess_path_range_m", True),
+        ("excess_delay_s", "bistatic_excess_delay_s", True),
+        ("bistatic_angle_deg", "bistatic_angle_deg", True),
+        ("path_range_rate_mps", "bistatic_path_range_rate_mps", True),
+        ("closing_speed_mps", "bistatic_closing_speed_mps", True),
+        ("doppler_hz", "bistatic_doppler_hz", True),
+        ("snr_noise_interference_ok", "bistatic_snr_noise_interference_ok", True),
+        ("doppler_resolved", "bistatic_doppler_resolved", True),
+        ("doppler_ambiguous", "bistatic_doppler_ambiguous", True),
+        ("direct_residual_ok", "bistatic_direct_residual_ok", True),
+        ("dynamic_range_ok", "bistatic_dynamic_range_ok", True),
+        ("return_environment_valid", "return_environment_valid", True),
+        ("detectable_screening", "bistatic_detectable_screening", True),
+        ("detectable_qualified", "bistatic_detectable_qualified", True),
+        ("detectable", "bistatic_detectable", True),
+        ("constraint_failure_code", "bistatic_constraint_failure_code", True),
+        ("return_path_loss_db", "return_path_loss_db", True),
+        ("return_environment_loss_db", "return_environment_loss_db", True),
+        ("return_terrain_loss_db", "return_terrain_loss_db", True),
+        ("return_los", "return_los", True),
+        ("return_terrain_state_code", "return_terrain_state_code", True),
+        ("return_sample_error_m", "return_sample_error_m", True),
     )
-    return_rf = return_path_rf_params(
-        forward_world.rf_params,
-        receiver_antenna_height_m=float(receiver.antenna_height_m_agl),
-        target_height_m=float(config.target.height_m_agl),
-        max_range_m=max_return_range_m,
-    )
-    progress(
-        "return_path_environment",
-        f"Building receiver-centered OSM/terrain return-path grid to {max_return_range_m:.0f} m",
-    )
-    return_world = build_world_model(
-        tx=receiver_point,
-        rf_params=return_rf,
-        views=[],
-        map_provider=map_provider,
-        terrain_provider=terrain_provider,
-    )
-    lookup = lookup_from_world(
-        return_world,
-        receiver=receiver_point,
-        max_range_m=max_return_range_m,
-        dr_m=float(return_rf.step_m),
-        dtheta_deg=float(return_rf.dtheta_deg),
-    )
-    return_world.cells.clear()
-    progress(
-        "return_path_environment",
-        f"Return-path environment grid ready ({lookup.metadata()['valid_samples']} samples)",
-    )
-    return lookup
+
+    # Historical position: incident power follows z_ground and precedes target-path fields.
+    for position, (product_name, source_name, enabled) in enumerate(specs):
+        if position == 10:
+            source_name_incident = (
+                "isac_incident_power_isotropic_dbm"
+                if _has_series(_grid_series(grid, "isac_incident_power_isotropic_dbm"))
+                else "incident_power_isotropic_dbm"
+            )
+            values = _grid_series(grid, source_name_incident)
+            yield "incident_isotropic_power_dbm", values
+            if release_after_write:
+                grid._channel_arrays.pop(source_name_incident, None)
+        if not enabled:
+            yield product_name, None
+            continue
+        values = _grid_series(grid, source_name)
+        yield product_name, values
+        if release_after_write:
+            grid._channel_arrays.pop(source_name, None)
+
+    if release_after_write:
+        # Release any non-product solver aliases left in the compact private store.
+        grid.clear_channel_arrays()
+
 
 def _create_dvt_map_provider(rf_params: RFParams, tx_height_m: float) -> MapProvider:
     """Create the automatic persistent AOI cache used by broadcast planning.
@@ -242,13 +342,6 @@ def run_rf_planning_for_point(
     Returns:
         Dictionary with results including snapped_tx, grid, and heatmap
     """
-    pipeline_started = perf_counter()
-    stage_timings_s: Dict[str, float] = {}
-    memory_snapshots_mb: Dict[str, float] = {}
-    rss_start = _current_rss_mb()
-    if rss_start is not None:
-        memory_snapshots_mb["start"] = round(rss_start, 2)
-
     logger.info("="*60)
     logger.info(f"STARTING RF PLANNING FOR POINT: ({lat}, {lon})")
     logger.info(f"  max_snap_distance_m: {max_snap_distance_m}")
@@ -587,7 +680,6 @@ def run_rf_planning_for_point(
             terrain_provider = create_terrain_provider(rf_params)
             if terrain_provider is not None:
                 progress("terrain", "Loading DEM for terrain-aware propagation")
-    world_stage_started = perf_counter()
     world = build_world_model(
         tx=snapped.latlon,
         rf_params=rf_params,
@@ -595,68 +687,120 @@ def run_rf_planning_for_point(
         map_provider=map_provider,
         terrain_provider=terrain_provider,
     )
-    stage_timings_s["physical_world"] = perf_counter() - world_stage_started
     num_world_cells = len(world.cells)
-    logger.info("Built world model with %d compact cells", num_world_cells)
-    progress("world_model", f"Physical world built ({num_world_cells} candidate points)")
-    rss_world = _current_rss_mb()
-    if rss_world is not None:
-        memory_snapshots_mb["after_physical_world"] = round(rss_world, 2)
+    logger.info(f"Built world model with {num_world_cells} cells")
+    progress("world_model", f"World model built ({num_world_cells} candidate cells)")
 
-    # 5) Complete the one-way waveform coverage before any bistatic work.
+    # 5) RF attenuation and optional waveform-independent channel analysis
     is_dvt_plan = _is_dvt(rf_params)
     if is_dvt_plan:
-        forward_detail = "Computing broadcast received power, field strength, and C/N"
+        attenuation_detail = "Computing broadcast carrier power and field strength"
     else:
-        forward_detail = "Computing NR RSRP, serving cell, interference, and SINR"
-    progress("forward_coverage", forward_detail)
-    logger.debug("%s...", forward_detail)
-    forward_started = perf_counter()
-    grid = compute_attenuation_grid(world, include_channel_analysis=False)
-    stage_timings_s["forward_coverage"] = perf_counter() - forward_started
-    logger.info("Computed forward coverage grid with %d points", len(grid.cell_lat))
-    progress("forward_coverage", f"Forward coverage complete ({len(grid.cell_lat)} points)")
-
-    # The forward grid now owns every value needed by channel analysis.  Release
-    # the large WorldCell collection before constructing the receiver-centered
-    # reciprocal environment so both worlds are never resident together.
-    released_forward_cells = len(world.cells)
-    world.cells.clear()
-    rss_after_release = _current_rss_mb()
-    if rss_after_release is not None:
-        memory_snapshots_mb["after_forward_world_release"] = round(rss_after_release, 2)
-
+        attenuation_detail = "Computing NR RSRP, serving cell, interference, and SINR"
     if rf_params.channel_analysis is not None:
-        return_started = perf_counter()
-        return_lookup = _build_channel_return_path_lookup(
-            forward_world=world,
+        attenuation_detail += "; evaluating bistatic range, echo, Doppler, and detectability"
+    progress("attenuation", attenuation_detail)
+    logger.debug("%s...", attenuation_detail)
+
+    # Preserve the TX-centered OSM payload before an RX-centered reciprocal solve
+    # updates the provider's active cache window.
+    retain_primary_osm_for_client = not (
+        is_dvt_plan
+        and (
+            getattr(rf_params, "compact_output", None) is True
+            or float(getattr(rf_params, "max_range_m", 0.0) or 0.0) > 5000.0
+        )
+    )
+    primary_osm_buildings_for_client = (
+        _osm_buildings_for_client_from_map_provider(map_provider)
+        if retain_primary_osm_for_client
+        else None
+    )
+
+    reciprocal_field = None
+    illumination_field = None
+    static_background_channel = None
+    channel_cfg = rf_params.channel_analysis
+    if channel_cfg is not None:
+        # Build static mapped-facade background while the provider still owns the
+        # TX-centered OSM AOI. Reciprocal/target-height solves may move that cache
+        # window. The result is a small reusable path table, not an N-cell field.
+        progress("background_channel", "Computing mapped static-building specular background channel")
+        try:
+            static_background_channel = build_static_background_channel(
+                map_provider=map_provider,
+                tx=snapped.latlon,
+                rf_params=rf_params,
+                receiver=channel_cfg.receiver,
+            )
+            if static_background_channel is not None:
+                progress(
+                    "background_channel",
+                    f"Static background complete ({len(static_background_channel.paths)} accepted facade paths)",
+                )
+        except Exception as exc:
+            logger.exception("Static mapped-background channel failed: %s", exc)
+            progress("background_channel", "Static mapped-building background unavailable; continuing")
+            static_background_channel = None
+    if channel_cfg is not None and str(channel_cfg.return_path_model) == "environment_reciprocal":
+        # First calculate the ordinary one-way TX field.  Then calculate a second,
+        # RX-centered propagation field over the same physical environment and fuse
+        # both fields point-for-point in the bistatic layer.
+        grid = compute_attenuation_grid(world, apply_channel=False)
+        # The TX-centered WorldCell lattice has been reduced to the one-way grid.
+        # Reciprocal propagation needs only TX/RF metadata from ``world``; retaining
+        # millions of TX cells while constructing millions of RX cells nearly doubles
+        # the environmental solver peak for no analytical benefit.
+        world.cells.clear()
+        progress("target_field", "Computing target-height TX-to-target illumination field")
+        illumination_field = build_target_illumination_field(
+            primary_world=world,
+            primary_grid=grid,
             map_provider=map_provider,
             terrain_provider=terrain_provider,
-            progress=progress,
         )
-        stage_timings_s["return_environment"] = perf_counter() - return_started
-        rss_return = _current_rss_mb()
-        if rss_return is not None:
-            memory_snapshots_mb["after_return_environment"] = round(rss_return, 2)
-
         progress(
-            "channel_analysis",
-            "Evaluating per-target bistatic geometry, echo power, Doppler, and detectability",
+            "target_field",
+            f"Target-height TX field complete ({illumination_field.metadata.get('sample_count', 0)} samples)",
         )
-        channel_started = perf_counter()
+        progress("return_field", "Computing environment-aware reciprocal target-to-RX field")
+        reciprocal_field = build_reciprocal_propagation_field(
+            primary_world=world,
+            primary_grid=grid,
+            map_provider=map_provider,
+            terrain_provider=terrain_provider,
+        )
+        progress(
+            "return_field",
+            f"Reciprocal RX field complete ({reciprocal_field.metadata.get('sample_count', 0)} samples)",
+        )
         grid = apply_channel_analysis(
-            world,
-            grid,
-            channel_context={"return_path_lookup": return_lookup},
+            world, grid, reciprocal_field=reciprocal_field, illumination_field=illumination_field
         )
-        stage_timings_s["channel_analysis"] = perf_counter() - channel_started
-        del return_lookup
-        progress("channel_analysis", "Bistatic/ISAC channel analysis complete")
-        rss_channel = _current_rss_mb()
-        if rss_channel is not None:
-            memory_snapshots_mb["after_channel_analysis"] = round(rss_channel, 2)
+        attach_static_background_summary(grid, static_background_channel)
+        illumination_field = None
+        # apply_channel_analysis copies the aligned return-field values into the
+        # grid's compact channel arrays. Drop the source field before rendering
+        # heatmaps/export so both copies are not retained for the rest of the plan.
+        reciprocal_field = None
+    else:
+        grid = compute_attenuation_grid(world)
+        attach_static_background_summary(grid, static_background_channel)
 
-    progress("attenuation", f"RF products complete ({len(grid.cell_lat)} output points)")
+    # The attenuation grid now owns all output values; release per-cell Pydantic
+    # objects before raster encoding and response serialization.
+    world.cells.clear()
+    point_count = _grid_point_count(grid)
+    compact_setting = getattr(rf_params, "compact_output", None)
+    compact_large_result = (
+        compact_setting is not False
+        and (is_dvt_plan or grid.channel_analysis_summary is not None)
+        and (compact_setting is True or point_count > LARGE_ARRAY_THRESHOLD_POINTS)
+    )
+    if compact_large_result:
+        _compact_internal_grid_storage(grid)
+    logger.info(f"Computed attenuation grid with {point_count} points")
+    progress("attenuation", f"RF attenuation complete ({point_count} output points)")
 
     # 6) heatmap / map overlay
     ray_mode_eff2 = str(getattr(rf_params, "ray_mode", ray_mode) or ray_mode).strip().lower()
@@ -670,235 +814,235 @@ def run_rf_planning_for_point(
     # requested display resolution. Existing 5G texture limits remain unchanged.
     texture_cap = 2048 if is_dvt_plan else 1024
     tex_size = int(min(texture_cap, max(512, round(base))))
-    # 2D OSM and 3D modes share one prepared raster geometry.  Every
-    # coverage/ISAC layer reuses the same point-to-pixel map and support mask.
-    rendering_started = perf_counter()
-    logger.debug("Preparing shared ellipse rasterizer (size=%d, ray_mode=%s)", tex_size, ray_mode_eff2)
-    progress("heatmap", f"Preparing shared heatmap geometry ({tex_size} px)")
-    rasterizer = EllipseRasterizer(grid, size=tex_size)
+    # 2D OSM and 3D modes share the same pre-colored ellipse PNG (local ENU → texture),
+    # so Leaflet and Cesium both get a continuous drape instead of radial spoke circles.
+    logger.debug(f"Generating ellipse heatmap PNG (size={tex_size}, ray_mode={ray_mode_eff2})...")
+    progress("heatmap", f"Rendering heatmap texture ({tex_size} px)")
+    heatmap_geometry = prepare_ellipse_heatmap_geometry(grid, size=tex_size)
 
-    def render_layer(
-        values: Any,
-        *,
-        vmin: float,
-        vmax: float,
-        layer: str,
-        units: str,
-        warning_label: str,
-    ) -> Optional[Dict[str, Any]]:
-        if not _has_values(values):
-            return None
-        try:
-            payload = rasterizer.render(values, vmin=vmin, vmax=vmax)
-            payload["layer"] = layer
-            payload["units"] = units
-            return payload
-        except Exception as exc:
-            logger.warning("%s heatmap PNG failed: %s", warning_label, exc)
-            return None
+    def render_ellipse(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        kwargs["geometry"] = heatmap_geometry
+        return attenuation_grid_to_png_ellipse(*args, **kwargs)
 
-    if is_dvt_plan and _has_values(grid.field_strength_dbuv_m):
-        heatmap_payload = render_layer(
-            grid.field_strength_dbuv_m,
+    field_strength_values = _grid_series(grid, "field_strength_dbuv_m")
+    if is_dvt_plan and _has_series(field_strength_values):
+        heatmap_payload = render_ellipse(
+            grid,
+            size=tex_size,
             vmin=20.0,
             vmax=120.0,
-            layer="field_strength_dbuv_m",
-            units="dBuV/m",
-            warning_label="DVT field-strength",
+            rsrp_values=field_strength_values,
         )
+        heatmap_payload["layer"] = "field_strength_dbuv_m"
+        heatmap_payload["units"] = "dBuV/m"
     else:
-        heatmap_payload = render_layer(
-            grid.rsrp_dbm,
-            vmin=-140.0,
-            vmax=-60.0,
-            layer="rsrp_dbm",
-            units="dBm",
-            warning_label="RSRP",
-        )
-    if heatmap_payload is None:
-        raise ValueError("primary coverage heatmap could not be rendered")
+        heatmap_payload = render_ellipse(grid, size=tex_size, vmin=-140.0, vmax=-60.0)
+        heatmap_payload["layer"] = "rsrp_dbm"
+        heatmap_payload["units"] = "dBm"
+    logger.info(f"Generated heatmap PNG texture: {heatmap_payload.get('width')}x{heatmap_payload.get('height')}")
+    progress("heatmap", "Heatmap rendering complete")
 
+    # Per-sector PNGs: true beam RSRP for each sector (not best-server / max across sectors at a point).
     heatmap_by_sector: Dict[str, Any] = {}
     if grid.rsrp_by_sector:
-        for sid, values in grid.rsrp_by_sector.items():
-            payload = render_layer(
-                values,
+        for sid, rlist in grid.rsrp_by_sector.items():
+            try:
+                heatmap_by_sector[str(sid)] = render_ellipse(
+                    grid,
+                    size=tex_size,
+                    vmin=-140.0,
+                    vmax=-60.0,
+                    rsrp_values=rlist,
+                )
+            except Exception as e:
+                logger.warning("Per-sector heatmap failed for %s: %s", sid, e)
+    if not is_dvt_plan:
+        progress("heatmap", f"Per-sector rasters: {len(heatmap_by_sector)}")
+    if compact_large_result:
+        # Per-sector numeric grids are no longer needed after their PNGs are
+        # rendered and are not part of the compact API/channel product.
+        grid.rsrp_by_sector = None
+
+    # Alternate layer PNGs (same ellipse drape as the primary coverage layer).
+    heatmap_terrain: Optional[Dict[str, Any]] = None
+    heatmap_sinr: Optional[Dict[str, Any]] = None
+    heatmap_received_power: Optional[Dict[str, Any]] = None
+    heatmap_incident_power: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_echo: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_snr: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_margin: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_doppler: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_excess_delay: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_path_range: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_angle: Optional[Dict[str, Any]] = None
+    heatmap_bistatic_detectable: Optional[Dict[str, Any]] = None
+
+    received_power_values = _grid_series(grid, "received_power_dbm")
+    incident_values = _grid_series(grid, "isac_incident_power_isotropic_dbm")
+    if incident_values is None:
+        incident_values = _grid_series(grid, "incident_power_isotropic_dbm")
+    echo_values = _grid_series(grid, "bistatic_echo_power_dbm")
+    post_snr_values = _grid_series(grid, "bistatic_postprocessing_snr_db")
+    margin_values = _grid_series(grid, "bistatic_detection_margin_db")
+    doppler_values = _grid_series(grid, "bistatic_doppler_hz")
+    delay_values = _grid_series(grid, "bistatic_excess_delay_s")
+    path_range_values = _grid_series(grid, "bistatic_path_range_m")
+    angle_values = _grid_series(grid, "bistatic_angle_deg")
+    detectable_values_src = _grid_series(grid, "bistatic_detectable")
+    doppler_arr = None
+    finite = None
+    detectable_values = None
+    terrain_values = _grid_series(grid, "terrain_loss_db")
+    sinr_values = _grid_series(grid, "sinr_db")
+
+    if is_dvt_plan and _has_series(received_power_values):
+        try:
+            heatmap_received_power = render_ellipse(
+                grid,
+                size=tex_size,
                 vmin=-140.0,
-                vmax=-60.0,
-                layer="rsrp_dbm",
-                units="dBm",
-                warning_label=f"sector {sid}",
+                vmax=-20.0,
+                rsrp_values=received_power_values,
             )
-            if payload is not None:
-                heatmap_by_sector[str(sid)] = payload
+            heatmap_received_power["layer"] = "received_power_dbm"
+            heatmap_received_power["units"] = "dBm"
+        except Exception as e:
+            logger.warning("DVT received-power heatmap PNG failed: %s", e)
+    if _has_series(incident_values):
+        try:
+            heatmap_incident_power = render_ellipse(
+                grid, size=tex_size, vmin=-160.0, vmax=-20.0,
+                rsrp_values=incident_values,
+            )
+            heatmap_incident_power["layer"] = "incident_power_isotropic_dbm"
+            heatmap_incident_power["units"] = "dBm"
+        except Exception as e:
+            logger.warning("Channel incident-power heatmap PNG failed: %s", e)
+    if _has_series(echo_values):
+        try:
+            heatmap_bistatic_echo = render_ellipse(
+                grid, size=tex_size, vmin=-200.0, vmax=-80.0,
+                rsrp_values=echo_values,
+            )
+            heatmap_bistatic_echo["layer"] = "bistatic_echo_power_dbm"
+            heatmap_bistatic_echo["units"] = "dBm"
+        except Exception as e:
+            logger.warning("Bistatic echo heatmap PNG failed: %s", e)
+    if _has_series(post_snr_values):
+        try:
+            heatmap_bistatic_snr = render_ellipse(
+                grid, size=tex_size, vmin=-40.0, vmax=30.0,
+                rsrp_values=post_snr_values,
+            )
+            heatmap_bistatic_snr["layer"] = "bistatic_postprocessing_snr_db"
+            heatmap_bistatic_snr["units"] = "dB"
+        except Exception as e:
+            logger.warning("Bistatic SNR heatmap PNG failed: %s", e)
+    if _has_series(margin_values):
+        try:
+            heatmap_bistatic_margin = render_ellipse(
+                grid, size=tex_size, vmin=-40.0, vmax=20.0,
+                rsrp_values=margin_values,
+            )
+            heatmap_bistatic_margin["layer"] = "bistatic_detection_margin_db"
+            heatmap_bistatic_margin["units"] = "dB"
+        except Exception as e:
+            logger.warning("Bistatic margin heatmap PNG failed: %s", e)
+    if _has_series(doppler_values):
+        try:
+            doppler_arr = np.asarray(doppler_values, dtype=np.float32)
+            finite = np.isfinite(doppler_arr)
+            doppler_limit = float(np.max(np.abs(doppler_arr[finite]))) if np.any(finite) else 1.0
+            doppler_limit = max(doppler_limit, 1.0e-6)
+            heatmap_bistatic_doppler = render_ellipse(
+                grid, size=tex_size, vmin=-doppler_limit, vmax=doppler_limit,
+                rsrp_values=doppler_arr,
+            )
+            heatmap_bistatic_doppler["layer"] = "bistatic_doppler_hz"
+            heatmap_bistatic_doppler["units"] = "Hz"
+        except Exception as e:
+            logger.warning("Bistatic Doppler heatmap PNG failed: %s", e)
+    if _has_series(delay_values):
+        try:
+            delay_us = np.asarray(delay_values, dtype=np.float32) * np.float32(1.0e6)
+            heatmap_bistatic_excess_delay = render_ellipse(
+                grid, size=tex_size, vmin=0.0, vmax=max(float(np.nanmax(delay_us)), 1.0),
+                rsrp_values=delay_us,
+            )
+            heatmap_bistatic_excess_delay["layer"] = "bistatic_excess_delay_us"
+            heatmap_bistatic_excess_delay["units"] = "us"
+            del delay_us
+        except Exception as e:
+            logger.warning("Bistatic excess-delay heatmap PNG failed: %s", e)
 
-    heatmap_received_power = render_layer(
-        grid.received_power_dbm if is_dvt_plan else None,
-        vmin=-140.0,
-        vmax=-20.0,
-        layer="received_power_dbm",
-        units="dBm",
-        warning_label="received-power",
-    )
-    heatmap_incident_power = render_layer(
-        grid.incident_power_isotropic_dbm,
-        vmin=-160.0,
-        vmax=-20.0,
-        layer="incident_power_isotropic_dbm",
-        units="dBm",
-        warning_label="incident-power",
-    )
-    heatmap_bistatic_echo = render_layer(
-        grid.bistatic_echo_power_dbm,
-        vmin=-200.0,
-        vmax=-80.0,
-        layer="bistatic_echo_power_dbm",
-        units="dBm",
-        warning_label="bistatic echo",
-    )
-    heatmap_bistatic_snr = render_layer(
-        grid.bistatic_postprocessing_snr_db,
-        vmin=-40.0,
-        vmax=30.0,
-        layer="bistatic_postprocessing_snr_db",
-        units="dB",
-        warning_label="bistatic SNR",
-    )
-    heatmap_bistatic_margin = render_layer(
-        grid.bistatic_detection_margin_db,
-        vmin=-40.0,
-        vmax=20.0,
-        layer="bistatic_detection_margin_db",
-        units="dB",
-        warning_label="bistatic margin",
-    )
+    if _has_series(path_range_values):
+        try:
+            range_km = np.asarray(path_range_values, dtype=np.float32) / np.float32(1000.0)
+            heatmap_bistatic_path_range = render_ellipse(
+                grid, size=tex_size, vmin=float(np.nanmin(range_km)), vmax=float(np.nanmax(range_km)),
+                rsrp_values=range_km,
+            )
+            heatmap_bistatic_path_range["layer"] = "bistatic_path_range_km"
+            heatmap_bistatic_path_range["units"] = "km"
+            del range_km
+        except Exception as e:
+            logger.warning("Bistatic path-range heatmap PNG failed: %s", e)
+    if _has_series(angle_values):
+        try:
+            heatmap_bistatic_angle = render_ellipse(
+                grid, size=tex_size, vmin=0.0, vmax=180.0,
+                rsrp_values=angle_values,
+            )
+            heatmap_bistatic_angle["layer"] = "bistatic_angle_deg"
+            heatmap_bistatic_angle["units"] = "deg"
+        except Exception as e:
+            logger.warning("Bistatic-angle heatmap PNG failed: %s", e)
+    if _has_series(detectable_values_src):
+        try:
+            detectable_values = np.asarray(detectable_values_src, dtype=np.float32)
+            heatmap_bistatic_detectable = render_ellipse(
+                grid, size=tex_size, vmin=0.0, vmax=1.0,
+                rsrp_values=detectable_values,
+            )
+            heatmap_bistatic_detectable["layer"] = "bistatic_detectable"
+            heatmap_bistatic_detectable["units"] = "flag"
+        except Exception as e:
+            logger.warning("Bistatic detectability heatmap PNG failed: %s", e)
 
-    heatmap_bistatic_doppler = None
-    if _has_values(grid.bistatic_doppler_hz):
-        doppler_values = np.asarray(grid.bistatic_doppler_hz, dtype=np.float32)
-        finite = np.isfinite(doppler_values)
-        doppler_limit = float(np.max(np.abs(doppler_values[finite]))) if np.any(finite) else 1.0
-        doppler_limit = max(doppler_limit, 1.0)
-        heatmap_bistatic_doppler = render_layer(
-            doppler_values,
-            vmin=-doppler_limit,
-            vmax=doppler_limit,
-            layer="bistatic_doppler_hz",
-            units="Hz",
-            warning_label="bistatic Doppler",
-        )
+    if _has_series(terrain_values):
+        try:
+            terrain_cap = float(getattr(rf_params, "terrain_loss_cap_db", 40.0) or 40.0)
+            heatmap_terrain = render_ellipse(
+                grid,
+                size=tex_size,
+                vmin=0.0,
+                vmax=terrain_cap,
+                rsrp_values=terrain_values,
+            )
+        except Exception as e:
+            logger.warning("Terrain loss heatmap PNG failed: %s", e)
+    if _has_series(sinr_values):
+        try:
+            heatmap_sinr = render_ellipse(
+                grid,
+                size=tex_size,
+                vmin=-5.0,
+                vmax=30.0,
+                rsrp_values=sinr_values,
+            )
+            heatmap_sinr["layer"] = "carrier_to_noise_db" if is_dvt_plan else "sinr_db"
+            heatmap_sinr["units"] = "dB"
+        except Exception as e:
+            logger.warning("%s heatmap PNG failed: %s", "C/N" if is_dvt_plan else "SINR", e)
 
-    heatmap_bistatic_excess_delay = None
-    if _has_values(grid.bistatic_excess_delay_s):
-        delay_us = np.asarray(grid.bistatic_excess_delay_s, dtype=np.float32) * np.float32(1.0e6)
-        heatmap_bistatic_excess_delay = render_layer(
-            delay_us,
-            vmin=0.0,
-            vmax=max(float(np.nanmax(delay_us)), 1.0),
-            layer="bistatic_excess_delay_us",
-            units="us",
-            warning_label="bistatic excess-delay",
-        )
-
-    def minmax(values: Any, default_min: float, default_max: float) -> tuple[float, float]:
-        if not _has_values(values):
-            return default_min, default_max
-        arr = np.asarray(values, dtype=np.float32)
-        finite = arr[np.isfinite(arr)]
-        if finite.size == 0:
-            return default_min, default_max
-        low = float(np.min(finite))
-        high = float(np.max(finite))
-        return (low, high if high > low else low + 1.0)
-
-    return_min, return_max = minmax(grid.bistatic_return_path_loss_db, 60.0, 180.0)
-    heatmap_bistatic_return_path_loss = render_layer(
-        grid.bistatic_return_path_loss_db,
-        vmin=return_min,
-        vmax=return_max,
-        layer="bistatic_return_path_loss_db",
-        units="dB",
-        warning_label="bistatic return-path-loss",
-    )
-    total_min, total_max = minmax(grid.bistatic_total_path_loss_db, 120.0, 300.0)
-    heatmap_bistatic_total_path_loss = render_layer(
-        grid.bistatic_total_path_loss_db,
-        vmin=total_min,
-        vmax=total_max,
-        layer="bistatic_total_path_loss_db",
-        units="dB",
-        warning_label="bistatic total-path-loss",
-    )
-    heatmap_isac_quality = render_layer(
-        grid.bistatic_isac_quality_code,
-        vmin=0.0,
-        vmax=5.0,
-        layer="bistatic_isac_quality_code",
-        units="class",
-        warning_label="ISAC quality",
-    )
-    if heatmap_isac_quality is not None:
-        heatmap_isac_quality["legend"] = (grid.channel_analysis_summary or {}).get(
-            "isac_quality", {}
-        ).get("code_legend", {})
-
-    heatmap_bistatic_path_range = None
-    if _has_values(grid.bistatic_path_range_m):
-        path_km = np.asarray(grid.bistatic_path_range_m, dtype=np.float32) / np.float32(1000.0)
-        path_min, path_max = minmax(path_km, 0.0, 1.0)
-        heatmap_bistatic_path_range = render_layer(
-            path_km,
-            vmin=path_min,
-            vmax=path_max,
-            layer="bistatic_path_range_km",
-            units="km",
-            warning_label="bistatic path-range",
-        )
-    heatmap_bistatic_angle = render_layer(
-        grid.bistatic_angle_deg,
-        vmin=0.0,
-        vmax=180.0,
-        layer="bistatic_angle_deg",
-        units="deg",
-        warning_label="bistatic angle",
-    )
-    heatmap_bistatic_detectable = None
-    if _has_values(grid.bistatic_detectable):
-        heatmap_bistatic_detectable = render_layer(
-            np.asarray(grid.bistatic_detectable, dtype=np.float32),
-            vmin=0.0,
-            vmax=1.0,
-            layer="bistatic_detectable",
-            units="flag",
-            warning_label="bistatic detectability",
-        )
-
-    terrain_cap = float(getattr(rf_params, "terrain_loss_cap_db", 40.0) or 40.0)
-    heatmap_terrain = render_layer(
-        grid.terrain_loss_db,
-        vmin=0.0,
-        vmax=terrain_cap,
-        layer="terrain_loss_db",
-        units="dB",
-        warning_label="terrain loss",
-    )
-    heatmap_sinr = render_layer(
-        grid.sinr_db,
-        vmin=-5.0,
-        vmax=30.0,
-        layer="carrier_to_noise_db" if is_dvt_plan else "sinr_db",
-        units="dB",
-        warning_label="C/N" if is_dvt_plan else "SINR",
-    )
-
-    stage_timings_s["heatmap_rendering"] = perf_counter() - rendering_started
-    logger.info(
-        "Rendered shared heatmap set in %.3f s (%dx%d)",
-        stage_timings_s["heatmap_rendering"],
-        heatmap_payload.get("width"),
-        heatmap_payload.get("height"),
-    )
-    progress("heatmap", "Coverage and ISAC heatmaps rendered")
+    # Geometry is shared across all aligned layers but no longer needed once the
+    # PNG set is complete. Releasing it here trims peak memory before NPZ/export.
+    del render_ellipse
+    del heatmap_geometry
+    received_power_values = incident_values = echo_values = post_snr_values = None
+    margin_values = doppler_values = delay_values = path_range_values = angle_values = None
+    detectable_values_src = terrain_values = sinr_values = None
+    doppler_arr = finite = detectable_values = None
 
     sectors_info: List[Dict[str, Any]] = []
     broadcast_antenna: Optional[Dict[str, Any]] = None
@@ -917,33 +1061,35 @@ def run_rf_planning_for_point(
     # Prepare response
 
     # Reduce payload size for 3D OSM-only mode (terrain or not — same PNG drape path).
-    compact_setting = getattr(rf_params, "compact_output", None)
-    compact_large_result = (
-        compact_setting is not False
-        and (is_dvt_plan or grid.channel_analysis_summary is not None)
-        and (compact_setting is True or len(grid.cell_lat) > 100000)
-    )
     compact_grid = ray_mode_eff2 in ("3d_osm", "3d-osm", "osm3d") or compact_large_result
     compact_fields = {
         "cell_lat", "cell_lon", "rsrp_dbm", "received_power_dbm",
         "field_strength_dbuv_m", "carrier_to_noise_db", "sinr_db",
-        "source_eirp_at_target_dbm", "tx_target_path_loss_db",
-        "tx_target_environment_excess_db", "tx_target_penetration_loss_db",
-        "tx_target_shadow_loss_db", "tx_target_diffraction_loss_db",
-        "tx_target_canyon_recovery_db", "tx_target_horizontal_pattern_loss_db",
-        "tx_target_vertical_pattern_loss_db", "tx_target_obstacles_count",
-        "tx_target_propagation_mode",
-        "incident_power_isotropic_dbm", "bistatic_echo_power_dbm",
+        "incident_power_isotropic_dbm", "isac_incident_power_isotropic_dbm",
+        "isac_tx_target_path_loss_db", "isac_tx_target_environment_loss_db",
+        "isac_tx_target_terrain_loss_db", "isac_tx_target_los", "isac_tx_target_sample_error_m",
+        "isac_echo_geometry_base_dbm",
+        "bistatic_doppler_east_hz_per_mps", "bistatic_doppler_north_hz_per_mps",
+        "bistatic_doppler_up_hz_per_mps", "bistatic_doppler_sensitivity_hz_per_mps",
+        "bistatic_motion_doppler_sensitivity_hz_per_mps", "bistatic_minimum_detectable_speed_mps",
+        "bistatic_echo_power_dbm",
         "bistatic_preprocessing_snr_db", "bistatic_postprocessing_snr_db",
         "bistatic_detection_margin_db", "bistatic_echo_to_residual_direct_db",
-        "bistatic_required_dynamic_range_db", "bistatic_tx_target_range_m",
-        "bistatic_target_receiver_range_m", "bistatic_return_path_loss_db",
-        "bistatic_return_environment_excess_db", "bistatic_total_path_loss_db",
-        "bistatic_path_range_m", "bistatic_excess_path_range_m", "bistatic_excess_delay_s",
+        "bistatic_direct_residual_margin_db", "bistatic_required_cancellation_db",
+        "bistatic_required_dynamic_range_db", "bistatic_dynamic_range_margin_db",
+        "bistatic_minimum_detectable_rcs_m2", "bistatic_rcs_margin_db",
+        "bistatic_tx_target_range_m",
+        "bistatic_target_receiver_range_m", "bistatic_path_range_m",
+        "bistatic_excess_path_range_m", "bistatic_excess_delay_s",
         "bistatic_angle_deg", "bistatic_path_range_rate_mps",
         "bistatic_closing_speed_mps", "bistatic_doppler_hz",
-        "bistatic_doppler_resolved", "bistatic_doppler_ambiguous",
-        "bistatic_detectable", "bistatic_isac_quality_code",
+        "bistatic_snr_noise_interference_ok", "bistatic_doppler_resolved", "bistatic_doppler_ambiguous",
+        "bistatic_direct_residual_ok", "bistatic_dynamic_range_ok",
+        "bistatic_detectable_screening", "bistatic_detectable_qualified",
+        "bistatic_constraint_failure_code", "return_environment_valid",
+        "bistatic_detectable", "return_path_loss_db",
+        "return_environment_loss_db", "return_terrain_loss_db", "return_los",
+        "return_terrain_state", "return_sample_error_m",
         "modulation", "throughput_mbps",
         "serving_sector_id", "interferer_count", "top_interferer_rsrp_dbm",
         "pilot_pollution_metric_db", "rsrp_by_sector", "terrain_loss_db",
@@ -966,14 +1112,9 @@ def run_rf_planning_for_point(
         grid_payload.pop("pilot_pollution_metric_db", None)
         grid_payload.pop("rsrp_by_sector", None)
         if not compact_grid:
-            carrier_values = (
-                grid.carrier_to_noise_db
-                if _has_values(grid.carrier_to_noise_db)
-                else grid.sinr_db
-            )
-            grid_payload["carrier_to_noise_db"] = np.asarray(carrier_values).tolist()
+            grid_payload["carrier_to_noise_db"] = list(grid.carrier_to_noise_db or grid.sinr_db)
     if compact_grid:
-        grid_payload["num_points"] = len(grid.cell_lat)
+        grid_payload["num_points"] = point_count
         grid_payload["compacted"] = True
         if is_dvt_plan:
             for key in (
@@ -982,18 +1123,7 @@ def run_rf_planning_for_point(
                 "received_power_dbm",
                 "field_strength_dbuv_m",
                 "carrier_to_noise_db",
-                "source_eirp_at_target_dbm",
                 "incident_power_isotropic_dbm",
-                "tx_target_path_loss_db",
-                "tx_target_environment_excess_db",
-                "tx_target_penetration_loss_db",
-                "tx_target_shadow_loss_db",
-                "tx_target_diffraction_loss_db",
-                "tx_target_canyon_recovery_db",
-                "tx_target_horizontal_pattern_loss_db",
-                "tx_target_vertical_pattern_loss_db",
-                "tx_target_obstacles_count",
-                "tx_target_propagation_mode",
                 "bistatic_echo_power_dbm",
                 "bistatic_preprocessing_snr_db",
                 "bistatic_postprocessing_snr_db",
@@ -1002,9 +1132,6 @@ def run_rf_planning_for_point(
                 "bistatic_required_dynamic_range_db",
                 "bistatic_tx_target_range_m",
                 "bistatic_target_receiver_range_m",
-                "bistatic_return_path_loss_db",
-                "bistatic_return_environment_excess_db",
-                "bistatic_total_path_loss_db",
                 "bistatic_path_range_m",
                 "bistatic_excess_path_range_m",
                 "bistatic_excess_delay_s",
@@ -1015,7 +1142,6 @@ def run_rf_planning_for_point(
                 "bistatic_doppler_resolved",
                 "bistatic_doppler_ambiguous",
                 "bistatic_detectable",
-                "bistatic_isac_quality_code",
                 "terrain_loss_db",
                 "los_terrain",
                 "terrain_state",
@@ -1057,46 +1183,31 @@ def run_rf_planning_for_point(
 
     channel_analysis_product: Optional[Dict[str, Any]] = None
     if grid.channel_analysis_summary is not None:
-        product_started = perf_counter()
         try:
             channel_analysis_product = write_channel_product(
-                arrays=_channel_product_arrays(grid),
+                arrays=(
+                    _iter_channel_product_arrays(grid, release_after_write=True)
+                    if compact_large_result
+                    else _channel_product_arrays(grid)
+                ),
                 metadata={
                     "schema": "agentic_rf_planner.channel_analysis_grid",
                     "schema_version": "2.0",
+                    "capabilities": {
+                        "reusable_scene_basis": True,
+                        "hypothesis_reanalysis_endpoint": "/api/channel-analysis/products/{product_id}/evaluate",
+                        "hypothesis_bundle_endpoint": "/api/channel-analysis/products/{product_id}/evaluate-bundle",
+                        "scene_rebuild_parameters": [
+                            "target.heightMagl", "receiver position/height", "TX/RF/environment configuration"
+                        ],
+                    },
                     "summary": grid.channel_analysis_summary,
-                    "array_dimensions": {"point_axis": 0, "point_count": len(grid.cell_lat)},
-                    "array_units": {
-                        "latitude_deg": "degree", "longitude_deg": "degree",
-                        "ground_elevation_m_amsl": "m", "terrain_loss_db": "dB",
-                        "terrain_los": "flag", "terrain_state": "category",
-                        "rsrp_dbm": "dBm", "sinr_db": "dB", "received_power_dbm": "dBm",
-                        "field_strength_dbuv_m": "dBuV/m", "carrier_to_noise_db": "dB",
-                        "modulation": "category", "throughput_mbps": "Mbit/s",
-                        "serving_sector_id": "identifier", "interferer_count": "count",
-                        "top_interferer_rsrp_dbm": "dBm", "pilot_pollution_metric_db": "dB",
-                        "source_eirp_at_target_dbm": "dBm",
-                        "incident_isotropic_power_dbm": "dBm", "tx_target_path_loss_db": "dB",
-                        "tx_target_environment_excess_db": "dB",
-                        "tx_target_penetration_loss_db": "dB",
-                        "tx_target_shadow_loss_db": "dB",
-                        "tx_target_diffraction_loss_db": "dB",
-                        "tx_target_canyon_recovery_db": "dB",
-                        "tx_target_horizontal_pattern_loss_db": "dB",
-                        "tx_target_vertical_pattern_loss_db": "dB",
-                        "tx_target_obstacles_count": "count",
-                        "tx_target_propagation_mode": "category",
-                        "echo_power_dbm": "dBm", "preprocessing_snr_db": "dB",
-                        "postprocessing_snr_db": "dB", "detection_margin_db": "dB",
-                        "echo_to_residual_direct_db": "dB", "required_dynamic_range_db": "dB",
-                        "tx_target_range_m": "m", "target_receiver_range_m": "m",
-                        "return_path_loss_db": "dB", "return_environment_excess_db": "dB",
-                        "total_bistatic_path_loss_db": "dB", "bistatic_path_range_m": "m",
-                        "excess_path_range_m": "m", "excess_delay_s": "s",
-                        "bistatic_angle_deg": "degree", "path_range_rate_mps": "m/s",
-                        "closing_speed_mps": "m/s", "doppler_hz": "Hz",
-                        "doppler_resolved": "flag", "doppler_ambiguous": "flag",
-                        "detectable": "flag", "isac_quality_code": "class"
+                    "transmitter": {
+                        "latitude": float(grid.tx.lat),
+                        "longitude": float(grid.tx.lon),
+                        "absolute_height_m": float(
+                            (rf_params.site_altitude_m or 0.0) + float(rf_params.tx_height_m)
+                        ),
                     },
                     "rf_config": rf_params.public_config(),
                     "geometry_source": geometry_source,
@@ -1111,28 +1222,6 @@ def run_rf_planning_for_point(
         except Exception as e:
             logger.exception("Failed to write channel-analysis NPZ product: %s", e)
             grid.channel_analysis_summary["data_product_error"] = str(e)
-        finally:
-            stage_timings_s["channel_product_export"] = perf_counter() - product_started
-
-    total_elapsed_s = perf_counter() - pipeline_started
-    stage_timings_s["total_to_response"] = total_elapsed_s
-    rss_before_response = _current_rss_mb()
-    if rss_before_response is not None:
-        memory_snapshots_mb["before_response"] = round(rss_before_response, 2)
-    pipeline_metrics = {
-        "stage_seconds": {
-            name: round(value, 4) for name, value in stage_timings_s.items()
-        },
-        "memory_rss_mb": memory_snapshots_mb,
-        "candidate_world_cells": num_world_cells,
-        "forward_world_cells_released_before_return_path": released_forward_cells,
-        "output_points": len(grid.cell_lat),
-        "compact_response": bool(compact_grid),
-        "heatmap_size_px": tex_size,
-        "world_cell_representation": "slotted_dataclass",
-        "channel_numeric_representation": "numpy_float32",
-        "shared_heatmap_rasterizer": True,
-    }
 
     result = {
         "original_point": {"lat": lat, "lon": lon},
@@ -1151,7 +1240,6 @@ def run_rf_planning_for_point(
         "grid": grid_payload,
         "heatmap": heatmap_payload,
         "building_area_sqm": building_area_sqm,
-        "pipeline_metrics": pipeline_metrics,
     }
     if is_dvt_plan:
         result["broadcast_antenna"] = broadcast_antenna
@@ -1186,12 +1274,6 @@ def run_rf_planning_for_point(
         result["heatmap_bistatic_angle"] = heatmap_bistatic_angle
     if heatmap_bistatic_detectable:
         result["heatmap_bistatic_detectable"] = heatmap_bistatic_detectable
-    if heatmap_bistatic_return_path_loss:
-        result["heatmap_bistatic_return_path_loss"] = heatmap_bistatic_return_path_loss
-    if heatmap_bistatic_total_path_loss:
-        result["heatmap_bistatic_total_path_loss"] = heatmap_bistatic_total_path_loss
-    if heatmap_isac_quality:
-        result["heatmap_isac_quality"] = heatmap_isac_quality
 
     if bool(getattr(rf_params, "terrain_enabled", True)):
         result["terrain"] = {
@@ -1251,8 +1333,8 @@ def run_rf_planning_for_point(
             "materials_detected": len(views),
         }
 
-    if str(effective_ray_mode).strip().lower() == "2d":
-        ob = _osm_buildings_for_client_from_map_provider(map_provider)
+    if str(effective_ray_mode).strip().lower() == "2d" and not compact_large_result:
+        ob = primary_osm_buildings_for_client or _osm_buildings_for_client_from_map_provider(map_provider)
         if ob is not None:
             result["osm_buildings_for_client"] = ob
 
