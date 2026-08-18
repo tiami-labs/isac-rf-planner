@@ -112,7 +112,7 @@ def build_world_model(
         if terrain_provider is not None and configured_site_altitude_m is None:
             z_tx_ground_m = float(terrain_provider.elevation_m(tx.lat, tx.lon))
             z_tx_abs_m = z_tx_ground_m + float(rf_params.tx_height_m)
-        return WorldModel(
+        return WorldModel.model_construct(
             tx=tx,
             rf_params=rf_params,
             cells=cells,
@@ -163,7 +163,7 @@ def build_world_model(
         diffraction_loss_db = float(getattr(cell, 'diffraction_loss_db', 0.0) or 0.0)
         canyon_recovery_db = float(getattr(cell, 'canyon_recovery_db', 0.0) or 0.0)
         metal_blocked = getattr(cell, 'metal_blocked', False)
-        buildings_along_path = getattr(cell, 'buildings_along_path', [])
+        buildings_along_path = getattr(cell, 'buildings_along_path', None)
 
         if (
             penetration_loss_db == 0.0
@@ -177,7 +177,7 @@ def build_world_model(
             cell_latlon = LatLon(lat=cell.lat, lon=cell.lon)
             buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
             bldg_atten_cfg = getattr(rf_params, "building_attenuation", None)
-            for building in buildings_along_path:
+            for building in buildings_along_path or []:
                 material = building.get("material", "unknown")
                 if is_material_blocking(material, rf_params.freq_mhz):
                     metal_blocked = True
@@ -196,7 +196,7 @@ def build_world_model(
             # Only if we don't already have it from coverage_grid
             if not buildings_along_path:
                 buildings_along_path = map_provider.get_buildings_along_ray(tx, cell_latlon)
-            num_buildings = len(buildings_along_path)
+            num_buildings = len(buildings_along_path or [])
             # Polar ray-march (build_coverage_grid) stamps first_blocker_distance_m and is_los.
             # Do not overwrite NLOS with is_los=True — that underestimates path loss in
             # compute_attenuation_grid vs 3d_osm (which skips this refinement block).
@@ -255,7 +255,7 @@ def build_world_model(
     logger.info(f"  LOS cells: {los_count} ({100*los_count/len(cells):.1f}%)")
     logger.info(f"  NLOS cells: {nlos_count} ({100*nlos_count/len(cells):.1f}%)")
     
-    return WorldModel(
+    return WorldModel.model_construct(
         tx=tx,
         rf_params=rf_params,
         cells=cells,

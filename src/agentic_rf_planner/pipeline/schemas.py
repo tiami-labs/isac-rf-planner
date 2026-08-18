@@ -1,10 +1,10 @@
 """Core data models for the RF planning pipeline."""
 
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Dict, Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from ..rf.dvt import DVTTransmitter
 from ..rf.channel_analysis import ChannelAnalysisConfig
@@ -290,19 +290,19 @@ class RFParams(BaseModel):
 
 @dataclass(slots=True)
 class WorldCell:
-    """Compact internal propagation sample.
+    """One internal 2.5D propagation sample.
 
-    This object is created once per polar sample and is intentionally a slotted
-    dataclass instead of a Pydantic model.  Request validation still happens in
-    ``RFParams``; using a validation model for millions of internal samples adds
-    substantial allocation and attribute-access overhead without improving the
-    calculation.
+    This is deliberately a slotted dataclass rather than a Pydantic model. Coverage
+    generation can create millions of cells; a per-instance ``__dict__`` with forty+
+    keys dominates memory while providing no value because these objects are never
+    part of the public API. Validation remains at RF/request boundaries.
     """
 
     lat: float
     lon: float
     distance_m: float
     bearing_deg: float
+
     dominant_material: MaterialType
     obstacles_count: int
     extra_loss_db: float
@@ -330,13 +330,18 @@ class WorldCell:
     propagation_mode: str = "los"
     first_blocker_distance_m: Optional[float] = None
     diffraction_flag: bool = False
+
     penetration_loss_db: float = 0.0
     shadow_loss_db: float = 0.0
     diffraction_loss_db: float = 0.0
     canyon_recovery_db: float = 0.0
     metal_blocked: bool = False
-    buildings_along_path: List[Dict[str, Any]] = field(default_factory=list)
+    # None means "not retained".  Allocating an empty list in every large-plan
+    # cell costs ~56 bytes/sample even when building metadata is intentionally
+    # disabled (DVT/3D compact modes).
+    buildings_along_path: Optional[List[Dict[str, Any]]] = None
     coverage_precomputed: bool = False
+
     precomputed_rsrp_dbm: Optional[float] = None
 
     z_ground_m: float = 0.0
@@ -347,59 +352,34 @@ class WorldCell:
     terrain_state: str = "los"
 
 
-@dataclass(slots=True)
-class BroadcastWorldCell:
-    """Minimal physical-world sample used by one-transmitter broadcast paths."""
-
-    lat: float
-    lon: float
-    distance_m: float
-    bearing_deg: float
-    obstacles_count: int
-    extra_loss_db: float
-    is_los: bool = True
-    propagation_mode: str = "los"
-    penetration_loss_db: float = 0.0
-    shadow_loss_db: float = 0.0
-    diffraction_loss_db: float = 0.0
-    canyon_recovery_db: float = 0.0
-    coverage_precomputed: bool = True
-    precomputed_rsrp_dbm: Optional[float] = None
-    z_ground_m: float = 0.0
-    z_rx_abs_m: Optional[float] = None
-    terrain_loss_db: float = 0.0
-    los_terrain: bool = True
-    terrain_state: str = "los"
-
-
-
 class WorldModel(BaseModel):
     """Complete world model for RF simulation."""
 
     tx: LatLon
     rf_params: RFParams
-    cells: List[Any]
+    cells: List[WorldCell]
     z_tx_ground_m: Optional[float] = None
     z_tx_abs_m: Optional[float] = None
 
 
-@dataclass(slots=True)
-class AttenuationGrid:
-    """Array-friendly final propagation result.
+class AttenuationGrid(BaseModel):
+    """
+    Final RF result. You can map this directly to a heatmap.
 
-    Large channel-analysis layers may remain NumPy arrays until the API actually
-    needs JSON.  This avoids constructing millions of boxed Python floats merely
-    to render heatmaps or write an NPZ product.
+    `rsrp_dbm` is the best-server (max) RSRP per map point for SINR/interference math.
+    `rsrp_by_sector` (when present) repeats the same point order as `cell_lat`/`cell_lon`
+    with that sector's RSRP only—use for per-sector heatmaps (true beam shape, not max-composite).
     """
 
     tx: LatLon
     rf_params: RFParams
+    # parallel to WorldModel.cells
     cell_lat: List[float]
     cell_lon: List[float]
-    rsrp_dbm: List[float]
-    sinr_db: List[float]
-    modulation: List[str]
-    throughput_mbps: List[float]
+    rsrp_dbm: List[float]  # Received Signal Received Power (dBm)
+    sinr_db: List[float]  # Signal-to-Interference-plus-Noise Ratio (dB)
+    modulation: List[str]  # Selected modulation scheme per cell
+    throughput_mbps: List[float]  # Estimated throughput (Mbps) per cell
     serving_sector_id: List[str]
     interferer_count: List[int]
     top_interferer_rsrp_dbm: List[float]
@@ -409,29 +389,28 @@ class AttenuationGrid:
     received_power_dbm: Optional[List[float]] = None
     field_strength_dbuv_m: Optional[List[float]] = None
     carrier_to_noise_db: Optional[List[float]] = None
+    # Waveform-agnostic channel-analysis arrays.  All arrays follow cell_lat/cell_lon order.
     incident_power_isotropic_dbm: Optional[List[float]] = None
-    source_eirp_at_target_dbm: Optional[List[float]] = None
-    tx_target_path_loss_db: Optional[List[float]] = None
-    tx_target_environment_excess_db: Optional[List[float]] = None
-    tx_target_penetration_loss_db: Optional[List[float]] = None
-    tx_target_shadow_loss_db: Optional[List[float]] = None
-    tx_target_diffraction_loss_db: Optional[List[float]] = None
-    tx_target_canyon_recovery_db: Optional[List[float]] = None
-    tx_target_horizontal_pattern_loss_db: Optional[List[float]] = None
-    tx_target_vertical_pattern_loss_db: Optional[List[float]] = None
-    tx_target_obstacles_count: Optional[List[int]] = None
-    tx_target_propagation_mode: Optional[List[str]] = None
+    isac_echo_geometry_base_dbm: Optional[List[float]] = None
+    bistatic_doppler_east_hz_per_mps: Optional[List[float]] = None
+    bistatic_doppler_north_hz_per_mps: Optional[List[float]] = None
+    bistatic_doppler_up_hz_per_mps: Optional[List[float]] = None
+    bistatic_doppler_sensitivity_hz_per_mps: Optional[List[float]] = None
+    bistatic_motion_doppler_sensitivity_hz_per_mps: Optional[List[float]] = None
+    bistatic_minimum_detectable_speed_mps: Optional[List[float]] = None
     bistatic_echo_power_dbm: Optional[List[float]] = None
     bistatic_preprocessing_snr_db: Optional[List[float]] = None
     bistatic_postprocessing_snr_db: Optional[List[float]] = None
     bistatic_detection_margin_db: Optional[List[float]] = None
     bistatic_echo_to_residual_direct_db: Optional[List[float]] = None
+    bistatic_direct_residual_margin_db: Optional[List[float]] = None
+    bistatic_required_cancellation_db: Optional[List[float]] = None
     bistatic_required_dynamic_range_db: Optional[List[float]] = None
+    bistatic_dynamic_range_margin_db: Optional[List[float]] = None
+    bistatic_minimum_detectable_rcs_m2: Optional[List[float]] = None
+    bistatic_rcs_margin_db: Optional[List[float]] = None
     bistatic_tx_target_range_m: Optional[List[float]] = None
     bistatic_target_receiver_range_m: Optional[List[float]] = None
-    bistatic_return_path_loss_db: Optional[List[float]] = None
-    bistatic_return_environment_excess_db: Optional[List[float]] = None
-    bistatic_total_path_loss_db: Optional[List[float]] = None
     bistatic_path_range_m: Optional[List[float]] = None
     bistatic_excess_path_range_m: Optional[List[float]] = None
     bistatic_excess_delay_s: Optional[List[float]] = None
@@ -439,10 +418,23 @@ class AttenuationGrid:
     bistatic_path_range_rate_mps: Optional[List[float]] = None
     bistatic_closing_speed_mps: Optional[List[float]] = None
     bistatic_doppler_hz: Optional[List[float]] = None
+    bistatic_snr_noise_interference_ok: Optional[List[bool]] = None
     bistatic_doppler_resolved: Optional[List[bool]] = None
     bistatic_doppler_ambiguous: Optional[List[bool]] = None
+    bistatic_direct_residual_ok: Optional[List[bool]] = None
+    bistatic_dynamic_range_ok: Optional[List[bool]] = None
+    bistatic_detectable_screening: Optional[List[bool]] = None
+    bistatic_detectable_qualified: Optional[List[bool]] = None
     bistatic_detectable: Optional[List[bool]] = None
-    bistatic_isac_quality_code: Optional[List[int]] = None
+    bistatic_constraint_failure_code: Optional[List[int]] = None
+    # Environment-aware reciprocal target -> analysis-RX propagation, aligned to target grid.
+    return_environment_valid: Optional[List[bool]] = None
+    return_path_loss_db: Optional[List[float]] = None
+    return_environment_loss_db: Optional[List[float]] = None
+    return_terrain_loss_db: Optional[List[float]] = None
+    return_los: Optional[List[bool]] = None
+    return_terrain_state: Optional[List[str]] = None
+    return_sample_error_m: Optional[List[float]] = None
     channel_analysis_summary: Optional[Dict[str, Any]] = None
     waveform: Optional[str] = None
     terrain_loss_db: Optional[List[float]] = None
@@ -450,39 +442,28 @@ class AttenuationGrid:
     terrain_state: Optional[List[str]] = None
     z_ground_m: Optional[List[float]] = None
 
-    def model_dump(self, *, exclude: Optional[set[str]] = None, **_: Any) -> Dict[str, Any]:
-        """Pydantic-compatible dump used by the existing REST layer.
+    # Large ISAC plans keep derived channel layers in compact NumPy arrays instead
+    # of materializing dozens of Python-float lists.  Private attrs are intentionally
+    # excluded from Pydantic serialization; the API/product layer explicitly reads
+    # them through ``channel_array``.  Small plans still populate the public list
+    # fields above for backwards compatibility and tests.
+    _channel_arrays: Dict[str, Any] = PrivateAttr(default_factory=dict)
 
-        NumPy arrays are converted only for fields that are actually included.
-        Large compact responses therefore avoid an otherwise expensive array-to-
-        Python-list conversion.
+    def set_channel_array(self, name: str, values: Any) -> None:
+        self._channel_arrays[str(name)] = values
+
+    def channel_array(self, name: str) -> Any:
+        """Return an internal array when present, otherwise the public field.
+
+        This keeps numerical layers array-backed during planning while preserving
+        the existing AttenuationGrid wire/schema surface for smaller responses.
         """
 
-        excluded = set(exclude or ())
+        if name in self._channel_arrays:
+            return self._channel_arrays[name]
+        return getattr(self, name, None)
 
-        def dump_value(value: Any) -> Any:
-            if value is None:
-                return None
-            if hasattr(value, "model_dump"):
-                return value.model_dump()
-            if isinstance(value, dict):
-                return {str(k): dump_value(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [dump_value(v) for v in value]
-            tolist = getattr(value, "tolist", None)
-            if callable(tolist):
-                return tolist()
-            item = getattr(value, "item", None)
-            if callable(item):
-                try:
-                    return item()
-                except Exception:
-                    pass
-            return value
+    def clear_channel_arrays(self) -> None:
+        self._channel_arrays.clear()
 
-        return {
-            f.name: dump_value(getattr(self, f.name))
-            for f in dataclass_fields(self)
-            if f.name not in excluded
-        }
 
