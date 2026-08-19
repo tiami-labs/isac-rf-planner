@@ -29,8 +29,8 @@ const plannedTxSiteKeys = new Set();
 const plannedRxSiteKeys = new Set();
 
 let sectorEntities = []; // visualization overlays (entities)
+let isacProbeEntities = []; // selected ISAC target geometry + iso-range ellipse
 let planResults = []; // { lat, lon, out, cacheCenter } per successful plan (for export)
-let channelInspectorEntities = [];
 
 function recordPlanResultForExport(out, requestLat, requestLon) {
   if (!out || typeof out !== "object") return;
@@ -55,6 +55,7 @@ window.RFPLANNER_DEBUG = {
   get planEntities() { return planEntities; },
   get rfEntities() { return rfEntities; },
   get sectorEntities() { return sectorEntities; },
+  get isacProbeEntities() { return isacProbeEntities; },
   get planPrimitives() { return planPrimitives; },
   get rfPrimitives() { return rfPrimitives; },
   get googleTileset() { return googleTileset; },
@@ -2304,9 +2305,6 @@ function clearOverlay() {
   }
   sectorEntities = [];
   planResults = [];
-  clearChannelInspector3d();
-  const channelPanel = document.getElementById("channel-target-inspector");
-  if (channelPanel) channelPanel.style.display = "none";
 
   planCounter = 0;
   plannedTxSiteKeys.clear();
@@ -2316,167 +2314,6 @@ function clearOverlay() {
   // Hide legend when overlay is cleared.
   const legend = document.getElementById("rsrp-legend");
   if (legend) legend.style.display = "none";
-}
-
-function channelProductInfo3d(result) {
-  const channel = result?.channel_analysis;
-  return result?.channel_analysis_product || channel?.data_product || null;
-}
-
-function channelInspectorEnabled3d() {
-  return !!document.getElementById("channel-analysis-enabled")?.checked &&
-    document.getElementById("channel-target-inspector-enabled")?.checked !== false;
-}
-
-function clearChannelInspector3d() {
-  if (!viewer) return;
-  for (const entity of channelInspectorEntities) {
-    try { viewer.entities.remove(entity); } catch {}
-  }
-  channelInspectorEntities = [];
-}
-
-function localMeters3d(lat, lon, originLat, originLon) {
-  const R = 6371000;
-  const rad = Math.PI / 180;
-  return {
-    x: (lon - originLon) * rad * R * Math.cos(originLat * rad),
-    y: (lat - originLat) * rad * R,
-  };
-}
-
-function localLatLon3d(x, y, originLat, originLon) {
-  const R = 6371000;
-  const rad = Math.PI / 180;
-  return {
-    lat: originLat + (y / R) / rad,
-    lon: originLon + (x / (R * Math.cos(originLat * rad))) / rad,
-  };
-}
-
-function bistaticEllipseCoordinates3d(tx, rx, totalPathM) {
-  const originLat = (Number(tx.latitude) + Number(rx.latitude)) / 2;
-  const originLon = (Number(tx.longitude) + Number(rx.longitude)) / 2;
-  const p1 = localMeters3d(Number(tx.latitude), Number(tx.longitude), originLat, originLon);
-  const p2 = localMeters3d(Number(rx.latitude), Number(rx.longitude), originLat, originLon);
-  const dx = p2.x - p1.x;
-  const dy = p2.y - p1.y;
-  const focusDistance = Math.hypot(dx, dy);
-  const a = Number(totalPathM) / 2;
-  const c = focusDistance / 2;
-  if (!Number.isFinite(a) || a <= c || a <= 0) return [];
-  const b = Math.sqrt(Math.max(a * a - c * c, 0));
-  const centerX = (p1.x + p2.x) / 2;
-  const centerY = (p1.y + p2.y) / 2;
-  const angle = Math.atan2(dy, dx);
-  const ca = Math.cos(angle);
-  const sa = Math.sin(angle);
-  const points = [];
-  for (let i = 0; i <= 180; i++) {
-    const t = (i / 180) * Math.PI * 2;
-    const ex = a * Math.cos(t);
-    const ey = b * Math.sin(t);
-    const x = centerX + ex * ca - ey * sa;
-    const y = centerY + ex * sa + ey * ca;
-    points.push(localLatLon3d(x, y, originLat, originLon));
-  }
-  return points;
-}
-
-function numberOrDash3d(value, digits = 1) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toFixed(digits) : "—";
-}
-
-function renderChannelTargetInspector3d(payload) {
-  const target = payload?.target || {};
-  const tx = payload?.transmitter || {};
-  const rx = payload?.receiver || {};
-  const m = payload?.metrics || {};
-  clearChannelInspector3d();
-
-  const txLat = Number(tx.latitude), txLon = Number(tx.longitude);
-  const rxLat = Number(rx.latitude), rxLon = Number(rx.longitude);
-  const targetLat = Number(target.latitude), targetLon = Number(target.longitude);
-  if ([txLat, txLon, rxLat, rxLon, targetLat, targetLon].every(Number.isFinite)) {
-    channelInspectorEntities.push(viewer.entities.add({
-      name: "TX to candidate target",
-      polyline: {
-        positions: Cesium.Cartesian3.fromDegreesArray([txLon, txLat, targetLon, targetLat]),
-        width: 4,
-        material: Cesium.Color.ORANGE.withAlpha(0.95),
-        clampToGround: true,
-      },
-    }));
-    channelInspectorEntities.push(viewer.entities.add({
-      name: "Candidate target to analysis receiver",
-      polyline: {
-        positions: Cesium.Cartesian3.fromDegreesArray([targetLon, targetLat, rxLon, rxLat]),
-        width: 4,
-        material: Cesium.Color.CYAN.withAlpha(0.95),
-        clampToGround: true,
-      },
-    }));
-    channelInspectorEntities.push(viewer.entities.add({
-      name: "Candidate target",
-      position: Cesium.Cartesian3.fromDegrees(targetLon, targetLat, 0),
-      point: { pixelSize: 12, color: Cesium.Color.MAGENTA, outlineColor: Cesium.Color.WHITE, outlineWidth: 2, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
-    }));
-    channelInspectorEntities.push(viewer.entities.add({
-      name: "Analysis receiver",
-      position: Cesium.Cartesian3.fromDegrees(rxLon, rxLat, 0),
-      point: { pixelSize: 11, color: Cesium.Color.CYAN, outlineColor: Cesium.Color.WHITE, outlineWidth: 2, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
-    }));
-    const ellipse = bistaticEllipseCoordinates3d(tx, rx, m.bistatic_path_range_m);
-    if (ellipse.length) {
-      channelInspectorEntities.push(viewer.entities.add({
-        name: "Iso-bistatic-range ellipse through candidate target",
-        polyline: {
-          positions: Cesium.Cartesian3.fromDegreesArray(ellipse.flatMap((p) => [p.lon, p.lat])),
-          width: 2,
-          material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.WHITE.withAlpha(0.9), dashLength: 16 }),
-          clampToGround: true,
-        },
-      }));
-    }
-  }
-
-  const panel = document.getElementById("channel-target-inspector");
-  if (panel) {
-    panel.style.display = "block";
-    panel.innerHTML = `
-      <div style="font-weight:600;margin-bottom:5px;">Selected target ${numberOrDash3d(target.latitude, 6)}, ${numberOrDash3d(target.longitude, 6)}</div>
-      <div>ISAC quality: <strong>${target.isac_quality_label || "—"}</strong> (class ${m.isac_quality_code ?? "—"})</div>
-      <div>TX→target loss: <strong>${numberOrDash3d(m.tx_target_path_loss_db)} dB</strong></div>
-      <div>TX→target environment: excess=${numberOrDash3d(m.tx_target_environment_excess_db)} dB; penetration=${numberOrDash3d(m.tx_target_penetration_loss_db)}; shadow=${numberOrDash3d(m.tx_target_shadow_loss_db)}; diffraction=${numberOrDash3d(m.tx_target_diffraction_loss_db)}; terrain=${numberOrDash3d(m.terrain_loss_db)}; canyon recovery=${numberOrDash3d(m.tx_target_canyon_recovery_db)} dB</div>
-      <div>TX pattern losses: horizontal=${numberOrDash3d(m.tx_target_horizontal_pattern_loss_db)} dB; vertical=${numberOrDash3d(m.tx_target_vertical_pattern_loss_db)} dB; obstacles=${m.tx_target_obstacles_count ?? "—"}; mode=${m.tx_target_propagation_mode || "—"}</div>
-      <div>Target→RX loss: <strong>${numberOrDash3d(m.return_path_loss_db)} dB</strong> (${numberOrDash3d(m.return_environment_excess_db)} dB environment excess)</div>
-      <div>Total bistatic loss: <strong>${numberOrDash3d(m.total_bistatic_path_loss_db)} dB</strong></div>
-      <div>Incident power: <strong>${numberOrDash3d(m.incident_isotropic_power_dbm)} dBm</strong></div>
-      <div>Expected echo: <strong>${numberOrDash3d(m.echo_power_dbm)} dBm</strong></div>
-      <div>Post-processing SNR / margin: <strong>${numberOrDash3d(m.postprocessing_snr_db)} / ${numberOrDash3d(m.detection_margin_db)} dB</strong></div>
-      <div>Doppler: <strong>${numberOrDash3d(m.doppler_hz)} Hz</strong>; resolved=${m.doppler_resolved ? "yes" : "no"}; ambiguous=${m.doppler_ambiguous ? "yes" : "no"}</div>
-      <div>Total path: <strong>${numberOrDash3d(Number(m.bistatic_path_range_m) / 1000, 3)} km</strong>; excess delay=${numberOrDash3d(Number(m.excess_delay_s) * 1e6, 3)} µs; angle=${numberOrDash3d(m.bistatic_angle_deg)}°</div>
-      <div>Detectable under configured thresholds: <strong>${m.detectable ? "yes" : "no"}</strong></div>
-    `;
-  }
-  viewer.scene.requestRender();
-}
-
-async function inspectChannelTarget3d(lat, lon) {
-  if (!channelInspectorEnabled3d()) return false;
-  const result = window._lastPlanResult;
-  const product = channelProductInfo3d(result);
-  if (!product?.product_id && !product?.download_url) return false;
-  const productId = product.product_id || String(product.download_url).split("/").filter(Boolean).pop();
-  if (!productId) return false;
-  setStatus(`Inspecting candidate target at ${lat.toFixed(6)}, ${lon.toFixed(6)}...`);
-  const response = await fetch(`/api/channel-analysis/products/${encodeURIComponent(productId)}/nearest?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`);
-  if (!response.ok) throw new Error(await response.text());
-  const payload = await response.json();
-  renderChannelTargetInspector3d(payload);
-  setStatus(`Target inspected: quality=${payload.target?.isac_quality_label || "unknown"}, echo=${numberOrDash3d(payload.metrics?.echo_power_dbm)} dBm, margin=${numberOrDash3d(payload.metrics?.detection_margin_db)} dB.`);
-  return true;
 }
 
 function updateRSRPLegend(scaleMinRSRP, scaleMaxRSRP, actualMinRSRP, actualMaxRSRP) {
@@ -2516,11 +2353,15 @@ function updateRSRPLegend(scaleMinRSRP, scaleMaxRSRP, actualMinRSRP, actualMaxRS
   const legendUnit = selectedLayer === "field_strength" ? "dBµV/m"
     : ["rsrp", "received_power", "incident_power", "bistatic_echo"].includes(selectedLayer) ? "dBm"
     : selectedLayer === "bistatic_doppler" ? "Hz"
+    : selectedLayer === "doppler_sensitivity" ? "Hz/(m/s)"
+    : selectedLayer === "minimum_detectable_speed" ? "m/s"
+    : selectedLayer === "minimum_detectable_rcs" ? "dBsm"
+    : selectedLayer === "static_clutter_delay_separation" ? "µs"
+    : selectedLayer === "static_clutter_path_count" ? "count"
     : selectedLayer === "bistatic_range" ? "km"
     : selectedLayer === "bistatic_delay" ? "µs"
     : selectedLayer === "bistatic_angle" ? "deg"
-    : selectedLayer === "bistatic_detectable" ? "flag"
-    : selectedLayer === "isac_quality" ? "class"
+    : ["bistatic_detectable", "screening_detectable", "qualified_detectable", "static_clutter_overlap", "target_measurement_cell"].includes(selectedLayer) ? "flag"
     : "dB";
   const maxUnit = document.getElementById("legend-unit-max");
   const minUnit = document.getElementById("legend-unit-min");
@@ -2568,6 +2409,8 @@ function pickHeatmapForLayer(plan, layer) {
   const covLayer = layer || (
     typeof RFTerrainParams !== "undefined" ? RFTerrainParams.getCoverageDisplayLayer() : "rsrp"
   );
+  const interactive = plan?._interactive_isac;
+  if (interactive?.layer?.png_b64 && interactive.layer.layer === covLayer) return interactive.layer;
   if (covLayer === "terrain_shadow" && plan.heatmap_terrain?.png_b64) return plan.heatmap_terrain;
   if (covLayer === "sinr" && plan.heatmap_sinr?.png_b64) return plan.heatmap_sinr;
   if (covLayer === "carrier_to_noise" && plan.heatmap_carrier_to_noise?.png_b64) return plan.heatmap_carrier_to_noise;
@@ -2581,9 +2424,6 @@ function pickHeatmapForLayer(plan, layer) {
   if (covLayer === "bistatic_delay" && plan.heatmap_bistatic_excess_delay?.png_b64) return plan.heatmap_bistatic_excess_delay;
   if (covLayer === "bistatic_angle" && plan.heatmap_bistatic_angle?.png_b64) return plan.heatmap_bistatic_angle;
   if (covLayer === "bistatic_detectable" && plan.heatmap_bistatic_detectable?.png_b64) return plan.heatmap_bistatic_detectable;
-  if (covLayer === "bistatic_return_loss" && plan.heatmap_bistatic_return_path_loss?.png_b64) return plan.heatmap_bistatic_return_path_loss;
-  if (covLayer === "bistatic_total_loss" && plan.heatmap_bistatic_total_path_loss?.png_b64) return plan.heatmap_bistatic_total_path_loss;
-  if (covLayer === "isac_quality" && plan.heatmap_isac_quality?.png_b64) return plan.heatmap_isac_quality;
   return plan.heatmap;
 }
 
@@ -2652,12 +2492,12 @@ function renderGridCoverage(grid) {
     updateRSRPLegend(0, Math.max(vmax, 1), vmin, vmax);
   } else if (layer === "bistatic_angle") {
     updateRSRPLegend(0, 180, vmin, vmax);
-  } else if (layer === "bistatic_detectable") {
+  } else if (["bistatic_detectable", "screening_detectable", "qualified_detectable", "static_clutter_overlap"].includes(layer)) {
     updateRSRPLegend(0, 1, vmin, vmax);
-  } else if (layer === "bistatic_return_loss" || layer === "bistatic_total_loss") {
-    updateRSRPLegend(Math.min(vmin, vmax), Math.max(vmax, vmin + 1), vmin, vmax);
-  } else if (layer === "isac_quality") {
-    updateRSRPLegend(0, 5, vmin, vmax);
+  } else if (["minimum_detectable_speed", "doppler_sensitivity", "required_cancellation"].includes(layer)) {
+    updateRSRPLegend(Math.min(0, vmin), Math.max(vmax, 1), vmin, vmax);
+  } else if (["minimum_detectable_rcs", "rcs_margin", "direct_residual_margin"].includes(layer)) {
+    updateRSRPLegend(vmin, Math.max(vmax, vmin + 0.001), vmin, vmax);
   } else {
     updateRSRPLegend(FIXED_RSRP_MIN, FIXED_RSRP_MAX, vmin, vmax);
   }
@@ -2780,6 +2620,323 @@ function offsetEnuToLatLon(latDeg, lonDeg, eastM, northM) {
   const dLat = (northM / R) * (180.0 / Math.PI);
   const dLon = (eastM / (R * Math.cos(φ))) * (180.0 / Math.PI);
   return { lat: latDeg + dLat, lon: lonDeg + dLon };
+}
+
+function clearIsacProbe3d() {
+  for (const e of isacProbeEntities) {
+    try { viewer.entities.remove(e); } catch { /* ignore */ }
+  }
+  isacProbeEntities = [];
+  const output = document.getElementById("channel-target-probe-output");
+  if (output) output.hidden = true;
+}
+
+function addIsacProbeEntity(spec) {
+  const entity = viewer.entities.add(spec);
+  isacProbeEntities.push(entity);
+  return entity;
+}
+
+function latLonToLocalEnu3d(originLat, originLon, lat, lon) {
+  const R = 6371000.0;
+  const φ = Cesium.Math.toRadians(originLat);
+  return {
+    east: Cesium.Math.toRadians(lon - originLon) * R * Math.cos(φ),
+    north: Cesium.Math.toRadians(lat - originLat) * R,
+  };
+}
+
+function currentChannelProduct3d() {
+  const out = window._lastPlanResult;
+  return out?.channel_analysis?.data_product || out?.channel_analysis_product || null;
+}
+
+const INTERACTIVE_ISAC_LAYERS_3D = new Set([
+  "bistatic_echo", "bistatic_snr", "bistatic_margin", "rcs_margin",
+  "minimum_detectable_rcs", "bistatic_doppler", "doppler_sensitivity",
+  "minimum_detectable_speed", "required_cancellation", "direct_residual_margin",
+  "static_clutter_delay_separation", "static_clutter_overlap", "static_clutter_path_count", "target_measurement_cell",
+  "screening_detectable", "qualified_detectable",
+]);
+
+function parseIsacLocationInput3d(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const parts = text.split(/[\s,;]+/).filter(Boolean).map(Number);
+  if (parts.length !== 2 || parts.some((v) => !Number.isFinite(v))) throw new Error("Selected target must be latitude, longitude.");
+  return { latitude: parts[0], longitude: parts[1] };
+}
+
+function isacSceneFingerprint3d(config) {
+  const receiver = config?.receiver || {};
+  return JSON.stringify({
+    receiverGeometry: { latitude: Number(receiver.latitude), longitude: Number(receiver.longitude), altitudeMamsl: Number(receiver.altitudeMamsl), antennaHeightMagl: Number(receiver.antennaHeightMagl) }, targetHeightMagl: Number(config?.target?.heightMagl),
+    returnPathModel: config?.returnPathModel, returnPathResolutionM: Number(config?.returnPathResolutionM),
+  });
+}
+
+function currentIsacRequest3d(layerOverride, selectedOverride) {
+  if (typeof window.RFWaveformBuildChannelAnalysis !== "function") throw new Error("ISAC waveform controls are unavailable.");
+  const cfg = window.RFWaveformBuildChannelAnalysis();
+  if (!cfg) throw new Error("Enable ISAC analysis first.");
+  const base = window._lastPlanResult?.rf_config_used?.channel_analysis;
+  if (!base) throw new Error("Run Plan RF once to build the physical ISAC scene.");
+  if (isacSceneFingerprint3d(cfg) !== isacSceneFingerprint3d(base)) {
+    throw new Error("A physical-scene input changed. Run Plan RF before applying this hypothesis.");
+  }
+  const selected = selectedOverride || parseIsacLocationInput3d(document.getElementById("channel-selected-target-location")?.value);
+  const layer = layerOverride || document.getElementById("coverage-display-layer")?.value || "qualified_detectable";
+  const req = {
+    receiver: cfg.receiver,
+    target: { heightMagl: cfg.target.heightMagl, bistaticRcsM2: cfg.target.bistaticRcsM2 },
+    motion: cfg.motion, processing: cfg.processing,
+    layer: INTERACTIVE_ISAC_LAYERS_3D.has(layer) ? layer : "qualified_detectable", imageSize: 1024,
+  };
+  if (selected) { req.selectedLatitude = selected.latitude; req.selectedLongitude = selected.longitude; }
+  return req;
+}
+
+async function evaluateIsacScene3d({ layer = null, selected = null, render = true } = {}) {
+  const productId = String(currentChannelProduct3d()?.product_id || "").trim();
+  if (!productId) throw new Error("No reusable ISAC scene product is available. Run Plan RF first.");
+  const request = currentIsacRequest3d(layer, selected);
+  const response = await fetch(`/api/channel-analysis/products/${encodeURIComponent(productId)}/evaluate`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.detail || `ISAC evaluate HTTP ${response.status}`);
+  window._activeIsacAnalysis = payload;
+  window._lastPlanResult._interactive_isac = payload;
+  if (payload.selected_target) {
+    const el = document.getElementById("channel-selected-target-location");
+    if (el) el.value = `${Number(payload.selected_target.latitude).toFixed(8)}, ${Number(payload.selected_target.longitude).toFixed(8)}`;
+    renderIsacTargetProbe3d(payload);
+  }
+  if (render) {
+    clearCoverageOverlay();
+    await applyPlanResponseToViewer(window._lastPlanResult, { refreshStreetLabelsOnSuccess: false, statusPrefix: "ISAC" });
+  }
+  const c = payload.counts || {}, q = payload.processing_assessment || {};
+  setStatus(`ISAC scene reused: ${Number(c.qualified_detectable || 0).toLocaleString()} processing-qualified, ${Number(c.screening_detectable || 0).toLocaleString()} screening points; ${q.qualified ? "effective gain qualified" : "ideal-BT screening only"}.`);
+  return payload;
+}
+
+function renderIsacTargetProbe3d(payload) {
+  const v = payload?.selected_target || payload?.values || {};
+  const txRaw = payload?.transmitter;
+  const rxRaw = payload?.receiver;
+  if (!v || !txRaw || !rxRaw) throw new Error("ISAC result is missing TX/RX/target geometry metadata.");
+
+  const targetLat = Number(v.latitude ?? payload?.target?.latitude);
+  const targetLon = Number(v.longitude ?? payload?.target?.longitude);
+  const tx = { lat: Number(txRaw.latitude), lon: Number(txRaw.longitude), h: Number(txRaw.absolute_height_m || 0) };
+  const rx = {
+    lat: Number(rxRaw.latitude), lon: Number(rxRaw.longitude),
+    h: Number(rxRaw.altitudeMamsl || 0) + Number(rxRaw.antennaHeightMagl || 0),
+  };
+  const p = { lat: targetLat, lon: targetLon, h: Number(v.absolute_height_m || 0) };
+  if (![tx.lat, tx.lon, rx.lat, rx.lon, p.lat, p.lon].every(Number.isFinite)) {
+    throw new Error("ISAC result contains invalid TX/RX/target coordinates.");
+  }
+
+  clearIsacProbe3d();
+  const targetCellOverlay = payload?.target_measurement_overlay;
+  if (targetCellOverlay?.png_b64 && Number.isFinite(Number(targetCellOverlay.radius_m))) {
+    const r = Number(targetCellOverlay.radius_m);
+    const sw = offsetEnuToLatLon(tx.lat, tx.lon, -r, -r);
+    const ne = offsetEnuToLatLon(tx.lat, tx.lon, r, r);
+    addIsacProbeEntity({ rectangle: {
+      coordinates: Cesium.Rectangle.fromDegrees(sw.lon, sw.lat, ne.lon, ne.lat),
+      material: new Cesium.ImageMaterialProperty({ image: targetCellOverlay.png_b64, transparent: true }),
+      height: 1.0, classificationType: Cesium.ClassificationType.BOTH,
+    }});
+  }
+  addIsacProbeEntity({ polyline: {
+    positions: Cesium.Cartesian3.fromDegreesArrayHeights([
+      tx.lon, tx.lat, tx.h, p.lon, p.lat, p.h, rx.lon, rx.lat, rx.h,
+    ]), width: 4, material: Cesium.Color.CYAN,
+  }});
+  addIsacProbeEntity({ polyline: {
+    positions: Cesium.Cartesian3.fromDegreesArrayHeights([tx.lon, tx.lat, tx.h, rx.lon, rx.lat, rx.h]),
+    width: 2, material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.WHITE, dashLength: 16 }),
+  }});
+  addIsacProbeEntity({
+    position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.h),
+    point: { pixelSize: 12, color: Cesium.Color.ORANGERED, outlineColor: Cesium.Color.YELLOW, outlineWidth: 2 },
+    label: { text: "Selected target", font: "13px sans-serif", fillColor: Cesium.Color.WHITE,
+      pixelOffset: new Cesium.Cartesian2(0, -20), disableDepthTestDistance: Number.POSITIVE_INFINITY },
+  });
+  addIsacProbeEntity({
+    position: Cesium.Cartesian3.fromDegrees(rx.lon, rx.lat, rx.h),
+    point: { pixelSize: 10, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 1 },
+    label: { text: "Analysis RX", font: "12px sans-serif", fillColor: Cesium.Color.WHITE,
+      pixelOffset: new Cesium.Cartesian2(0, -18), disableDepthTestDistance: Number.POSITIVE_INFINITY },
+  });
+
+  const midLat = (tx.lat + rx.lat) / 2.0, midLon = (tx.lon + rx.lon) / 2.0;
+  const txVec = latLonToLocalEnu3d(midLat, midLon, tx.lat, tx.lon);
+  const rxVec = latLonToLocalEnu3d(midLat, midLon, rx.lat, rx.lon);
+  const dx = rxVec.east - txVec.east, dy = rxVec.north - txVec.north, baseline = Math.hypot(dx, dy);
+  const a = Number(v.bistatic_path_range_m) / 2.0, c = baseline / 2.0;
+  if (Number.isFinite(a) && a > c && baseline > 0.01) {
+    const b = Math.sqrt(Math.max(0, a * a - c * c));
+    const ux = dx / baseline, uy = dy / baseline, vx = -uy, vy = ux, flat = [];
+    for (let i = 0; i <= 160; i++) {
+      const t = (2 * Math.PI * i) / 160, major = a * Math.cos(t), minor = b * Math.sin(t);
+      const ll = offsetEnuToLatLon(midLat, midLon, major * ux + minor * vx, major * uy + minor * vy);
+      flat.push(ll.lon, ll.lat, p.h);
+    }
+    addIsacProbeEntity({ polyline: { positions: Cesium.Cartesian3.fromDegreesArrayHeights(flat), width: 2,
+      material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.ORANGE, dashLength: 14 }) }});
+  }
+
+  const fmt = (value, digits = 1) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "n/a";
+  const yesno = (x) => x === true ? "yes" : x === false ? "no" : "n/a";
+  const bg = v?.static_background || {};
+  const bgNearest = bg?.nearest_static_path || {};
+  const bgContrib = Array.isArray(bg?.same_cell_contributors) ? bg.same_cell_contributors : [];
+  const bgContributorText = bgContrib.length
+    ? bgContrib.slice(0, 3).map((x) => `OSM ${x.building_id ?? "?"} ${x.material || "unknown"}`).join("; ")
+    : "none in same ideal cell";
+  const escHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+  const bgPathTable = bgContrib.length ? `<details style="margin:5px 0;"><summary style="cursor:pointer;color:#c9a7ff;">Same-cell facade path table (${bgContrib.length})</summary>
+    <div style="overflow-x:auto;"><table style="width:100%;font-size:10px;border-collapse:collapse;margin-top:4px;">
+      <thead><tr><th>#</th><th>OSM</th><th>material</th><th>delay µs</th><th>path km</th><th>bounce lat,lon</th></tr></thead>
+      <tbody>${bgContrib.slice(0, 10).map((x, i) => {
+        const blat = Number(x.bounce_latitude_deg), blon = Number(x.bounce_longitude_deg);
+        const bounce = Number.isFinite(blat) && Number.isFinite(blon) ? `${blat.toFixed(6)}, ${blon.toFixed(6)}` : "n/a";
+        return `<tr><td>${i + 1}</td><td>${escHtml(x.building_id ?? "?")}</td><td>${escHtml(x.material || "unknown")}</td><td>${fmt(Number(x.excess_delay_s) * 1e6, 3)}</td><td>${fmt(Number(x.total_path_m) / 1000, 3)}</td><td>${bounce}</td></tr>`;
+      }).join("")}</tbody>
+    </table></div></details>` : "";
+  const delayDopplerSvg = (() => {
+    const paths = Array.isArray(bg?.delay_doppler_paths) ? bg.delay_doppler_paths : [];
+    const targetDelayUs = Number(v?.excess_delay_s) * 1e6;
+    const targetDopplerHz = Number(v?.doppler_hz);
+    if (!paths.length || !Number.isFinite(targetDelayUs) || !Number.isFinite(targetDopplerHz)) return "";
+    const delayResUs = Math.max(Number(bg?.delay_resolution_s) * 1e6 || 0, 1e-6);
+    const dopplerResHz = Math.max(Number(bg?.doppler_resolution_hz) || 0, 1e-6);
+    const delays = paths.map((x) => Number(x.excess_delay_s) * 1e6).filter(Number.isFinite);
+    if (!delays.length) return "";
+    let xMin = Math.min(targetDelayUs, ...delays);
+    let xMax = Math.max(targetDelayUs, ...delays);
+    const xPad = Math.max(delayResUs * 2, (xMax - xMin) * 0.06, 0.05);
+    xMin -= xPad; xMax += xPad;
+    const yAbs = Math.max(Math.abs(targetDopplerHz) * 1.15, dopplerResHz * 2.0, 1.0);
+    const W = 360, H = 180, L = 46, R = 10, T = 18, B = 34;
+    const sx = (x) => L + (x - xMin) / Math.max(xMax - xMin, 1e-9) * (W - L - R);
+    const sy = (y) => T + (yAbs - y) / (2 * yAbs) * (H - T - B);
+    const circles = paths.map((x) => {
+      const dx = Number(x.excess_delay_s) * 1e6;
+      if (!Number.isFinite(dx)) return "";
+      return `<circle cx="${sx(dx).toFixed(2)}" cy="${sy(0).toFixed(2)}" r="3.4" fill="#64b5f6" fill-opacity="0.72" stroke="#d7efff" stroke-width="0.6"/>`;
+    }).join("");
+    const cellX0 = sx(targetDelayUs - 0.5 * delayResUs);
+    const cellX1 = sx(targetDelayUs + 0.5 * delayResUs);
+    const cellY0 = sy(0.5 * dopplerResHz);
+    const cellY1 = sy(-0.5 * dopplerResHz);
+    return `<div style="margin:7px 0 3px;color:#aaa;font-size:10px;">Mapped facade specular paths in ideal delay–Doppler coordinates (geometry only)</div>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:420px;background:#10151d;border:1px solid #2d3c4d;border-radius:4px;">
+        <line x1="${L}" y1="${sy(0).toFixed(2)}" x2="${W-R}" y2="${sy(0).toFixed(2)}" stroke="#66788a" stroke-width="1"/>
+        <line x1="${L}" y1="${T}" x2="${L}" y2="${H-B}" stroke="#66788a" stroke-width="1"/>
+        <rect x="${Math.min(cellX0,cellX1).toFixed(2)}" y="${Math.min(cellY0,cellY1).toFixed(2)}" width="${Math.max(Math.abs(cellX1-cellX0),1).toFixed(2)}" height="${Math.max(Math.abs(cellY1-cellY0),1).toFixed(2)}" fill="#ffeb3b" fill-opacity="0.08" stroke="#ffeb3b" stroke-dasharray="3,2" stroke-width="1"/>
+        ${circles}
+        <circle cx="${sx(targetDelayUs).toFixed(2)}" cy="${sy(targetDopplerHz).toFixed(2)}" r="5.5" fill="#ff5722" stroke="#ffeb3b" stroke-width="1.5"/>
+        <text x="${L}" y="${H-8}" fill="#aebdca" font-size="10">excess delay (µs): ${xMin.toFixed(2)} … ${xMax.toFixed(2)}</text>
+        <text x="6" y="12" fill="#aebdca" font-size="10">Doppler ±${yAbs.toFixed(2)} Hz</text>
+        <text x="${W-145}" y="${H-8}" fill="#ffdb86" font-size="10">target ${targetDelayUs.toFixed(3)} µs / ${targetDopplerHz.toFixed(2)} Hz</text>
+      </svg>`;
+  })();
+  const output = document.getElementById("channel-target-probe-output");
+  if (output) {
+    output.hidden = false;
+    output.innerHTML = `
+      <div style="font-weight:bold;color:#fff;margin-bottom:6px;">Selected target analysis</div>
+      <table class="isac-target-table"><tbody>
+        <tr><th colspan="2">Target</th></tr>
+        <tr><td>Location</td><td>${p.lat.toFixed(7)}, ${p.lon.toFixed(7)}</td></tr>
+        <tr><td>Scene interpolation</td><td>${v?.scene_interpolation?.method || "n/a"}</td></tr>
+        <tr><td>Interpolation max neighbor</td><td>${fmt(v?.scene_interpolation?.max_neighbor_distance_m, 1)} m</td></tr>
+        <tr><td>Ideal delay / Doppler resolution</td><td>${fmt(Number(v?.measurement_cell?.delay_resolution_s) * 1e6, 3)} µs / ${fmt(v?.measurement_cell?.doppler_resolution_hz, 3)} Hz</td></tr>
+        <tr><td>Locations in same ideal measurement cell</td><td>${v?.measurement_cell?.joint_cell_point_count ?? "n/a"}</td></tr>
+        <tr><td>Target height AGL</td><td>${fmt(v.target_height_agl_m ?? payload?.target?.heightMagl, 1)} m</td></tr>
+        <tr><td>Bistatic RCS</td><td>${fmt(v.bistatic_rcs_m2, 3)} m²</td></tr>
+        <tr><td>Motion</td><td>${fmt(payload?.motion?.speedMps, 2)} m/s @ ${fmt(payload?.motion?.headingDegTrue, 1)}° true; climb ${fmt(payload?.motion?.climbRateMps, 2)} m/s</td></tr>
+        <tr><th colspan="2">TX → target illumination</th></tr>
+        <tr><td>Range</td><td>${fmt(v.tx_target_range_m / 1000, 3)} km</td></tr>
+        <tr><td>Incident power</td><td>${fmt(v.incident_isotropic_power_dbm, 2)} dBm</td></tr>
+        <tr><td>Propagation path loss</td><td>${fmt(v.tx_target_path_loss_db, 2)} dB</td></tr>
+        <tr><td>Environment / terrain loss</td><td>${fmt(v.tx_target_environment_loss_db, 2)} / ${fmt(v.tx_target_terrain_loss_db, 2)} dB</td></tr>
+        <tr><td>TX→target LOS / sample error</td><td>${yesno(v.tx_target_los)} / ${fmt(v.tx_target_sample_error_m, 1)} m</td></tr>
+        <tr><th colspan="2">Target → RX environment</th></tr>
+        <tr><td>Range</td><td>${fmt(v.target_receiver_range_m / 1000, 3)} km</td></tr>
+        <tr><td>Return path loss</td><td>${fmt(v.return_path_loss_db, 2)} dB</td></tr>
+        <tr><td>Environment / terrain loss</td><td>${fmt(v.return_environment_loss_db, 2)} / ${fmt(v.return_terrain_loss_db, 2)} dB</td></tr>
+        <tr><td>Environment valid / LOS</td><td>${yesno(v.return_environment_valid)} / ${yesno(v.return_los)}</td></tr>
+        <tr><th colspan="2">Bistatic geometry / observability</th></tr>
+        <tr><td>Total path / angle</td><td>${fmt(v.bistatic_path_range_m / 1000, 3)} km / ${fmt(v.bistatic_angle_deg, 2)}°</td></tr>
+        <tr><td>Excess delay</td><td>${fmt(Number(v.excess_delay_s) * 1e6, 3)} µs</td></tr>
+        <tr><td>Signed Doppler</td><td>${fmt(v.doppler_hz, 2)} Hz</td></tr>
+        <tr><td>Doppler sensitivity</td><td>${fmt(v.doppler_sensitivity_hz_per_mps, 4)} Hz/(m/s)</td></tr>
+        <tr><td>Configured-motion sensitivity</td><td>${fmt(v.motion_doppler_sensitivity_hz_per_mps, 4)} Hz/(m/s)</td></tr>
+        <tr><td>Best-heading min detectable speed</td><td>${fmt(v.minimum_detectable_speed_mps, 3)} m/s</td></tr>
+        <tr><th colspan="2">Mapped static-building background</th></tr>
+        <tr><td>Background status</td><td>${bg.status || bg.reason || "not available"}</td></tr>
+        <tr><td>Facades scanned</td><td>${bg.candidate_walls ?? "n/a"}</td></tr>
+        <tr><td>Finite specular candidates</td><td>${bg.geometric_specular_candidates ?? "n/a"}</td></tr>
+        <tr><td>Visibility candidates evaluated</td><td>${bg.evaluated_wall_candidates ?? "n/a"}</td></tr>
+        <tr><td>Visibility search complete</td><td>${yesno(bg.candidate_search_complete)}</td></tr>
+        <tr><td>Accepted visible specular paths</td><td>${bg.accepted_paths ?? "n/a"}</td></tr>
+        <tr><td>Geometry / TX vis / RX vis rejected</td><td>${bg?.rejection_counts?.geometry_rejected ?? "n/a"} / ${bg?.rejection_counts?.visibility_tx_blocked ?? "n/a"} / ${bg?.rejection_counts?.visibility_rx_blocked ?? "n/a"}</td></tr>
+        <tr><td>Target in static Doppler cell</td><td>${yesno(bg.target_in_static_doppler_cell)}</td></tr>
+        <tr><td>Same-cell mapped path count</td><td>${bg.same_cell_path_count ?? "n/a"}</td></tr>
+        <tr><td>Nearest clutter delay separation</td><td>${bg.nearest_static_path_delay_separation_s == null ? "n/a" : fmt(Number(bg.nearest_static_path_delay_separation_s) * 1e6, 3) + " µs"}</td></tr>
+        <tr><td>Nearest mapped reflector</td><td>${bgNearest.building_id == null ? "n/a" : `OSM ${bgNearest.building_id} / ${bgNearest.material || "unknown"}`}</td></tr>
+        <tr><td>Same-cell contributors</td><td>${bgContributorText}</td></tr>
+        ${bgPathTable ? `<tr><td colspan="2" style="padding:2px 0;">${bgPathTable}</td></tr>` : ""}
+        ${delayDopplerSvg ? `<tr><td colspan="2" style="padding:4px 0;">${delayDopplerSvg}</td></tr>` : ""}
+        <tr><th colspan="2">Echo / detector constraints</th></tr>
+        <tr><td>Echo power</td><td>${fmt(v.echo_power_dbm, 2)} dBm</td></tr>
+        <tr><td>Post-processing SNR / N+I margin</td><td>${fmt(v.postprocessing_snr_db, 2)} / ${fmt(v.detection_margin_db, 2)} dB</td></tr>
+        <tr><td>Minimum detectable RCS / RCS margin</td><td>${fmt(v.minimum_detectable_rcs_m2, 4)} m² / ${fmt(v.rcs_margin_db, 2)} dB</td></tr>
+        <tr><td>Echo / residual-direct ratio</td><td>${fmt(v.echo_to_residual_direct_db, 2)} dB</td></tr>
+        <tr><td>Direct-path constraint margin / OK</td><td>${fmt(v.direct_residual_margin_db, 2)} dB / ${yesno(v.direct_residual_ok)}</td></tr>
+        <tr><td>Required cancellation</td><td>${fmt(v.required_cancellation_db, 2)} dB</td></tr>
+        <tr><td>Dynamic range / margin / OK</td><td>${fmt(v.required_dynamic_range_db, 2)} / ${fmt(v.dynamic_range_margin_db, 2)} dB / ${yesno(v.dynamic_range_ok)}</td></tr>
+        <tr><td>Doppler resolved / ambiguous</td><td>${yesno(v.doppler_resolved)} / ${yesno(v.doppler_ambiguous)}</td></tr>
+        <tr><td>Screening / processing-qualified detectable</td><td>${yesno(v.detectable_screening)} / <strong>${yesno(v.detectable_qualified)}</strong></td></tr>
+        <tr><td>Failed constraints</td><td>${Array.isArray(v.failed_constraints) && v.failed_constraints.length ? v.failed_constraints.join(", ") : "none"}</td></tr>
+        <tr><td>Constraint failure code</td><td>${Number(v.constraint_failure_code ?? 0)}</td></tr>
+        <tr><th colspan="2">Processing / interference basis</th></tr>
+        <tr><td>Thermal noise</td><td>${fmt(payload.processing_assessment?.thermal_noise_power_dbm, 2)} dBm</td></tr>
+        <tr><td>Interference + clutter</td><td>${payload.processing_assessment?.interference_plus_clutter_power_dbm == null ? "not supplied" : fmt(payload.processing_assessment.interference_plus_clutter_power_dbm, 2) + " dBm"}</td></tr>
+        <tr><td>Effective N+I</td><td>${fmt(payload.processing_assessment?.effective_noise_plus_interference_dbm, 2)} dBm</td></tr>
+        <tr><td>Gain source / used</td><td>${payload.processing_assessment?.gain_source || "n/a"} / ${fmt(payload.processing_assessment?.used_processing_gain_db, 2)} dB</td></tr>
+        <tr><td>Effective gain / interference basis qualified</td><td>${yesno(payload.processing_assessment?.effective_gain_qualified)} / ${yesno(payload.processing_assessment?.interference_input_qualified)}</td></tr>
+        <tr><td>SNR vs noise+interference constraint</td><td>${yesno(v.snr_noise_interference_ok)}</td></tr>
+        <tr><td>Direct RX power / residual</td><td>${fmt(payload?.direct_path?.received_power_dbm, 2)} / ${fmt(payload?.direct_path?.residual_after_cancellation_dbm, 2)} dBm</td></tr>
+        <tr><td>Direct-path model</td><td>${payload?.direct_path?.model || "n/a"}</td></tr>
+      </tbody></table>
+      <div class="hint" style="margin-top:6px;">Processing-qualified detectability requires all enabled channel constraints plus a validated effective processing gain and the required interference/clutter basis.</div>`;
+  }
+}
+
+async function tryIsacTargetProbe3d(lat, lon) {
+  const enabled = !!document.getElementById("channel-analysis-enabled")?.checked;
+  const productId = String(currentChannelProduct3d()?.product_id || "").trim();
+  if (!enabled || !productId) return false;
+  try {
+    setStatus("Evaluating selected target against the reusable ISAC scene...");
+    const input = document.getElementById("channel-selected-target-location");
+    if (input) input.value = `${Number(lat).toFixed(8)}, ${Number(lon).toFixed(8)}`;
+    await evaluateIsacScene3d({ selected: { latitude: lat, longitude: lon }, render: false });
+    return true;
+  } catch (err) {
+    console.error("ISAC 3D target evaluation failed:", err);
+    setStatus(`ISAC target evaluation failed: ${err}`);
+    return true;
+  }
 }
 
 /** One city-style PNG drape: Cesium ellipse clamped to ground/tiles (unchanged city geometry). */
@@ -3509,6 +3666,41 @@ async function captureViewBlob(includeRf) {
   }
 }
 
+async function appendIsacHypothesisBundleToExport3d(out, prefix, extraBlobs) {
+  const product = out?.channel_analysis?.data_product || out?.channel_analysis_product;
+  const productId = String(product?.product_id || "").trim();
+  if (!productId) return;
+  const summary = out?.channel_analysis || {};
+  const active = out?._interactive_isac || (
+    window._activeIsacAnalysis?.product_id === productId ? window._activeIsacAnalysis : null
+  );
+  const source = active || summary;
+  if (!source?.receiver || !source?.target || !source?.motion || !source?.processing) return;
+  const request = {
+    receiver: source.receiver,
+    target: source.target,
+    motion: source.motion,
+    processing: source.processing,
+    layers: Array.from(INTERACTIVE_ISAC_LAYERS_3D),
+    imageSize: 1024,
+  };
+  const response = await fetch(`/api/channel-analysis/products/${encodeURIComponent(productId)}/evaluate-bundle`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.detail || `ISAC export evaluate HTTP ${response.status}`);
+  const manifest = { ...payload, layers: Object.fromEntries(Object.entries(payload.layers || {}).map(([name, hm]) => [name, { ...hm, png_b64: undefined }])) };
+  if (active?.selected_target) manifest.selected_target = active.selected_target;
+  extraBlobs[`${prefix}/isac_current_hypothesis_bundle.json`] = new Blob(
+    [JSON.stringify(manifest, null, 2)], { type: "application/json" },
+  );
+  for (const [name, hm] of Object.entries(payload.layers || {})) {
+    if (!hm?.png_b64) continue;
+    const safe = String(name).replace(/[^a-zA-Z0-9_-]/g, "_");
+    extraBlobs[`${prefix}/heatmaps/current_hypothesis_${safe}.png`] = window.RFExportUtils.base64DataUrlToBlob(hm.png_b64);
+  }
+}
+
 async function exportCurrentView() {
   if (!viewer) return;
 
@@ -3560,15 +3752,66 @@ async function exportCurrentView() {
         })
       : { plans: [], road_names: roadNames };
 
-    const artifacts = window.RFExportUtils?.collectPlanExportArtifacts
-      ? await window.RFExportUtils.collectPlanExportArtifacts(planResults)
-      : { files: {}, manifest: null };
-    if (artifacts.manifest) metadata.complete_export_manifest = artifacts.manifest;
-
     const ts = new Date();
     const filename = `rf_planner_export_${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, "0")}-${String(ts.getDate()).padStart(2, "0")}_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}.zip`;
 
-    const extraBlobs = { "full_view_without_rf.png": fullViewWithoutRf, ...artifacts.files };
+    const extraBlobs = { "full_view_without_rf.png": fullViewWithoutRf };
+    if (window.RFExportUtils && planResults.length) {
+      const heatmapFields = [
+        "heatmap_received_power", "heatmap_incident_power", "heatmap_bistatic_echo",
+        "heatmap_bistatic_snr", "heatmap_bistatic_margin", "heatmap_bistatic_doppler",
+        "heatmap_bistatic_path_range", "heatmap_bistatic_excess_delay",
+        "heatmap_bistatic_angle", "heatmap_bistatic_detectable", "heatmap_terrain", "heatmap_sinr",
+      ];
+      for (let i = 0; i < planResults.length; i++) {
+        const out = planResults[i].out || {};
+        const prefix = `plan_${i + 1}`;
+        extraBlobs[`${prefix}/rf_config_used.json`] = new Blob(
+          [JSON.stringify(out.rf_config_used || out.grid?.rf_params || {}, null, 2)],
+          { type: "application/json" },
+        );
+        if (out.channel_analysis) {
+          extraBlobs[`${prefix}/channel_analysis_summary.json`] = new Blob(
+            [JSON.stringify(out.channel_analysis, null, 2)],
+            { type: "application/json" },
+          );
+        }
+        const activeIsac = out._interactive_isac || (window._activeIsacAnalysis?.product_id === (out.channel_analysis?.data_product?.product_id || out.channel_analysis_product?.product_id) ? window._activeIsacAnalysis : null);
+        if (activeIsac) {
+          const activeState = { ...activeIsac, layer: activeIsac.layer ? { ...activeIsac.layer, png_b64: undefined } : null };
+          extraBlobs[`${prefix}/isac_active_hypothesis.json`] = new Blob(
+            [JSON.stringify(activeState, null, 2)], { type: "application/json" },
+          );
+          if (activeIsac.layer?.png_b64) {
+            const activeLayerName = String(activeIsac.layer.layer || "active_isac").replace(/[^a-zA-Z0-9_-]/g, "_");
+            extraBlobs[`${prefix}/heatmaps/isac_active_${activeLayerName}.png`] = window.RFExportUtils.base64DataUrlToBlob(activeIsac.layer.png_b64);
+          }
+        }
+        for (const field of heatmapFields) {
+          const image = out[field];
+          if (!image?.png_b64) continue;
+          const layer = String(image.layer || field.replace(/^heatmap_/, "")).replace(/[^a-zA-Z0-9_-]/g, "_");
+          extraBlobs[`${prefix}/heatmaps/${layer}.png`] = window.RFExportUtils.base64DataUrlToBlob(image.png_b64);
+        }
+        try {
+          await appendIsacHypothesisBundleToExport3d(out, prefix, extraBlobs);
+        } catch (e) {
+          console.warn("RFPlanner3D: failed to include complete current-hypothesis ISAC heatmaps", e);
+          extraBlobs[`${prefix}/isac_bundle_export_error.txt`] = new Blob([String(e?.message || e)], { type: "text/plain" });
+        }
+
+        const product = out.channel_analysis?.data_product || out.channel_analysis_product;
+        if (product?.download_url) {
+          try {
+            const response = await fetch(product.download_url);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            extraBlobs[`${prefix}/isac_complete_grid.npz`] = await response.blob();
+          } catch (e) {
+            console.warn("RFPlanner3D: failed to include ISAC NPZ in export", e);
+          }
+        }
+      }
+    }
 
     if (window.RFExportUtils && typeof JSZip !== "undefined") {
       await window.RFExportUtils.createExportZip(
@@ -3579,7 +3822,7 @@ async function exportCurrentView() {
         extraBlobs,
         sectorHeatmapBlobs,
       );
-      setStatus("Exported ZIP with full views, every heatmap, all settings, full plan JSON, and complete machine-readable RF/channel grids.");
+      setStatus("Exported ZIP with full views, coverage/ISAC heatmaps, complete NPZ grids, configuration and metadata.");
     } else {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(fullViewWithRf);
@@ -4100,6 +4343,7 @@ async function exportLocalMesh() {
 function clearMap() {
   clearOverlay();
   clearRaytraceOverlay();
+  clearIsacProbe3d();
   try { localRtState.buildingsCache.clear(); } catch { /* ignore */ }
   if (rxEntity) {
     try { viewer.entities.remove(rxEntity); } catch {}
@@ -4468,12 +4712,8 @@ async function applyPlanResponseToViewer(out, {
       productLink.style.display = "none";
     }
   }
-  const totalPipelineSeconds = Number(out?.pipeline_metrics?.stage_seconds?.total_to_response);
-  const performanceStatus = Number.isFinite(totalPipelineSeconds)
-    ? `\nPipeline: ${totalPipelineSeconds.toFixed(1)} s, ${Number(out?.pipeline_metrics?.output_points || 0).toLocaleString()} output points.`
-    : "";
   if (refreshStreetLabelsOnSuccess) queueStreetLabelRefresh(true);
-  setStatus(`${statusPrefix}${attemptText}: plan complete.${key}${channelStatus}${productStatus}${performanceStatus}`);
+  setStatus(`${statusPrefix}${attemptText}: plan complete.${key}${channelStatus}${productStatus}`);
   console.info("RFPlanner3D apply plan", { rayMode, payload: out });
 
   recordPlanResultForExport(out, lat, lon);
@@ -5048,16 +5288,12 @@ async function init() {
     const lon = Cesium.Math.toDegrees(carto.longitude);
     const groundH = Number.isFinite(Number(carto.height)) ? Number(carto.height) : 0.0;
 
-    try {
-      if (await inspectChannelTarget3d(lat, lon)) return;
-    } catch (error) {
-      console.error("3D channel target inspection failed:", error);
-      setStatus(`Target inspection failed: ${error}`);
+    if (polygonDrawingMode) {
+      addPolygonVertex(lat, lon);
       return;
     }
 
-    if (polygonDrawingMode) {
-      addPolygonVertex(lat, lon);
+    if (await tryIsacTargetProbe3d(lat, lon)) {
       return;
     }
 
@@ -5216,11 +5452,20 @@ Click Plan RF Queue.`);
   });
   document.getElementById("coverage-display-layer")?.addEventListener("change", async () => {
     if (!window._lastPlanResult || !window._lastPlanResult.grid) return;
+    const layer = document.getElementById("coverage-display-layer")?.value || "rsrp";
+    if (INTERACTIVE_ISAC_LAYERS_3D.has(layer) && currentChannelProduct3d()?.product_id) {
+      try { await evaluateIsacScene3d({ layer, render: true }); }
+      catch (err) { setStatus(`ISAC layer failed: ${err}`); }
+      return;
+    }
     clearCoverageOverlay();
     await applyPlanResponseToViewer(window._lastPlanResult, {
-      refreshStreetLabelsOnSuccess: false,
-      statusPrefix: "Layer",
+      refreshStreetLabelsOnSuccess: false, statusPrefix: "Layer",
     });
+  });
+  document.getElementById("channel-apply-hypothesis")?.addEventListener("click", async () => {
+    try { await evaluateIsacScene3d({ render: true }); }
+    catch (err) { setStatus(`ISAC hypothesis failed: ${err}`); }
   });
   document.getElementById("export-zip-btn")?.addEventListener("click", () => exportCurrentView());
   document.getElementById("export-local-mesh-btn")?.addEventListener("click", () => exportLocalMesh());

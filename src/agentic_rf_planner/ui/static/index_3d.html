@@ -249,44 +249,67 @@
     </div>
 
     <div class="rf-sidebar-section" id="channel-analysis-section">
-      <h3 class="rf-sidebar-h3">Link budget and bistatic channel</h3>
+      <h3 class="rf-sidebar-h3">ISAC / bistatic sensing analysis</h3>
       <label class="rf-check-row">
         <input type="checkbox" id="channel-analysis-enabled" />
-        Enable waveform-agnostic receiver, target-return and Doppler analysis
+        Enable waveform-agnostic bistatic scene analysis
       </label>
-      <p class="rf-sidebar-muted-sm" style="margin:6px 0;">Available for every waveform. Frequency and occupied bandwidth come from the active transmitter; every coverage point is evaluated as a candidate target.</p>
+      <p class="rf-sidebar-muted-sm" style="margin:6px 0;">The physical scene is built sequentially from communications coverage, a target-height TX→target environmental field, an RX-centered target→RX reciprocal field, and the direct TX↔RX reference path. Large propagation worlds are released between solves. RCS, motion and detector assumptions then reuse compact scene arrays without rebuilding OSM/terrain.</p>
       <div id="channel-analysis-fields" hidden>
-        <div class="rf-field-grid">
-          <div style="grid-column:1/-1;"><label class="rf-label" for="channel-rx-location">Analysis RX location (lat,lon)</label><input id="channel-rx-location" class="rf-input" type="text" inputmode="decimal" placeholder="38.41717489626978, -121.39508190497462" /></div><div class="rf-sidebar-muted-sm" style="grid-column:1/-1;">Every coverage pixel is evaluated as a candidate target. Heatmaps report expected TX→target illumination, target→RX environmental return loss, echo power, Doppler, post-processing SNR, detection margin, and ISAC quality at that location.</div>
-          <div><label class="rf-label" for="channel-rx-altitude-m">RX site altitude (m AMSL)</label><input id="channel-rx-altitude-m" class="rf-input" type="number" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-rx-height-m">RX antenna height (m AGL)</label><input id="channel-rx-height-m" class="rf-input" type="number" min="0" step="0.1" value="10" /></div>
-          <div><label class="rf-label" for="channel-direct-gain-dbi">Direct/reference antenna gain (dBi)</label><input id="channel-direct-gain-dbi" class="rf-input" type="number" step="0.1" value="8" /></div>
-          <div><label class="rf-label" for="channel-echo-gain-dbi">Echo/surveillance antenna gain (dBi)</label><input id="channel-echo-gain-dbi" class="rf-input" type="number" step="0.1" value="12" /></div>
-          <div><label class="rf-label" for="channel-rx-feeder-loss-db">RX feeder loss (dB)</label><input id="channel-rx-feeder-loss-db" class="rf-input" type="number" min="0" step="0.1" value="1" /></div>
-          <div><label class="rf-label" for="channel-rx-noise-figure-db">RX noise figure (dB)</label><input id="channel-rx-noise-figure-db" class="rf-input" type="number" min="0" step="0.1" value="5" /></div>
-          <div><label class="rf-label" for="channel-target-height-m">Target height (m AGL)</label><input id="channel-target-height-m" class="rf-input" type="number" min="0" step="10" value="1000" /></div>
-          <div><label class="rf-label" for="channel-bistatic-rcs-m2">Bistatic RCS (m²)</label><input id="channel-bistatic-rcs-m2" class="rf-input" type="number" min="0.000001" step="0.1" value="10" /></div>
-          <div><label class="rf-label" for="channel-target-speed-mps">Target speed (m/s)</label><input id="channel-target-speed-mps" class="rf-input" type="number" min="0" step="0.1" value="50" /></div>
-          <div><label class="rf-label" for="channel-target-heading-deg">Target heading true (deg)</label><input id="channel-target-heading-deg" class="rf-input" type="number" min="0" max="359.999" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-target-climb-mps">Target climb rate (m/s)</label><input id="channel-target-climb-mps" class="rf-input" type="number" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-direct-excess-loss-db">Direct-path excess loss (dB)</label><input id="channel-direct-excess-loss-db" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-return-path-model">Target→RX propagation</label><select id="channel-return-path-model" class="rf-select"><option value="environmental_reciprocal_grid" selected>OSM + terrain reciprocal grid</option><option value="free_space_plus_excess">Free space + entered excess loss</option></select></div>
-          <div><label class="rf-label" for="channel-return-excess-loss-db">Additional target→RX loss (dB)</label><input id="channel-return-excess-loss-db" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-processing-bandwidth-mhz">Processing bandwidth (MHz, 0=waveform)</label><input id="channel-processing-bandwidth-mhz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-integration-s">Coherent integration / CPI (s)</label><input id="channel-integration-s" class="rf-input" type="number" min="0.000001" step="0.1" value="1" /></div>
-          <div><label class="rf-label" for="channel-prf-hz">Doppler sampling PRF (Hz, 0=unset)</label><input id="channel-prf-hz" class="rf-input" type="number" min="0" step="1" value="0" /></div>
-          <div><label class="rf-label" for="channel-clutter-notch-hz">Clutter notch (Hz)</label><input id="channel-clutter-notch-hz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-min-doppler-hz">Minimum detectable Doppler (Hz)</label><input id="channel-min-doppler-hz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
-          <div><label class="rf-label" for="channel-processing-loss-db">Processing loss (dB)</label><input id="channel-processing-loss-db" class="rf-input" type="number" min="0" step="0.1" value="3" /></div>
-          <div><label class="rf-label" for="channel-system-loss-db">Other system loss (dB)</label><input id="channel-system-loss-db" class="rf-input" type="number" min="0" step="0.1" value="3" /></div>
-          <div><label class="rf-label" for="channel-required-snr-db">Required post-processing SNR (dB)</label><input id="channel-required-snr-db" class="rf-input" type="number" step="0.1" value="10" /></div>
-          <div><label class="rf-label" for="channel-direct-cancellation-db">Direct-path cancellation (dB)</label><input id="channel-direct-cancellation-db" class="rf-input" type="number" min="0" step="1" value="60" /></div>
+        <details open>
+          <summary style="font-size:11px;color:#ddd;font-weight:600;">Physical scene geometry — changing these requires Plan RF</summary>
+          <div class="rf-field-grid" style="margin-top:8px;">
+            <div style="grid-column:1/-1;"><label class="rf-label" for="channel-rx-location">Analysis RX site (latitude, longitude)</label><input id="channel-rx-location" class="rf-input" type="text" placeholder="38.41717489626978, -121.39508190497462" /></div>
+            <div><label class="rf-label" for="channel-rx-altitude-m">RX site ground altitude (m AMSL; required)</label><input id="channel-rx-altitude-m" class="rf-input" type="number" step="0.1" placeholder="Enter surveyed/terrain site altitude" /></div>
+            <div><label class="rf-label" for="channel-rx-height-m">RX antenna height (m AGL)</label><input id="channel-rx-height-m" class="rf-input" type="number" min="0" step="0.1" value="10" /></div>
+            <div><label class="rf-label" for="channel-target-height-m">Candidate target height (m AGL)</label><input id="channel-target-height-m" class="rf-input" type="number" min="0" step="10" value="1000" /></div>
+            <div><label class="rf-label" for="channel-return-resolution-m">ISAC environmental field spacing — TX→target and target→RX (m)</label><input id="channel-return-resolution-m" class="rf-input" type="number" min="5" max="1000" step="5" value="50" /></div>
+          </div>
+        </details>
+
+        <details open style="margin-top:8px;">
+          <summary style="font-size:11px;color:#ddd;font-weight:600;">Interactive target / detector hypothesis — Apply without rebuilding scene</summary>
+          <div class="rf-field-grid" style="margin-top:8px;">
+            <div><label class="rf-label" for="channel-direct-gain-dbi">Reference-channel antenna gain (dBi)</label><input id="channel-direct-gain-dbi" class="rf-input" type="number" step="0.1" value="8" /></div>
+            <div><label class="rf-label" for="channel-echo-gain-dbi">Surveillance-channel antenna gain (dBi)</label><input id="channel-echo-gain-dbi" class="rf-input" type="number" step="0.1" value="12" /></div>
+            <div><label class="rf-label" for="channel-rx-feeder-loss-db">RX feeder loss (dB)</label><input id="channel-rx-feeder-loss-db" class="rf-input" type="number" min="0" step="0.1" value="1" /></div>
+            <div><label class="rf-label" for="channel-rx-noise-figure-db">RX noise figure (dB)</label><input id="channel-rx-noise-figure-db" class="rf-input" type="number" min="0" step="0.1" value="5" /></div>
+            <div style="grid-column:1/-1;"><label class="rf-label" for="channel-interference-clutter-dbm">Aggregate in-band interference + clutter power at surveillance RX input (dBm, over processing bandwidth; blank = thermal-only screening)</label><input id="channel-interference-clutter-dbm" class="rf-input" type="number" step="0.1" placeholder="Measured or scenario-assumed in-band aggregate" /></div>
+            <div><label class="rf-label" for="channel-direct-excess-loss-db">Additional direct-path loss (dB)</label><input id="channel-direct-excess-loss-db" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-return-excess-loss-db">Additional target→RX loss (dB)</label><input id="channel-return-excess-loss-db" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-bistatic-rcs-m2">Bistatic target RCS (m²)</label><input id="channel-bistatic-rcs-m2" class="rf-input" type="number" min="0.000001" step="0.1" value="10" /></div>
+            <div><label class="rf-label" for="channel-target-speed-mps">Target horizontal speed (m/s)</label><input id="channel-target-speed-mps" class="rf-input" type="number" min="0" step="0.1" value="50" /></div>
+            <div><label class="rf-label" for="channel-target-heading-deg">Target true heading (deg CW from north)</label><input id="channel-target-heading-deg" class="rf-input" type="number" min="0" max="359.999" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-target-climb-mps">Target climb rate (+up, m/s)</label><input id="channel-target-climb-mps" class="rf-input" type="number" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-processing-bandwidth-mhz">Processing bandwidth (MHz; 0=waveform BW)</label><input id="channel-processing-bandwidth-mhz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-integration-s">Coherent processing interval / CPI (s)</label><input id="channel-integration-s" class="rf-input" type="number" min="0.000001" step="0.1" value="1" /></div>
+            <div style="grid-column:1/-1;"><label class="rf-label" for="channel-effective-processing-gain-db">Validated effective processing gain (dB; blank = ideal BT screening only)</label><input id="channel-effective-processing-gain-db" class="rf-input" type="number" min="0" step="0.1" placeholder="Required for processing-qualified detectability" /></div>
+            <div><label class="rf-label" for="channel-processing-loss-db">Additional processing loss (dB)</label><input id="channel-processing-loss-db" class="rf-input" type="number" min="0" step="0.1" value="3" /></div>
+            <div><label class="rf-label" for="channel-system-loss-db">Other echo-chain/system loss (dB)</label><input id="channel-system-loss-db" class="rf-input" type="number" min="0" step="0.1" value="3" /></div>
+            <div><label class="rf-label" for="channel-required-snr-db">Required post-processing SNR (dB)</label><input id="channel-required-snr-db" class="rf-input" type="number" step="0.1" value="10" /></div>
+            <div><label class="rf-label" for="channel-direct-cancellation-db">Achieved direct-path cancellation (dB)</label><input id="channel-direct-cancellation-db" class="rf-input" type="number" min="0" step="1" value="60" /></div>
+            <div><label class="rf-label" for="channel-required-direct-margin-db">Required echo / residual-direct margin (dB)</label><input id="channel-required-direct-margin-db" class="rf-input" type="number" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-max-dynamic-range-db">Receiver simultaneous dynamic range (dB; blank=not constrained)</label><input id="channel-max-dynamic-range-db" class="rf-input" type="number" min="0.001" step="1" /></div>
+            <div><label class="rf-label" for="channel-prf-hz">Doppler sampling PRF (Hz; 0=unset)</label><input id="channel-prf-hz" class="rf-input" type="number" min="0" step="1" value="0" /></div>
+            <div><label class="rf-label" for="channel-clutter-notch-hz">Clutter / zero-Doppler rejection half-width (Hz)</label><input id="channel-clutter-notch-hz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+            <div><label class="rf-label" for="channel-min-doppler-hz">Additional minimum detectable |Doppler| (Hz)</label><input id="channel-min-doppler-hz" class="rf-input" type="number" min="0" step="0.1" value="0" /></div>
+          </div>
+          <div style="margin-top:6px;">
+            <label class="rf-check-row"><input type="checkbox" id="channel-require-direct-constraint" checked /> Require echo/residual-direct constraint for detectability</label>
+            <label class="rf-check-row"><input type="checkbox" id="channel-require-dynamic-range-constraint" /> Require configured receiver dynamic-range limit</label>
+            <label class="rf-check-row"><input type="checkbox" id="channel-require-interference-qualification" checked /> Require an interference/clutter input for processing-qualified detectability</label>
+          </div>
+        </details>
+
+        <div style="margin-top:8px;">
+          <label class="rf-label" for="channel-selected-target-location">Selected target (latitude, longitude; click map to set)</label>
+          <input id="channel-selected-target-location" class="rf-input" type="text" placeholder="Click a target point after planning" />
+          <button id="channel-apply-hypothesis" class="rf-btn" type="button" style="margin-top:6px;width:100%;">Apply ISAC hypothesis to current scene</button>
+          <p class="rf-sidebar-muted-sm" style="margin:4px 0 0;">This reevaluates RCS, Doppler and detector constraints over the existing physical scene in O(N) array work. It does not rerun OSM, terrain or reciprocal propagation.</p>
         </div>
-        <label class="rf-check-row" style="margin-top:8px;"><input type="checkbox" id="channel-target-inspector-enabled" checked /> Click any heatmap pixel as a candidate target: inspect both environmental path legs, expected echo, Doppler, SNR, margin, and its iso-range ellipse</label>
-        <p class="rf-sidebar-muted-sm" style="margin-top:6px;">Every heatmap pixel is a candidate target. Echo power, both path losses, total bistatic loss, Doppler, delay, SNR margin and ISAC quality class are calculated per location.</p>
-        <div id="channel-target-inspector" class="rf-sidebar-muted-sm" style="margin-top:8px; display:none;"></div>
       </div>
-      <a id="channel-product-download" class="rf-sidebar-link" href="#" download hidden>Download complete RF + channel grid (.npz)</a>
+      <a id="channel-product-download" class="rf-sidebar-link" href="#" download hidden>Download complete machine-readable ISAC grid (.npz)</a>
+      <div id="channel-target-probe-output" class="rf-sidebar-muted-sm" style="margin-top:8px;" hidden></div>
     </div>
 
     <div class="rf-sidebar-section" id="terrain-environment-section">
@@ -345,16 +368,24 @@
           <option id="coverage-layer-carrier-to-noise" value="carrier_to_noise">Carrier-to-noise C/N (dB)</option>
           <option id="coverage-layer-incident-power" value="incident_power">Incident total-carrier power at target, 0 dBi (dBm)</option>
           <option id="coverage-layer-bistatic-echo" value="bistatic_echo">Bistatic echo power (dBm)</option>
-          <option id="coverage-layer-bistatic-return-loss" value="bistatic_return_loss">Target→RX environmental path loss per target (dB)</option>
-          <option id="coverage-layer-bistatic-total-loss" value="bistatic_total_loss">Total TX→target→RX path loss per target (dB)</option>
-          <option id="coverage-layer-isac-quality" value="isac_quality">Expected ISAC quality at each target (0–5)</option>
           <option id="coverage-layer-bistatic-snr" value="bistatic_snr">Post-processing echo SNR (dB)</option>
-          <option id="coverage-layer-bistatic-margin" value="bistatic_margin">Detection margin (dB)</option>
-          <option id="coverage-layer-bistatic-doppler" value="bistatic_doppler">Signed bistatic Doppler (Hz)</option>
-          <option id="coverage-layer-bistatic-range" value="bistatic_range">Total TX→target→RX path length per target (km)</option>
+          <option id="coverage-layer-bistatic-margin" value="bistatic_margin">SNR margin vs noise + interference (dB)</option>
+          <option id="coverage-layer-rcs-margin" value="rcs_margin">RCS margin for enabled power constraints (dB)</option>
+          <option id="coverage-layer-minimum-rcs" value="minimum_detectable_rcs">Minimum RCS for enabled power constraints (dBsm)</option>
+          <option id="coverage-layer-bistatic-doppler" value="bistatic_doppler">Signed bistatic Doppler for configured motion (Hz)</option>
+          <option id="coverage-layer-doppler-sensitivity" value="doppler_sensitivity">Doppler sensitivity magnitude (Hz per m/s)</option>
+          <option id="coverage-layer-minimum-speed" value="minimum_detectable_speed">Best-heading minimum detectable speed (m/s)</option>
+          <option id="coverage-layer-required-cancellation" value="required_cancellation">Required direct-path cancellation (dB)</option>
+          <option id="coverage-layer-direct-residual-margin" value="direct_residual_margin">Direct-path constraint margin (dB)</option>
+          <option id="coverage-layer-static-clutter-delay" value="static_clutter_delay_separation">Nearest static facade clutter delay separation (µs)</option>
+          <option id="coverage-layer-static-clutter-overlap" value="static_clutter_overlap">Static facade clutter overlap in ideal delay-Doppler cell (0/1)</option>
+          <option id="coverage-layer-static-clutter-path-count" value="static_clutter_path_count">Mapped static facade paths in target delay-Doppler cell (count; geometry-only)</option>
+          <option id="coverage-layer-target-measurement-cell" value="target_measurement_cell">Selected-target ideal delay-Doppler ambiguity cell (0/1; requires target)</option>
+          <option id="coverage-layer-bistatic-range" value="bistatic_range">Bistatic path range (km)</option>
           <option id="coverage-layer-bistatic-delay" value="bistatic_delay">Bistatic excess delay (µs)</option>
           <option id="coverage-layer-bistatic-angle" value="bistatic_angle">Bistatic angle (deg)</option>
-          <option id="coverage-layer-bistatic-detectable" value="bistatic_detectable">Detectability mask (0/1)</option>
+          <option id="coverage-layer-screening-detectable" value="screening_detectable">Screening detectability (ideal BT allowed; N+I if supplied)</option>
+          <option id="coverage-layer-qualified-detectable" value="qualified_detectable">Processing-qualified detectability (validated gain + interference/clutter basis required)</option>
         </select>
       </div>
     </div>
