@@ -54,6 +54,40 @@
     return value;
   }
 
+  function optionalNumber(id, label, options) {
+    const el = byId(id);
+    const raw = String(el?.value ?? "").trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    const opts = options || {};
+    if (!Number.isFinite(value)) throw new Error(`${label} must be numeric.`);
+    if (opts.gt != null && !(value > opts.gt)) throw new Error(`${label} must be greater than ${opts.gt}.`);
+    if (opts.ge != null && !(value >= opts.ge)) throw new Error(`${label} must be at least ${opts.ge}.`);
+    if (opts.lt != null && !(value < opts.lt)) throw new Error(`${label} must be less than ${opts.lt}.`);
+    if (opts.le != null && !(value <= opts.le)) throw new Error(`${label} must be at most ${opts.le}.`);
+    return value;
+  }
+
+  function requiredLocation(id, label) {
+    let raw = String(byId(id)?.value || "").trim();
+    // Input compatibility for saved sessions / older clients while the visible UI
+    // uses one coordinate field.
+    if (!raw && id === "channel-rx-location") {
+      const legacyLat = String(byId("channel-rx-lat")?.value || "").trim();
+      const legacyLon = String(byId("channel-rx-lon")?.value || "").trim();
+      if (legacyLat && legacyLon) raw = `${legacyLat}, ${legacyLon}`;
+    }
+    const parts = raw.split(/[\s,;]+/).filter(Boolean).map(Number);
+    if (parts.length !== 2 || parts.some((value) => !Number.isFinite(value))) {
+      throw new Error(`${label} must be entered as latitude, longitude.`);
+    }
+    const [latitude, longitude] = parts;
+    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+      throw new Error(`${label} is outside the valid latitude/longitude range.`);
+    }
+    return { latitude, longitude };
+  }
+
   function optionalText(id) {
     const value = String(byId(id)?.value || "").trim();
     return value || null;
@@ -104,13 +138,6 @@
     const enabled = channelAnalysisEnabled();
     setVisible(byId("channel-analysis-fields"), enabled);
     syncCoverageLayerOptions(isDvtProfile(getProfile()));
-    const layer = byId("coverage-display-layer");
-    const channelLayers = new Set([
-      "incident_power", "bistatic_echo", "bistatic_return_loss", "bistatic_total_loss",
-      "isac_quality", "bistatic_snr", "bistatic_margin", "bistatic_doppler",
-      "bistatic_range", "bistatic_delay", "bistatic_angle", "bistatic_detectable",
-    ]);
-    if (enabled && layer && !channelLayers.has(String(layer.value || ""))) layer.value = "isac_quality";
   }
 
   function syncCoverageLayerOptions(dvt) {
@@ -131,16 +158,25 @@
     optionState("coverage-layer-carrier-to-noise", dvt, "Carrier-to-noise C/N (dB)");
     optionState("coverage-layer-incident-power", channel, "Incident total-carrier power at target, 0 dBi (dBm)");
     optionState("coverage-layer-bistatic-echo", channel, "Bistatic echo power (dBm)");
-    optionState("coverage-layer-bistatic-return-loss", channel, "Target→RX environmental path loss per candidate target (dB)");
-    optionState("coverage-layer-bistatic-total-loss", channel, "Total TX→target→RX path loss per candidate target (dB)");
-    optionState("coverage-layer-isac-quality", channel, "Expected ISAC quality at each candidate target (0–5)");
     optionState("coverage-layer-bistatic-snr", channel, "Post-processing echo SNR (dB)");
-    optionState("coverage-layer-bistatic-margin", channel, "Detection margin (dB)");
-    optionState("coverage-layer-bistatic-doppler", channel, "Signed bistatic Doppler (Hz)");
-    optionState("coverage-layer-bistatic-range", channel, "Total TX→target→RX path length per candidate target (km)");
+    optionState("coverage-layer-bistatic-margin", channel, "SNR margin vs noise + interference (dB)");
+    optionState("coverage-layer-rcs-margin", channel, "Power-constraint RCS margin (dB)");
+    optionState("coverage-layer-minimum-rcs", channel, "Minimum detectable RCS (dBsm)");
+    optionState("coverage-layer-bistatic-doppler", channel, "Signed Doppler for configured motion (Hz)");
+    optionState("coverage-layer-doppler-sensitivity", channel, "Doppler sensitivity magnitude (Hz per m/s)");
+    optionState("coverage-layer-minimum-speed", channel, "Best-heading minimum detectable speed (m/s)");
+    optionState("coverage-layer-required-cancellation", channel, "Required direct-path cancellation (dB)");
+    optionState("coverage-layer-direct-residual-margin", channel, "Echo / residual-direct margin (dB)");
+    optionState("coverage-layer-static-clutter-power", channel, "Modeled static facade clutter in target delay-Doppler cell (dBm; uncalibrated)");
+    optionState("coverage-layer-target-static-clutter", channel, "Target / modeled static facade clutter (dB; ideal cell)");
+    optionState("coverage-layer-static-clutter-delay", channel, "Nearest static facade clutter delay separation (µs)");
+    optionState("coverage-layer-static-clutter-overlap", channel, "Static facade clutter overlap in ideal delay-Doppler cell (0/1)");
+    optionState("coverage-layer-static-clutter-path-count", channel, "Mapped static facade paths in target delay-Doppler cell (count; geometry-only)");
+    optionState("coverage-layer-bistatic-range", channel, "Bistatic path range (km)");
     optionState("coverage-layer-bistatic-delay", channel, "Bistatic excess delay (µs)");
     optionState("coverage-layer-bistatic-angle", channel, "Bistatic angle (deg)");
-    optionState("coverage-layer-bistatic-detectable", channel, "Detectability mask (0/1)");
+    optionState("coverage-layer-screening-detectable", channel, "Screening detectability (ideal BT allowed)");
+    optionState("coverage-layer-qualified-detectable", channel, "Processing-qualified detectability (validated gain + interference/clutter basis required)");
 
     if (!layer) return;
     const selected = layer.options?.[layer.selectedIndex];
@@ -257,17 +293,6 @@
     return antenna;
   }
 
-  function parseLatLonField(id, label) {
-    const raw = String(byId(id)?.value || "").trim();
-    const parts = raw.split(/[\s,]+/).filter(Boolean);
-    if (parts.length !== 2) throw new Error(`${label} must be entered as lat,lon.`);
-    const latitude = Number(parts[0]);
-    const longitude = Number(parts[1]);
-    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) throw new Error(`${label} latitude must be in [-90, 90].`);
-    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) throw new Error(`${label} longitude must be in [-180, 180].`);
-    return { latitude, longitude };
-  }
-
   function buildChannelAnalysis() {
     if (!channelAnalysisEnabled()) return null;
     const processingBandwidthMhz = requiredNumber(
@@ -276,7 +301,7 @@
       { ge: 0 },
     );
     const prfHz = requiredNumber("channel-prf-hz", "Doppler sampling PRF", { ge: 0 });
-    const receiverLocation = parseLatLonField("channel-rx-location", "Analysis RX location");
+    const receiverLocation = requiredLocation("channel-rx-location", "Analysis receiver location");
     const config = {
       receiver: {
         latitude: receiverLocation.latitude,
@@ -300,18 +325,32 @@
         climbRateMps: requiredNumber("channel-target-climb-mps", "Target climb rate"),
       },
       processing: {
-        coherentIntegrationS: requiredNumber("channel-integration-s", "Coherent integration time", { gt: 0 }),
-        processingLossDb: requiredNumber("channel-processing-loss-db", "Processing loss", { ge: 0 }),
-        systemLossDb: requiredNumber("channel-system-loss-db", "System loss", { ge: 0 }),
+        coherentIntegrationS: requiredNumber("channel-integration-s", "Coherent processing interval", { gt: 0 }),
+        processingLossDb: requiredNumber("channel-processing-loss-db", "Additional processing loss", { ge: 0 }),
+        systemLossDb: requiredNumber("channel-system-loss-db", "Echo-chain/system loss", { ge: 0 }),
         requiredSnrDb: requiredNumber("channel-required-snr-db", "Required post-processing SNR"),
-        directPathCancellationDb: requiredNumber("channel-direct-cancellation-db", "Direct-path cancellation", { ge: 0 }),
-        clutterNotchHz: requiredNumber("channel-clutter-notch-hz", "Clutter notch", { ge: 0 }),
+        directPathCancellationDb: requiredNumber("channel-direct-cancellation-db", "Achieved direct-path cancellation", { ge: 0 }),
+        requiredEchoToResidualDirectDb: requiredNumber("channel-required-direct-margin-db", "Required echo/residual-direct margin"),
+        requireDirectPathConstraint: !!byId("channel-require-direct-constraint")?.checked,
+        requireDynamicRangeConstraint: !!byId("channel-require-dynamic-range-constraint")?.checked,
+        requireInterferenceInputForQualification: !!byId("channel-require-interference-qualification")?.checked,
+        clutterNotchHz: requiredNumber("channel-clutter-notch-hz", "Clutter/zero-Doppler rejection half-width", { ge: 0 }),
         minimumDetectableDopplerHz: requiredNumber("channel-min-doppler-hz", "Minimum detectable Doppler", { ge: 0 }),
       },
-      returnPathModel: String(byId("channel-return-path-model")?.value || "environmental_reciprocal_grid"),
+      returnPathModel: "environment_reciprocal",
+      returnPathResolutionM: requiredNumber("channel-return-resolution-m", "Return-field resolution", { ge: 5, le: 1000 }),
     };
     if (processingBandwidthMhz > 0) config.processing.processingBandwidthHz = processingBandwidthMhz * 1e6;
     if (prfHz > 0) config.processing.pulseRepetitionFrequencyHz = prfHz;
+    const effectiveGainDb = optionalNumber("channel-effective-processing-gain-db", "Validated effective processing gain", { ge: 0 });
+    if (effectiveGainDb != null) config.processing.effectiveProcessingGainDb = effectiveGainDb;
+    const interferenceClutterDbm = optionalNumber("channel-interference-clutter-dbm", "Surveillance interference plus clutter power");
+    if (interferenceClutterDbm != null) config.processing.interferencePlusClutterPowerDbm = interferenceClutterDbm;
+    const maxDynamicRangeDb = optionalNumber("channel-max-dynamic-range-db", "Receiver simultaneous dynamic range", { gt: 0 });
+    if (maxDynamicRangeDb != null) config.processing.maxReceiverDynamicRangeDb = maxDynamicRangeDb;
+    if (config.processing.requireDynamicRangeConstraint && maxDynamicRangeDb == null) {
+      throw new Error("Receiver simultaneous dynamic range is required when the dynamic-range constraint is enabled.");
+    }
     return config;
   }
 
@@ -424,6 +463,8 @@
     byId("channel-analysis-enabled")?.addEventListener("change", syncChannelAnalysisMode);
     syncUi(options || {});
   }
+
+  window.RFWaveformBuildChannelAnalysis = buildChannelAnalysis;
 
   window.RFWaveformUI = {
     init,
