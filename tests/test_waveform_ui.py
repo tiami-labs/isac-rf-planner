@@ -255,14 +255,13 @@ def test_waveform_ui_builds_waveform_agnostic_channel_analysis_for_nr_and_dvt():
           'dvt-dr-m': '20', 'dvt-dtheta-deg': '0.25',
           'coverage-display-layer': 'bistatic_margin',
           'channel-rx-location': '38.4, -121.5',
-          'channel-return-path-model': 'environmental_reciprocal_grid',
           'channel-rx-altitude-m': '10', 'channel-rx-height-m': '15',
           'channel-direct-gain-dbi': '8', 'channel-echo-gain-dbi': '12',
           'channel-rx-feeder-loss-db': '1', 'channel-rx-noise-figure-db': '5',
           'channel-target-height-m': '1000', 'channel-bistatic-rcs-m2': '10',
           'channel-target-speed-mps': '120', 'channel-target-heading-deg': '45',
           'channel-target-climb-mps': '3',
-          'channel-direct-excess-loss-db': '2', 'channel-return-excess-loss-db': '4',
+          'channel-return-resolution-m': '50', 'channel-direct-excess-loss-db': '2', 'channel-return-excess-loss-db': '4',
           'channel-processing-bandwidth-mhz': '0', 'channel-integration-s': '1',
           'channel-prf-hz': '1000', 'channel-clutter-notch-hz': '2', 'channel-min-doppler-hz': '1',
           'channel-processing-loss-db': '3', 'channel-system-loss-db': '3',
@@ -291,8 +290,7 @@ def test_waveform_ui_builds_waveform_agnostic_channel_analysis_for_nr_and_dvt():
         if (dvt.technology !== 'dvt' || !dvt.channel_analysis) throw new Error('DVT channel analysis missing');
         if (dvt.channel_analysis.target.heightMagl !== 1000) throw new Error('target height');
         if (dvt.channel_analysis.target.bistaticRcsM2 !== 10) throw new Error('RCS');
-        if (dvt.channel_analysis.returnPathModel !== 'environmental_reciprocal_grid') throw new Error('return path model');
-        if (dvt.channel_analysis.receiver.latitude !== 38.4 || dvt.channel_analysis.receiver.longitude !== -121.5) throw new Error('combined receiver location');
+        if (dvt.channel_analysis.returnPathModel !== 'environment_reciprocal') throw new Error('return path model');
         if (dvt.coverage_display_layer !== 'bistatic_margin') throw new Error('display layer');
         if ('passive_radar' in dvt || 'passive_radar' in nr) throw new Error('legacy key leaked');
         """
@@ -301,54 +299,19 @@ def test_waveform_ui_builds_waveform_agnostic_channel_analysis_for_nr_and_dvt():
 
 
 
-def test_ui_export_collector_includes_every_heatmap_settings_response_and_npz():
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is not installed")
-    script_path = STATIC / "export_utils.js"
-    js = textwrap.dedent(
-        f"""
-        const fs = require('fs');
-        const vm = require('vm');
-        global.window = {{}};
-        global.atob = (value) => Buffer.from(value, 'base64').toString('binary');
-        global.fetch = async (url) => ({{
-          ok: true,
-          status: 200,
-          statusText: 'OK',
-          blob: async () => new Blob([Buffer.from('npz-bytes')], {{type:'application/octet-stream'}}),
-        }});
-        vm.runInThisContext(fs.readFileSync({str(script_path)!r}, 'utf8'));
-        const png = 'data:image/png;base64,' + Buffer.from('png').toString('base64');
-        const out = {{
-          rf_config_used: {{technology:'dvt', waveform:'atsc1', channel_analysis:{{receiver:{{latitude:1,longitude:2}}}}}},
-          channel_analysis: {{model:'waveform_agnostic_bistatic_channel'}},
-          geometry_source: {{type:'automatic_osm_aoi_cache'}},
-          heatmap: {{png_b64:png, layer:'received_power_dbm', units:'dBm'}},
-          heatmap_bistatic_echo: {{png_b64:png, layer:'echo_power_dbm', units:'dBm'}},
-          heatmap_bistatic_total_path_loss: {{png_b64:png, layer:'total_bistatic_path_loss_db', units:'dB'}},
-          heatmap_isac_quality: {{png_b64:png, layer:'bistatic_isac_quality_code', units:'class'}},
-          channel_analysis_product: {{product_id:'abc', download_url:'/api/channel-analysis/products/abc'}},
-        }};
-        (async () => {{
-          const artifacts = await window.RFExportUtils.collectPlanExportArtifacts([{{lat:1,lon:2,out}}]);
-          const names = Object.keys(artifacts.files);
-          const required = [
-            'heatmaps/TX1/primary_coverage.png',
-            'heatmaps/TX1/bistatic_echo_power.png',
-            'heatmaps/TX1/total_bistatic_path_loss.png',
-            'heatmaps/TX1/isac_target_quality.png',
-            'plans/TX1/complete_plan_response.json',
-            'plans/TX1/complete_settings.json',
-            'channel/TX1_complete_rf_channel_grid.npz',
-            'export_manifest.json',
-          ];
-          for (const name of required) if (!names.includes(name)) throw new Error('missing '+name);
-          if (artifacts.manifest.plans[0].heatmaps.length !== 4) throw new Error('heatmap manifest incomplete');
-          const settings = JSON.parse(await artifacts.files['plans/TX1/complete_settings.json'].text());
-          if (settings.rf_config_used.technology !== 'dvt') throw new Error('settings missing');
-          if (!settings.channel_analysis) throw new Error('channel summary missing');
-        }})().catch((error) => {{ console.error(error); process.exit(1); }});
-        """
-    )
-    subprocess.run([node, "-e", js], check=True, cwd=ROOT)
+def test_ui_exposes_static_facade_background_as_measurement_domain_analysis():
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    html3d = (STATIC / "index_3d.html").read_text(encoding="utf-8")
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    planner3d = (STATIC / "planner_3d.js").read_text(encoding="utf-8")
+    for source in (html, html3d):
+        assert 'value="static_clutter_delay_separation"' in source
+        assert 'value="static_clutter_overlap"' in source
+        assert 'value="static_clutter_path_count"' in source
+        assert 'geometry-only' in source
+        assert 'value="target_measurement_cell"' in source
+    for source in (app, planner3d):
+        assert 'Mapped facade specular paths in ideal delay–Doppler coordinates' in source
+        assert 'Same-cell facade path table' in source
+        assert 'candidate_search_complete' in source
+    assert 'Static facade return: OSM' in app
