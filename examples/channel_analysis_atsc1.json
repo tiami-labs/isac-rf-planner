@@ -63,6 +63,6 @@
       "clutterNotchHz": 2.0,
       "minimumDetectableDopplerHz": 1.0
     },
-    "returnPathModel": "free_space_plus_excess"
+    "returnPathModel": "environment_reciprocal"
   }
 }
