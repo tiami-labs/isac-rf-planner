@@ -16,10 +16,12 @@ In either the 2D or 3D planner:
 2. Select the TX site and coverage radius.
 3. Open **Link budget and bistatic channel**.
 4. Enable **waveform-agnostic receiver, target-return and Doppler analysis**.
-5. Enter the fixed analysis receiver, target assumptions, target velocity, and processing assumptions.
-6. Select a channel display layer, such as **Bistatic echo power**, **Signed bistatic Doppler**, or **Detection margin**.
-7. Run the plan.
-8. Use **Download machine-readable channel grid (.npz)** for every per-target output array.
+5. Enter the fixed analysis receiver as one `latitude, longitude` location, target assumptions, target velocity, and processing assumptions.
+6. Choose the reciprocal return-field resolution (50 m default; lower values increase runtime/memory).
+7. Select a channel display layer, such as **Bistatic echo power**, **Signed bistatic Doppler**, or **Detection margin**.
+8. Run the plan.
+9. With **Target probe** enabled, click any candidate target location to draw TX→target→RX, the direct baseline, and the iso-bistatic-range ellipse through that point.
+10. Use the normal UI ZIP export or **Download machine-readable channel grid (.npz)** for the per-target outputs.
 
 No separate command or preprocessing step is required.
 
@@ -83,14 +85,17 @@ The channel analysis uses the broadcast transmitter's physical ERP/EIRP chain an
 
 The TX-to-target leg uses the planner's full one-way propagation result.
 
-The current fixed receiver legs are explicit and machine-labeled:
+The default target-to-RX leg now builds a second propagation field centered on the analysis receiver over the same OSM/terrain environment, then spatially resamples it onto the primary target grid:
 
 ```text
+TX → target: full primary propagation field
+target → RX: RX-centered reciprocal environmental field + returnPathExcessLossDb
 direct TX → RX: free-space loss + directPathExcessLossDb
-target → RX:    free-space loss + returnPathExcessLossDb
 ```
 
-These excess-loss fields allow measured or externally modeled losses to be inserted without hiding the assumption.
+`returnPathModel="environment_reciprocal"` is the default. `free_space_plus_excess` remains available for compatibility and controlled comparisons. The direct TX→RX baseline is still explicitly free-space plus configured direct excess loss; it is not silently labeled as environment-aware.
+
+The reciprocal field exports total return-path loss, environmental loss, terrain loss, LOS state, and resampling error per target. `returnPathResolutionM` controls its solver spacing before resampling to the primary target lattice.
 
 ## Doppler resolution and detectability
 
@@ -114,7 +119,7 @@ This is a deterministic link-budget/channel flag, not a probability-of-detection
 
 The JSON response includes `channel_analysis`, containing configuration, direct-path link budget, resolution limits, counts, and best points.
 
-It also includes `channel_analysis_product`:
+It also includes `channel_analysis_product`. The NPZ now contains the primary one-way coverage/illumination arrays, reciprocal return-path arrays, and bistatic/ISAC fusion arrays in the same target index order:
 
 ```json
 {

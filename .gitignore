@@ -10,4 +10,3 @@ data/osm/
 *.npz
 *.zip
 *.log
-.venv/
