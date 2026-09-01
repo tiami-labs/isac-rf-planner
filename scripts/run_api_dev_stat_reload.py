@@ -2,7 +2,7 @@
 """Dev API server using stat-based reload (no inotify).
 
 Use when Linux raises OSError: OS file watch limit reached with
-uvicorn --reload (WatchFiles), e.g. when Cursor or other tools already
+uvicorn --reload (WatchFiles), e.g. when IDEs or other tools already
 consume most of fs.inotify.max_user_watches.
 
 From repo root:
