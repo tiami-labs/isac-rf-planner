@@ -10,3 +10,7 @@ data/osm/
 *.npz
 *.zip
 *.log
+* copy.py
+*_old.py
+.~lock*
+test-results/
