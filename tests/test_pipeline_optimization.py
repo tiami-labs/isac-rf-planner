@@ -3,8 +3,8 @@ import math
 import numpy as np
 import pytest
 
-from agentic_rf_planner.geo.heatmap import EllipseRasterizer
-from agentic_rf_planner.pipeline.schemas import (
+from isac_rf_planner.geo.heatmap import EllipseRasterizer
+from isac_rf_planner.pipeline.schemas import (
     AttenuationGrid,
     BroadcastWorldCell,
     LatLon,
@@ -13,15 +13,15 @@ from agentic_rf_planner.pipeline.schemas import (
     WorldCell,
     WorldModel,
 )
-from agentic_rf_planner.rf.attenuation_models import apply_channel_analysis, compute_attenuation_grid
-from agentic_rf_planner.rf.channel_analysis import (
+from isac_rf_planner.rf.attenuation_models import apply_channel_analysis, compute_attenuation_grid
+from isac_rf_planner.rf.channel_analysis import (
     ChannelAnalysisConfig,
     TargetMotion,
     bistatic_geometry,
     bistatic_geometry_arrays,
 )
-from agentic_rf_planner.rf.channel_environment import ReturnPathEnvironmentLookup
-from agentic_rf_planner.rf.dvt import DVTTransmitter
+from isac_rf_planner.rf.channel_environment import ReturnPathEnvironmentLookup
+from isac_rf_planner.rf.dvt import DVTTransmitter
 
 
 def _dvt() -> DVTTransmitter:

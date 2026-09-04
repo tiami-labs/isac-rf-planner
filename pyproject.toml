@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentic-rf-planner"
+name = "isac-rf-planner"
 version = "0.1.0"
-description = "Agentic RF planning with VLM-based material detection"
+description = "ISAC RF planning with VLM-based material detection"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 authors = [
-    {name = "Saeede Enayati", email = "senayati@tiamilabs.org"}
+    {name = "Tiami Labs", email = "senayati@tiamilabs.org"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -51,12 +51,12 @@ dev = [
 ]
 
 [project.scripts]
-agentic-rf-planner = "agentic_rf_planner.cli:main"
-agentic-rf-prepare-region = "agentic_rf_planner.data.prepare_region:main"
+isac-rf-planner = "isac_rf_planner.cli:main"
+isac-rf-prepare-region = "isac_rf_planner.data.prepare_region:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["agentic_rf_planner*", "tiny_vlm_360*"]
+include = ["isac_rf_planner*", "tiny_vlm_360*"]
 
 [tool.black]
 line-length = 100

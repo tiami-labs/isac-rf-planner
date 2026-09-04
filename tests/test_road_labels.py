@@ -1,4 +1,4 @@
-from agentic_rf_planner.geo.road_labels import (
+from isac_rf_planner.geo.road_labels import (
     build_road_label_candidates,
     classify_road_importance,
     fetch_road_labels,
@@ -86,18 +86,18 @@ def test_fetch_road_labels_uses_cached_osm_data(monkeypatch) -> None:
     ]
 
     monkeypatch.setattr(
-        "agentic_rf_planner.geo.road_labels.load_cached_osm_data",
+        "isac_rf_planner.geo.road_labels.load_cached_osm_data",
         lambda center, radius_m, data_type: cached_elements,
     )
     monkeypatch.setattr(
-        "agentic_rf_planner.geo.road_labels.save_cached_osm_data",
+        "isac_rf_planner.geo.road_labels.save_cached_osm_data",
         lambda center, radius_m, data_type, data: None,
     )
 
     def fail_post(*args, **kwargs):
         raise AssertionError("requests.post should not be called on cache hit")
 
-    monkeypatch.setattr("agentic_rf_planner.geo.road_labels.requests.post", fail_post)
+    monkeypatch.setattr("isac_rf_planner.geo.road_labels.requests.post", fail_post)
 
     labels = fetch_road_labels(0.0, 0.0, radius_m=2000.0, major_limit=10, minor_limit=10)
     assert len(labels) == 1

@@ -1,0 +1,81 @@
+{
+  "why_this_file": "Machine-readable twin+plan record: waveform params, sector pointing, path-loss model, and ray mode used to produce the heatmaps. Use it to reproduce or audit a run without the UI.",
+  "planner_version": "3d",
+  "export_timestamp_iso": "2026-06-02T20:10:54.009Z",
+  "heatmap_hue_definition": {
+    "vmin_dbm": -140,
+    "vmax_dbm": -60,
+    "actual_min_dbm": -139.99981689453125,
+    "actual_max_dbm": -68.59989929199219,
+    "gradient": "blue->cyan->green->yellow->orange->red",
+    "formula": "t=(rsrp-vmin)/(vmax-vmin)"
+  },
+  "plans": [
+    {
+      "gnodeb_index": 1,
+      "freq_mhz": 3500,
+      "path_loss_model": "3gpp_38901",
+      "ray_mode": "3d_osm",
+      "sectors": [
+        {
+          "id": "CATX0133P1A",
+          "azimuth_deg": 70,
+          "beamwidth_h_deg": 65,
+          "tx_power_dbm": 53.01,
+          "pci": 800
+        },
+        {
+          "id": "CATX0133P2A",
+          "azimuth_deg": 200,
+          "beamwidth_h_deg": 65,
+          "tx_power_dbm": 53.01,
+          "pci": 801
+        },
+        {
+          "id": "CATX0133P3A",
+          "azimuth_deg": 310,
+          "beamwidth_h_deg": 65,
+          "tx_power_dbm": 53.01,
+          "pci": 802
+        }
+      ]
+    },
+    {
+      "gnodeb_index": 2,
+      "freq_mhz": 3500,
+      "path_loss_model": "3gpp_38901",
+      "ray_mode": "3d_osm",
+      "sectors": [
+        {
+          "id": "CATX6990P1",
+          "azimuth_deg": 225,
+          "beamwidth_h_deg": 65,
+          "tx_power_dbm": 53.01,
+          "pci": null
+        }
+      ]
+    },
+    {
+      "gnodeb_index": 3,
+      "freq_mhz": 3500,
+      "path_loss_model": "3gpp_38901",
+      "ray_mode": "3d_osm",
+      "sectors": [
+        {
+          "id": "CATX6607P1E",
+          "azimuth_deg": 25,
+          "beamwidth_h_deg": 82,
+          "tx_power_dbm": 43.01,
+          "pci": 5
+        },
+        {
+          "id": "CATX6607P2E",
+          "azimuth_deg": 220,
+          "beamwidth_h_deg": 82,
+          "tx_power_dbm": 43.01,
+          "pci": 6
+        }
+      ]
+    }
+  ]
+}

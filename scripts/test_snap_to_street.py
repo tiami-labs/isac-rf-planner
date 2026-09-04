@@ -10,7 +10,7 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from agentic_rf_planner.geo.snapping import snap_to_street
+from isac_rf_planner.geo.snapping import snap_to_street
 
 logging.basicConfig(
     level=logging.DEBUG,

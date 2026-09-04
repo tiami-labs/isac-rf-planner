@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-STATIC = ROOT / "src" / "agentic_rf_planner" / "ui" / "static"
+STATIC = ROOT / "src" / "isac_rf_planner" / "ui" / "static"
 
 
 def test_export_utils_collects_every_layer_png_numeric_npz_and_settings():

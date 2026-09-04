@@ -6,19 +6,19 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from agentic_rf_planner.api.rest import PlanRequest, app
-from agentic_rf_planner.pipeline.schemas import LatLon, MaterialType, RFParams, WorldCell, WorldModel
-from agentic_rf_planner.rf.attenuation_models import apply_channel_analysis, compute_attenuation_grid
-from agentic_rf_planner.rf.channel_analysis import (
+from isac_rf_planner.api.rest import PlanRequest, app
+from isac_rf_planner.pipeline.schemas import LatLon, MaterialType, RFParams, WorldCell, WorldModel
+from isac_rf_planner.rf.attenuation_models import apply_channel_analysis, compute_attenuation_grid
+from isac_rf_planner.rf.channel_analysis import (
     ChannelAnalysisConfig,
     TargetMotion,
     bistatic_echo_power_dbm,
     bistatic_geometry,
     free_space_path_loss_db,
 )
-from agentic_rf_planner.rf.channel_products import write_channel_product
-from agentic_rf_planner.rf.isac_reanalysis import _horizontal_excess_delay_scalar
-from agentic_rf_planner.rf.dvt import DVTTransmitter
+from isac_rf_planner.rf.channel_products import write_channel_product
+from isac_rf_planner.rf.isac_reanalysis import _horizontal_excess_delay_scalar
+from isac_rf_planner.rf.dvt import DVTTransmitter
 
 
 def _channel_config(*, speed_mps: float = 120.0, heading_deg: float = 180.0, prf_hz=None):
@@ -474,7 +474,7 @@ def _reusable_scene_product(tmp_path, monkeypatch, *, direct_received_dbm=-120.0
     return write_channel_product(
         arrays=arrays,
         metadata={
-            "schema": "agentic_rf_planner.channel_analysis_grid",
+            "schema": "isac_rf_planner.channel_analysis_grid",
             "schema_version": "2.0",
             "summary": summary,
             "transmitter": {

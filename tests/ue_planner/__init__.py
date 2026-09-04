@@ -14,7 +14,7 @@ from .gps_telemetry_matcher import GPSTelemetryMatcher, MatchedMeasurement
 from .ue_location_assessor import UELocationAssessor, UELocationQuality
 
 __version__ = "1.0.0"
-__author__ = "Saeede Enayati"
+__author__ = "Tiami Labs"
 
 __all__ = [
     'RFPlanner',

@@ -1,7 +1,7 @@
-from agentic_rf_planner.api import rest
-from agentic_rf_planner.pipeline.schemas import LatLon
-from agentic_rf_planner.rf.ray_tracing import RayPath, WallSegment
-from agentic_rf_planner.geo import osm_map_provider as osm_mod
+from isac_rf_planner.api import rest
+from isac_rf_planner.pipeline.schemas import LatLon
+from isac_rf_planner.rf.ray_tracing import RayPath, WallSegment
+from isac_rf_planner.geo import osm_map_provider as osm_mod
 
 
 def test_strict_validator_rejects_path_through_reflector_building(monkeypatch):
@@ -59,7 +59,7 @@ def test_strict_validator_rejects_path_through_reflector_building(monkeypatch):
     )
 
     monkeypatch.setattr(osm_mod, "OSMMapProvider", FakeOSM)
-    rt_mod = __import__("agentic_rf_planner.rf.ray_tracing", fromlist=["dummy"])
+    rt_mod = __import__("isac_rf_planner.rf.ray_tracing", fromlist=["dummy"])
     monkeypatch.setattr(rt_mod, "extract_wall_segments", lambda buildings, origin: [east_wall])
     monkeypatch.setattr(rt_mod, "compute_single_bounce_paths", lambda *args, **kwargs: [bad_path])
     monkeypatch.setattr(rt_mod, "compute_two_bounce_paths", lambda *args, **kwargs: [])

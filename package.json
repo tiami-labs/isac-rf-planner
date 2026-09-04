@@ -1,7 +1,7 @@
 {
-  "name": "rf-planning",
+  "name": "isac-rf-planner",
   "version": "1.0.0",
-  "description": "RF planning system that uses vision-language models (VLMs) to detect materials in 360\u00b0 panoramas and compute RF signal coverage heatmaps.",
+  "description": "ISAC RF Planner: RF planning with VLM-based material detection and signal coverage heatmaps.",
   "main": "index.js",
   "directories": {
     "doc": "docs",
@@ -11,8 +11,8 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "Saeede Enayati <senayati@tiamilabs.org>",
-  "license": "ISC",
+  "author": "Tiami Labs <senayati@tiamilabs.org>",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "cesium": "1.111"

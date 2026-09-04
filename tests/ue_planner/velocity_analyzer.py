@@ -9,7 +9,7 @@ The key insight is that:
 - freq_offset_hz: Coarse PSS/SSS-based frequency offset (tens of kHz, mostly LO error)
 - cfo_est: Refined PBCH-DMRS CFO (few hundred Hz, true Doppler)
 
-Author: Saeede Enayati
+Author: Tiami Labs
 Date: 2025-01-27
 """
 

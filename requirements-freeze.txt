@@ -6,7 +6,7 @@
 # For new installations, use requirements.txt or pyproject.toml instead.
 
 accelerate==1.11.0
-agentic-rf-planner==0.1.0
+isac-rf-planner==0.1.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.11.0

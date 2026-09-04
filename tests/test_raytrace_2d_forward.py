@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 
-from agentic_rf_planner.pipeline.schemas import LatLon
-from agentic_rf_planner.rf.raytrace_2d_forward import (
+from isac_rf_planner.pipeline.schemas import LatLon
+from isac_rf_planner.rf.raytrace_2d_forward import (
     ForwardPropagationPlan,
     ForwardScene2D,
     launch_forward_beam,

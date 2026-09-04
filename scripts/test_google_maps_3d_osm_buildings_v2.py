@@ -54,10 +54,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from agentic_rf_planner.geo.osm_map_provider import OSMMapProvider  # noqa: E402
-from agentic_rf_planner.pipeline.schemas import LatLon, RFParams  # noqa: E402
-from agentic_rf_planner.pipeline.world_builder import build_world_model  # noqa: E402
-from agentic_rf_planner.rf.attenuation_models import compute_attenuation_grid  # noqa: E402
+from isac_rf_planner.geo.osm_map_provider import OSMMapProvider  # noqa: E402
+from isac_rf_planner.pipeline.schemas import LatLon, RFParams  # noqa: E402
+from isac_rf_planner.pipeline.world_builder import build_world_model  # noqa: E402
+from isac_rf_planner.rf.attenuation_models import compute_attenuation_grid  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

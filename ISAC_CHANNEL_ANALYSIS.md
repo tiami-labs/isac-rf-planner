@@ -5,7 +5,7 @@
 Start the planner exactly as before:
 
 ```bash
-uvicorn agentic_rf_planner.api.rest:app --reload
+uvicorn isac_rf_planner.api.rest:app --reload
 ```
 
 No separate preprocessing command is required.

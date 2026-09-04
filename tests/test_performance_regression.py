@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from agentic_rf_planner.agents.rf_planning_agent import (
+from isac_rf_planner.agents.rf_planning_agent import (
     _channel_product_arrays,
     _iter_channel_product_arrays,
 )
-from agentic_rf_planner.geo.heatmap import _fill_nans_nearest
-from agentic_rf_planner.pipeline.schemas import AttenuationGrid, LatLon, RFParams, WorldCell, WorldModel
-from agentic_rf_planner.rf.attenuation_models import _compute_single_dvt_grid
-from agentic_rf_planner.rf.dvt import DVTTransmitter
-from agentic_rf_planner.rf.reciprocal_propagation import _cell_path_components
+from isac_rf_planner.geo.heatmap import _fill_nans_nearest
+from isac_rf_planner.pipeline.schemas import AttenuationGrid, LatLon, RFParams, WorldCell, WorldModel
+from isac_rf_planner.rf.attenuation_models import _compute_single_dvt_grid
+from isac_rf_planner.rf.dvt import DVTTransmitter
+from isac_rf_planner.rf.reciprocal_propagation import _cell_path_components
 
 
 def _reference_fill_nans_nearest(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:

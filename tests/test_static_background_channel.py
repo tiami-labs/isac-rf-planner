@@ -4,16 +4,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from agentic_rf_planner.pipeline.schemas import LatLon, RFParams
-from agentic_rf_planner.rf.background_scatter import (
+from isac_rf_planner.pipeline.schemas import LatLon, RFParams
+from isac_rf_planner.rf.background_scatter import (
     _select_candidate_wall_segments,
     build_static_background_channel,
 )
-from agentic_rf_planner.rf.isac_reanalysis import (
+from isac_rf_planner.rf.isac_reanalysis import (
     _selected_static_background,
     _static_background_grid_metrics,
 )
-from agentic_rf_planner.rf.ray_tracing import (
+from isac_rf_planner.rf.ray_tracing import (
     _wall_segment_link_relevance_m,
     enu_from_latlon,
     extract_wall_segments,
@@ -156,7 +156,7 @@ def test_selected_static_background_attributes_same_cell_reflectors_geometry_onl
 
 
 def test_zero_path_priority_pass_falls_back_beyond_candidate_budget(monkeypatch):
-    import agentic_rf_planner.rf.background_scatter as bs
+    import isac_rf_planner.rf.background_scatter as bs
     origin = LatLon(lat=38.0, lon=-121.0)
     rx = latlon_from_enu(origin, 1000.0, 0.0)
     buildings = [

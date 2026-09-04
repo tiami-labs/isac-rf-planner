@@ -43,7 +43,7 @@ def main() -> None:
     reload_dirs = args.reload_dirs if args.reload_dirs else [str(src)]
 
     config = Config(
-        "agentic_rf_planner.api.rest:app",
+        "isac_rf_planner.api.rest:app",
         host=args.host,
         port=args.port,
         reload=True,

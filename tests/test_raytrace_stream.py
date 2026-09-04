@@ -3,7 +3,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from agentic_rf_planner.api import rest
+from isac_rf_planner.api import rest
 
 
 def test_raytrace_stream_emits_progress_and_result(monkeypatch):

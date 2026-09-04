@@ -9,7 +9,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-STATIC = ROOT / "src" / "agentic_rf_planner" / "ui" / "static"
+STATIC = ROOT / "src" / "isac_rf_planner" / "ui" / "static"
 
 
 @pytest.mark.parametrize("filename", ["index.html", "index_3d.html"])
@@ -204,7 +204,7 @@ def test_dvt_sync_hides_nr_only_controls_and_restores_nr():
 
 
 def test_waveform_script_is_served_by_an_explicit_no_store_route():
-    rest_source = (ROOT / "src" / "agentic_rf_planner" / "api" / "rest.py").read_text(encoding="utf-8")
+    rest_source = (ROOT / "src" / "isac_rf_planner" / "api" / "rest.py").read_text(encoding="utf-8")
 
     assert '@app.get("/waveform_ui.js")' in rest_source
     route_start = rest_source.index('@app.get("/waveform_ui.js")')
@@ -222,7 +222,7 @@ def test_dvt_hides_the_entire_legacy_nr_advanced_panel():
 
 def test_waveform_script_http_route_returns_javascript():
     from fastapi.testclient import TestClient
-    from agentic_rf_planner.api.rest import app
+    from isac_rf_planner.api.rest import app
 
     response = TestClient(app).get("/waveform_ui.js")
     assert response.status_code == 200

@@ -138,7 +138,7 @@ Examples:
 The execution surface is unchanged:
 
 ```bash
-uvicorn agentic_rf_planner.api.rest:app --reload
+uvicorn isac_rf_planner.api.rest:app --reload
 ```
 
 Then select a DVT waveform, select the transmitter, set the radius, and run.
@@ -163,7 +163,7 @@ The cache path can be overridden with `DVT_OSM_DATABASE` or `RF_OSM_DATABASE`;
 otherwise it is created automatically at `data/osm/rf_geometry.sqlite` relative
 to the directory where Uvicorn is started.
 
-`agentic-rf-prepare-region` remains an optional offline pre-seeding tool. It is
+`isac-rf-prepare-region` remains an optional offline pre-seeding tool. It is
 not part of the normal click-and-run workflow.
 
 Broadcast-site coordinates are used directly. DVT planning skips street
@@ -176,7 +176,7 @@ detectability are implemented by the shared waveform-agnostic channel layer.
 They are not owned by the DVT transmitter model. The same UI and API contract
 operate with 5G NR, ATSC 1.0, ATSC 3.0, DVB-T, and baseline DVT.
 
-See `CHANNEL_ANALYSIS.md` and the concrete requests in:
+See `ISAC_CHANNEL_ANALYSIS.md` and the concrete requests in:
 
 - `examples/channel_analysis_5g_nr.json`
 - `examples/channel_analysis_atsc1.json`

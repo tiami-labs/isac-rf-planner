@@ -6,15 +6,15 @@ import math
 
 import pytest
 
-from agentic_rf_planner.api import rest as rest_api
-from agentic_rf_planner.api.rest import PlanRequest
-from agentic_rf_planner.geo.osm_map_provider import (
+from isac_rf_planner.api import rest as rest_api
+from isac_rf_planner.api.rest import PlanRequest
+from isac_rf_planner.geo.osm_map_provider import (
     _parse_overpass_elements,
     _tile_centers_for_square,
 )
-from agentic_rf_planner.pipeline.schemas import LatLon, RFParams, WorldCell, WorldModel
-from agentic_rf_planner.rf.attenuation_models import compute_attenuation_grid
-from agentic_rf_planner.rf.dvt import DVTTransmitter, erp_kw_to_eirp_dbm
+from isac_rf_planner.pipeline.schemas import LatLon, RFParams, WorldCell, WorldModel
+from isac_rf_planner.rf.attenuation_models import compute_attenuation_grid
+from isac_rf_planner.rf.dvt import DVTTransmitter, erp_kw_to_eirp_dbm
 
 
 def _dvt_payload(*, power_overrides=None, antenna_overrides=None, **tx_overrides):
@@ -432,7 +432,7 @@ def test_dvt_api_logging_contains_broadcast_antenna_and_no_nr_runtime_sections(m
         }
     )
 
-    caplog.set_level(logging.INFO, logger="agentic_rf_planner.api.rest")
+    caplog.set_level(logging.INFO, logger="isac_rf_planner.api.rest")
     asyncio.run(rest_api.api_plan(req))
     messages = "\n".join(record.getMessage() for record in caplog.records)
 

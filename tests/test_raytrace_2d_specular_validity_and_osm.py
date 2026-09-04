@@ -30,16 +30,16 @@ _RAYTRACE_2D_VISUAL_PNG = (
     Path(__file__).resolve().parents[1] / "test_artifacts" / "raytrace_2d_osm_raw_vs_filtered.png"
 )
 
-from agentic_rf_planner.geo.osm_map_provider import OSMMapProvider, _polygon_contains_point
-from agentic_rf_planner.pipeline.schemas import LatLon, RFParams
-from agentic_rf_planner.rf.raytrace_2d_forward import (
+from isac_rf_planner.geo.osm_map_provider import OSMMapProvider, _polygon_contains_point
+from isac_rf_planner.pipeline.schemas import LatLon, RFParams
+from isac_rf_planner.rf.raytrace_2d_forward import (
     ForwardBeamSummary,
     ForwardPropagationPlan,
     ForwardScene2D,
     facets_from_wall_segments,
     launch_forward_beam,
 )
-from agentic_rf_planner.rf.ray_tracing import (
+from isac_rf_planner.rf.ray_tracing import (
     compute_single_bounce_paths,
     compute_two_bounce_paths,
     enu_from_latlon,
@@ -47,7 +47,7 @@ from agentic_rf_planner.rf.ray_tracing import (
     find_minimum_order_specular_paths,
     latlon_from_enu,
 )
-from agentic_rf_planner.rf.raytrace_2d_validity import (
+from isac_rf_planner.rf.raytrace_2d_validity import (
     estimate_num_azimuth_rays_2d_sbr,
     estimate_num_directions_3d_sbr,
     open_segment_has_interior_sample_in_footprint,
@@ -166,7 +166,7 @@ def test_snap_latlon_moves_interior_point_outside_footprint():
         ],
     }
     geom = building["geometry"]
-    from agentic_rf_planner.geo.osm_map_provider import _polygon_contains_point
+    from isac_rf_planner.geo.osm_map_provider import _polygon_contains_point
 
     inner = LatLon(lat=37.77490, lon=-122.41930)
     assert _polygon_contains_point(geom, inner)

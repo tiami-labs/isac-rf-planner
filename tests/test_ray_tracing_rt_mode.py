@@ -1,6 +1,6 @@
-from agentic_rf_planner.geo.google_mesh import BearingProfile, RayBlockSegment, RayProfileSet
-from agentic_rf_planner.pipeline.schemas import LatLon, RFParams
-from agentic_rf_planner.rf.ray_tracing import (
+from isac_rf_planner.geo.google_mesh import BearingProfile, RayBlockSegment, RayProfileSet
+from isac_rf_planner.pipeline.schemas import LatLon, RFParams
+from isac_rf_planner.rf.ray_tracing import (
     MeshProfileIndex,
     WallSegment,
     compute_multi_bounce_paths,

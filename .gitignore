@@ -1,16 +1,45 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Local caches / bulky runtime data
 cache/
 Cesium/
 data/dem_cache/
 data/channel_analysis/
 data/osm/
+data/panos/
 *.hgt
 *.npz
 *.zip
 *.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.~lock*
+
+# Local scratch / backups
 * copy.py
 *_old.py
-.~lock*
+*.bak
 test-results/

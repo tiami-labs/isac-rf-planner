@@ -74,7 +74,7 @@ dev = [
   - Used for interactive maps
 
 ### Static Files
-- **Location**: `src/agentic_rf_planner/ui/static/`
+- **Location**: `src/isac_rf_planner/ui/static/`
 - **Files**: `index.html`, `app.js`, `style.css`
 - **No Build Step**: Files served directly by FastAPI
 
@@ -86,7 +86,7 @@ dev = [
    - **URL**: `https://overpass-api.de/api/interpreter`
    - **Purpose**: Building footprints, street data, landcover
    - **Rate Limits**: Public instance, reasonable use expected
-   - **Caching**: Implemented in `src/agentic_rf_planner/geo/osm_cache.py`
+   - **Caching**: Implemented in `src/isac_rf_planner/geo/osm_cache.py`
    - **Cache Location**: `~/.rf_planning_cache/osm_data/`
 
 2. **Bing Maps Tiles**
@@ -166,7 +166,7 @@ echo 'export MAPILLARY_API_KEY="your_key_here"' >> ~/.bashrc
 pip list | grep -E "torch|transformers|fastapi"
 
 # Test import
-python -c "import agentic_rf_planner; print('OK')"
+python -c "import isac_rf_planner; print('OK')"
 ```
 
 ### 6. Start Server
@@ -175,10 +175,10 @@ python -c "import agentic_rf_planner; print('OK')"
 source ~/RFP/bin/activate
 
 # Start development server
-uvicorn agentic_rf_planner.api.rest:app --reload
+uvicorn isac_rf_planner.api.rest:app --reload
 
 # Or production server
-uvicorn agentic_rf_planner.api.rest:app --host 0.0.0.0 --port 8000
+uvicorn isac_rf_planner.api.rest:app --host 0.0.0.0 --port 8000
 ```
 
 ## Dependency Locations
@@ -192,7 +192,7 @@ uvicorn agentic_rf_planner.api.rest:app --host 0.0.0.0 --port 8000
 ### Project Package
 - **Location**: Project root (`/path/to/rf-planning/`)
 - **Installation Mode**: Editable (`pip install -e .`)
-- **Source**: `src/agentic_rf_planner/`
+- **Source**: `src/isac_rf_planner/`
 
 ### Cache Directories
 - **OSM Cache**: `~/.rf_planning_cache/osm_data/`
@@ -241,7 +241,7 @@ python -c "import os; print(os.environ.get('MAPILLARY_API_KEY', 'Not set'))"
 ### Port Already in Use
 ```bash
 # Use different port
-uvicorn agentic_rf_planner.api.rest:app --port 8001
+uvicorn isac_rf_planner.api.rest:app --port 8001
 ```
 
 ## Dependency Size Estimates

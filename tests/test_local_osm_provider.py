@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from agentic_rf_planner.agents import rf_planning_agent
-from agentic_rf_planner.data.prepare_region import build_database
-from agentic_rf_planner.geo.local_osm_provider import LocalOSMProvider
-from agentic_rf_planner.geo.physical_spanning import StubMapProvider
-from agentic_rf_planner.pipeline.schemas import LatLon, RFParams
-from agentic_rf_planner.rf.dvt import DVTTransmitter
+from isac_rf_planner.agents import rf_planning_agent
+from isac_rf_planner.data.prepare_region import build_database
+from isac_rf_planner.geo.local_osm_provider import LocalOSMProvider
+from isac_rf_planner.geo.physical_spanning import StubMapProvider
+from isac_rf_planner.pipeline.schemas import LatLon, RFParams
+from isac_rf_planner.rf.dvt import DVTTransmitter
 
 
 def _write_fixture_geojson(path: Path) -> None:
@@ -209,7 +209,7 @@ def _network_fixture(center: LatLon):
 
 
 def test_automatic_aoi_cache_creates_fetches_and_reuses(tmp_path):
-    from agentic_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
+    from isac_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
 
     database = tmp_path / "rf_geometry.sqlite"
     center = LatLon(lat=38.0, lon=-121.0)
@@ -240,7 +240,7 @@ def test_automatic_aoi_cache_creates_fetches_and_reuses(tmp_path):
 
 
 def test_automatic_aoi_cache_adaptively_splits_failed_large_request(tmp_path):
-    from agentic_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
+    from isac_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
 
     database = tmp_path / "rf_geometry.sqlite"
     center = LatLon(lat=38.0, lon=-121.0)
@@ -274,7 +274,7 @@ def test_automatic_aoi_cache_adaptively_splits_failed_large_request(tmp_path):
 
 
 def test_click_and_run_path_acquires_then_reports_sqlite_cache(tmp_path):
-    from agentic_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
+    from isac_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
 
     database = tmp_path / "rf_geometry.sqlite"
     center = LatLon(lat=38.0, lon=-121.0)
@@ -297,7 +297,7 @@ def test_click_and_run_path_acquires_then_reports_sqlite_cache(tmp_path):
 
 
 def test_real_20km_plus_margin_uses_one_full_query_then_25_tiles(tmp_path):
-    from agentic_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
+    from isac_rf_planner.geo.local_osm_provider import AutoCachingOSMProvider
 
     center = LatLon(lat=38.271667, lon=-121.506111)
     calls = []

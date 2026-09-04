@@ -3,16 +3,16 @@ import math
 import numpy as np
 import pytest
 
-from agentic_rf_planner.geo.coverage_grid import build_coverage_grid
-from agentic_rf_planner.geo.terrain_propagation import compute_terrain_at_sample
-from agentic_rf_planner.pipeline.schemas import LatLon, MaterialType, RFParams, WorldCell, WorldModel
-from agentic_rf_planner.rf.attenuation_models import (
+from isac_rf_planner.geo.coverage_grid import build_coverage_grid
+from isac_rf_planner.geo.terrain_propagation import compute_terrain_at_sample
+from isac_rf_planner.pipeline.schemas import LatLon, MaterialType, RFParams, WorldCell, WorldModel
+from isac_rf_planner.rf.attenuation_models import (
     _dvt_vertical_pattern_attenuation_absolute_db,
     _vertical_pattern_attenuation_db,
     compute_attenuation_grid,
 )
-from agentic_rf_planner.rf.channel_analysis import ChannelAnalysisConfig
-from agentic_rf_planner.rf.dvt import DVTTransmitter
+from isac_rf_planner.rf.channel_analysis import ChannelAnalysisConfig
+from isac_rf_planner.rf.dvt import DVTTransmitter
 
 
 def dvt() -> DVTTransmitter:
@@ -307,7 +307,7 @@ def test_polar_sampling_exports_true_location_dependent_cross_range_spacing():
     cross = np.asarray(grid.bistatic_sample_cross_range_spacing_m)
     assert np.allclose(radial, 20.0)
     assert cross[1] > cross[0]
-    from agentic_rf_planner.geo.google_mesh.utils import haversine_m
+    from isac_rf_planner.geo.google_mesh.utils import haversine_m
     target_surface_range_m = haversine_m(
         LatLon(lat=38.271667, lon=-121.506111),
         LatLon(lat=float(grid.cell_lat[1]), lon=float(grid.cell_lon[1])),
@@ -318,7 +318,7 @@ def test_polar_sampling_exports_true_location_dependent_cross_range_spacing():
 
 
 def test_thermal_noise_uses_exact_ktb_reference_at_290k():
-    from agentic_rf_planner.rf.channel_analysis import thermal_noise_power_dbm
+    from isac_rf_planner.rf.channel_analysis import thermal_noise_power_dbm
 
     one_hz = thermal_noise_power_dbm(1.0, 0.0, 290.0)
     assert one_hz == pytest.approx(-173.975, abs=0.01)
@@ -385,7 +385,7 @@ def test_broadcast_preliminary_source_power_uses_signed_target_elevation_pattern
 
 
 def test_tabulated_ambiguity_surface_varies_by_delay_and_doppler_and_does_not_extrapolate():
-    from agentic_rf_planner.rf.channel_analysis import (
+    from isac_rf_planner.rf.channel_analysis import (
         AmbiguitySurfacePoint,
         ambiguity_response_power_db,
     )
@@ -413,7 +413,7 @@ def test_tabulated_ambiguity_surface_varies_by_delay_and_doppler_and_does_not_ex
 
 
 def test_tabulated_ambiguity_surface_rejects_collinear_or_incomplete_data():
-    from agentic_rf_planner.rf.channel_analysis import ChannelProcessing
+    from isac_rf_planner.rf.channel_analysis import ChannelProcessing
 
     with pytest.raises(ValueError, match="at least three"):
         ChannelProcessing.model_validate({

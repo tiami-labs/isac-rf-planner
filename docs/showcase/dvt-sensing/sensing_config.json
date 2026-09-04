@@ -1,0 +1,62 @@
+{
+  "why_this_file": "Captures the illuminator, power/antenna, and sensing RX/target/motion knobs that produced the ISAC product maps. Needed to interpret detectability and quality rasters.",
+  "technology": "dvt",
+  "waveform": "atsc1",
+  "transmitter": {
+    "latitude": 38.271667,
+    "longitude": -121.506111,
+    "altitude": 0,
+    "antennaHeight": 320,
+    "name": "DVT TX"
+  },
+  "power": {
+    "erpKw": null,
+    "erpHKw": 50,
+    "erpVKw": null,
+    "conductedPowerKw": null,
+    "txGainDb": 0,
+    "feederLossDb": 0,
+    "antennaGainDbi": 0,
+    "polarization": "DA (E)"
+  },
+  "antenna": {
+    "patternType": "omnidirectional",
+    "verticalBeamwidthDeg": 8,
+    "horizontalBeamwidthDeg": 360,
+    "beamTiltDeg": 0
+  },
+  "channel_analysis": {
+    "receiver": {
+      "latitude": 38.41717489626978,
+      "longitude": -121.39508190497462,
+      "altitudeMamsl": 0,
+      "antennaHeightMagl": 10,
+      "directAntennaGainDbi": 8,
+      "echoAntennaGainDbi": 12,
+      "feederLossDb": 1,
+      "noiseFigureDb": 5,
+      "directPathExcessLossDb": 0,
+      "returnPathExcessLossDb": 0
+    },
+    "target": {
+      "heightMagl": 1000,
+      "bistaticRcsM2": 10
+    },
+    "motion": {
+      "speedMps": 50,
+      "headingDegTrue": 0,
+      "climbRateMps": 0
+    },
+    "processing": {
+      "processingBandwidthHz": null,
+      "coherentIntegrationS": 1,
+      "processingLossDb": 3,
+      "systemLossDb": 3,
+      "requiredSnrDb": 10,
+      "directPathCancellationDb": 60,
+      "pulseRepetitionFrequencyHz": null,
+      "clutterNotchHz": 0,
+      "minimumDetectableDopplerHz": 0
+    }
+  }
+}

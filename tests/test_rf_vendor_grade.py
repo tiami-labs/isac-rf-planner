@@ -1,9 +1,9 @@
 """Targeted tests for the vendor-grade RF roadmap pieces."""
 
-from agentic_rf_planner.geo.coverage_grid import build_coverage_grid
-from agentic_rf_planner.geo.physical_spanning import StubMapProvider
-from agentic_rf_planner.pipeline.schemas import AttenuationGrid, LatLon, RFParams, WorldCell, WorldModel
-from agentic_rf_planner.rf.attenuation_models import (
+from isac_rf_planner.geo.coverage_grid import build_coverage_grid
+from isac_rf_planner.geo.physical_spanning import StubMapProvider
+from isac_rf_planner.pipeline.schemas import AttenuationGrid, LatLon, RFParams, WorldCell, WorldModel
+from isac_rf_planner.rf.attenuation_models import (
     _horizontal_pattern_attenuation_db,
     _reference_signal_eirp_dbm,
     _scenario_path_loss_db,
